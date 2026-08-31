@@ -1,0 +1,888 @@
+"""`GPUQService` - the one place job business logic lives.
+
+Both the CLI and the MCP adapter call these methods; neither reimplements
+scheduling, snapshotting or state handling (spec sections 3 and 20).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from gpuq import BACKEND_NAME, __version__
+from gpuq.backends.base import (
+    BACKEND_FINISHED,
+    BACKEND_MISSING,
+    BACKEND_QUEUED,
+    BACKEND_REMOVED,
+    BACKEND_RUNNING,
+    BackendJob,
+    BackendUnavailable,
+)
+from gpuq.backends.local_dispatcher import LocalDispatcherBackend, build_backend
+from gpuq.config import Config, load_config
+from gpuq.db import Database, json_dumps
+from gpuq.gpu import GpuInfo, query_gpus
+from gpuq.models import (
+    ACTIVE_STATES,
+    Job,
+    JobState,
+    Priority,
+    SnapshotMode,
+    priority_rank,
+)
+from gpuq.snapshot import (
+    Snapshot,
+    SnapshotError,
+    create_copy_snapshot,
+    create_git_snapshot,
+    find_repo_root,
+    load_project_defaults,
+    load_project_passthrough,
+    remove_snapshot,
+)
+from gpuq.util import (
+    atomic_write_text,
+    ensure_dir,
+    expand_path,
+    hostname,
+    parse_env_assignment,
+    resolve_path,
+    utcnow_iso,
+)
+
+
+class GPUQError(RuntimeError):
+    """User-facing error. The CLI prints the message and exits non-zero."""
+
+
+class JobNotFound(GPUQError):
+    pass
+
+
+#: Backend state -> GPUQ state. The single mapping point (spec section 9.2).
+def map_backend_state(backend_state: str, exit_code: int | None) -> JobState | None:
+    if backend_state == BACKEND_QUEUED:
+        return JobState.QUEUED
+    if backend_state == BACKEND_RUNNING:
+        return JobState.RUNNING
+    if backend_state == BACKEND_REMOVED:
+        return JobState.CANCELLED
+    if backend_state == BACKEND_FINISHED:
+        if exit_code is None:
+            return JobState.FAILED
+        return JobState.SUCCEEDED if exit_code == 0 else JobState.FAILED
+    if backend_state == BACKEND_MISSING:
+        return JobState.LOST
+    return None
+
+
+@dataclass
+class SubmitRequest:
+    command: list[str]
+    project: str | None = None
+    priority: str = "normal"
+    gpus: int | None = None
+    label: str | None = None
+    cwd: str | None = None
+    snapshot: bool = True
+    live_worktree: bool = False
+    shell: str | None = None
+    env: dict[str, str] | None = None
+    passthrough: list[str] | None = None
+
+
+@dataclass
+class SubmitResult:
+    job: Job
+    snapshot: Snapshot
+    backend_job_id: int
+    queue_position: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "job_id": self.job.id,
+            "state": self.job.state,
+            "project": self.job.project,
+            "priority": self.job.priority,
+            "backend_job_id": self.backend_job_id,
+            "snapshot_commit": self.job.snapshot_commit,
+            "snapshot_mode": self.job.snapshot_mode,
+            "execution_cwd": self.job.execution_cwd,
+            "log_path": self.job.log_path,
+            "queue_position": self.queue_position,
+        }
+
+
+class GPUQService:
+    def __init__(
+        self,
+        config: Config | None = None,
+        *,
+        backend: LocalDispatcherBackend | None = None,
+    ) -> None:
+        self.config = config or load_config()
+        self.db = Database(self.config.db_path)
+        self._backend = backend
+        self._db_ready = False
+
+    # -- lifecycle --------------------------------------------------------
+    @property
+    def backend(self) -> LocalDispatcherBackend:
+        if self._backend is None:
+            self._backend = build_backend(self.config)
+        return self._backend
+
+    def ensure_ready(self) -> None:
+        if not self._db_ready:
+            self.config.ensure_dirs()
+            self.db.initialize()
+            self._db_ready = True
+
+    def initialize(self) -> dict[str, Any]:
+        """`gpuq init`. Idempotent."""
+        self.config.ensure_dirs()
+        if self.config.source_path and not self.config.source_path.exists():
+            self.config.save()
+        schema = self.db.initialize()
+        self._db_ready = True
+        self.backend.initialize()
+        return {
+            "state_dir": str(self.config.state_dir),
+            "config_path": str(self.config.source_path) if self.config.source_path else None,
+            "schema_version": schema,
+            "backend": self.backend.health(),
+        }
+
+    def close(self) -> None:
+        self.db.close()
+        if self._backend is not None:
+            self._backend.close()
+
+    def __enter__(self) -> GPUQService:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    # ------------------------------------------------------------------
+    # Submission
+    # ------------------------------------------------------------------
+    def submit(self, request: SubmitRequest) -> SubmitResult:
+        """Validate, snapshot, enqueue. Never runs the command itself."""
+        self.ensure_ready()
+
+        # ---- validate ------------------------------------------------
+        shell_mode = request.shell is not None
+        if shell_mode:
+            command = [request.shell or ""]
+            if not command[0].strip():
+                raise GPUQError("--shell requires a non-empty command string")
+        else:
+            command = [str(c) for c in (request.command or [])]
+            if not command:
+                raise GPUQError(
+                    "no command given.\n"
+                    "Usage: gpuq submit --project NAME -- <command> [args...]"
+                )
+
+        try:
+            priority = Priority(request.priority)
+        except ValueError:
+            raise GPUQError(
+                f"invalid priority {request.priority!r}; "
+                "choose from critical, high, normal, low"
+            ) from None
+
+        gpus = self.config.gpu.default_gpu_count if request.gpus is None else request.gpus
+        if gpus < 0:
+            raise GPUQError("--gpus must be >= 0")
+
+        submitted_cwd = resolve_path(request.cwd or Path.cwd())
+        if not submitted_cwd.is_dir():
+            raise GPUQError(f"working directory does not exist: {submitted_cwd}")
+
+        env: dict[str, str] = {}
+        for key, value in (request.env or {}).items():
+            k, v = parse_env_assignment(f"{key}={value}")
+            env[k] = v
+
+        repo_root = find_repo_root(submitted_cwd)
+        project = request.project or self._infer_project(repo_root, submitted_cwd)
+
+        passthrough = list(request.passthrough or [])
+        passthrough += [p for p in load_project_passthrough(repo_root) if p not in passthrough]
+
+        # ---- decide snapshot mode ------------------------------------
+        if request.live_worktree or not request.snapshot:
+            mode = SnapshotMode.LIVE if request.live_worktree else SnapshotMode.NONE
+        elif self.config.core.snapshot_mode == "none":
+            mode = SnapshotMode.NONE
+        elif repo_root is not None:
+            mode = SnapshotMode.GIT
+        elif self.config.core.snapshot_mode == "copy":
+            mode = SnapshotMode.COPY
+        else:
+            raise GPUQError(
+                f"{submitted_cwd} is not inside a git repository, so gpuq cannot freeze "
+                "the source for a queued job.\n"
+                "Re-run with --live-worktree to accept running against the live "
+                "directory (it may change before the job starts), or run 'git init'."
+            )
+
+        # ---- 1. insert PREPARING row ---------------------------------
+        now = utcnow_iso()
+        job_id = self.db.insert_job(
+            backend=BACKEND_NAME,
+            backend_job_id=None,
+            project=project,
+            label=request.label,
+            priority=priority.value,
+            repo_root=str(repo_root) if repo_root else None,
+            submitted_cwd=str(submitted_cwd),
+            execution_cwd=None,
+            command_json=json_dumps(command),
+            shell_mode=1 if shell_mode else 0,
+            requested_gpu_count=gpus,
+            gpu_mode="exclusive" if self.config.gpu.exclusive_by_default else "shared",
+            snapshot_mode=mode.value,
+            host=hostname(),
+            submitter_pid=os.getpid(),
+            submitter_agent=detect_agent(),
+            state=JobState.PREPARING.value,
+            queued_at=now,
+            env_json=json_dumps(env) if env else None,
+            log_path=str(self.config.log_path(0)),  # placeholder, fixed below
+        )
+
+        log_path = self.config.log_path(job_id)
+        snapshot: Snapshot | None = None
+        try:
+            # ---- 2. snapshot -----------------------------------------
+            snapshot = self._create_snapshot(
+                job_id, mode, repo_root, submitted_cwd, passthrough
+            )
+            execution_cwd = self._resolve_execution_cwd(
+                snapshot, repo_root, submitted_cwd
+            )
+
+            self.db.update_job(
+                job_id,
+                execution_cwd=str(execution_cwd),
+                snapshot_mode=snapshot.mode,
+                snapshot_commit=snapshot.commit,
+                snapshot_path=str(snapshot.path) if snapshot.path else None,
+                passthrough_json=json_dumps(snapshot.passthrough) if snapshot.passthrough else None,
+                log_path=str(log_path),
+            )
+
+            # ---- 3. write the manifest before enqueue ----------------
+            self._write_manifest(job_id)
+
+            # ---- 4. enqueue ------------------------------------------
+            label = self.backend_label(job_id, project, priority.value)
+            backend_job_id = self.backend.submit(
+                self.runner_argv(job_id),
+                label=label,
+                gpu_count=gpus,
+                slots=1,
+                log_name=self.config.log_name(job_id),
+                priority_rank=priority_rank(priority),
+                cwd=str(execution_cwd),
+                env=None,  # job env is applied by the runner, from the DB
+            )
+
+            # ---- 5/6. record backend id, mark QUEUED -----------------
+            job = self.db.update_job(
+                job_id, backend_job_id=backend_job_id, state=JobState.QUEUED.value
+            )
+
+            if priority is Priority.CRITICAL:
+                # Spec 11.7: critical goes to the front, but never preempts.
+                try:
+                    self.backend.promote(backend_job_id)
+                except BackendUnavailable:
+                    pass
+
+            self._write_manifest(job_id)
+            return SubmitResult(
+                job=job,
+                snapshot=snapshot,
+                backend_job_id=backend_job_id,
+                queue_position=self._queue_position(job_id),
+            )
+
+        except BaseException as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            try:
+                self.db.try_update_state(
+                    job_id, JobState.FAILED, error=message, finished_at=utcnow_iso()
+                )
+            except Exception:
+                pass
+            if snapshot is not None and snapshot.path is not None:
+                try:
+                    remove_snapshot(
+                        snapshot.path,
+                        repo_root=snapshot.repo_root,
+                        state_root=self.config.state_dir,
+                        ref=snapshot.ref,
+                    )
+                except Exception:
+                    pass
+            if isinstance(exc, BackendUnavailable):
+                raise GPUQError(
+                    f"job not submitted: {exc}\n"
+                    "gpuq will not run the command directly - the queue is the only "
+                    "safe path for heavy GPU work."
+                ) from exc
+            if isinstance(exc, (SnapshotError, GPUQError)):
+                raise GPUQError(f"job not submitted: {exc}") from exc
+            raise
+
+    def _create_snapshot(
+        self,
+        job_id: int,
+        mode: SnapshotMode,
+        repo_root: Path | None,
+        submitted_cwd: Path,
+        passthrough: list[str],
+    ) -> Snapshot:
+        if mode is SnapshotMode.GIT:
+            assert repo_root is not None
+            destination = self.config.snapshots_dir / str(job_id) / "repo"
+            return create_git_snapshot(
+                repo_root, destination, job_id=job_id, passthrough=passthrough
+            )
+        if mode is SnapshotMode.COPY:
+            destination = self.config.snapshots_dir / str(job_id) / "repo"
+            return create_copy_snapshot(submitted_cwd, destination, passthrough=passthrough)
+        return Snapshot(mode=mode.value, path=None, repo_root=repo_root, passthrough=[])
+
+    @staticmethod
+    def _resolve_execution_cwd(
+        snapshot: Snapshot, repo_root: Path | None, submitted_cwd: Path
+    ) -> Path:
+        """Run in the snapshot at the same relative depth the user submitted from."""
+        if snapshot.path is None:
+            return submitted_cwd
+        if repo_root is None:
+            return snapshot.path
+        try:
+            relative = submitted_cwd.relative_to(resolve_path(repo_root))
+        except ValueError:
+            return snapshot.path
+        target = snapshot.path / relative
+        return target if target.is_dir() else snapshot.path
+
+    def runner_argv(self, job_id: int) -> list[str]:
+        """Command the backend executes.
+
+        Only the job id crosses the process boundary: the runner reads the
+        exact argv back from the database as JSON. That is a strictly stronger
+        guarantee than re-quoting user arguments through a Windows command
+        line, which is what spec section 8.4 is protecting against.
+        """
+        from gpuq.winproc import windowless_python
+
+        return [windowless_python(sys.executable), "-m", "gpuq", "_run", str(job_id)]
+
+    @staticmethod
+    def backend_label(job_id: int, project: str, priority: str) -> str:
+        """Unique marker used to recover a backend id after a crash (spec 9.3)."""
+        safe_project = project.replace(":", "_")
+        return f"gpuq:{job_id}:{safe_project}:{priority}"
+
+    @staticmethod
+    def _infer_project(repo_root: Path | None, cwd: Path) -> str:
+        defaults = load_project_defaults(repo_root)
+        name = defaults.get("name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+        return (repo_root or cwd).name or "default"
+
+    # ------------------------------------------------------------------
+    # Manifest / provenance (spec section 19)
+    # ------------------------------------------------------------------
+    def _write_manifest(self, job_id: int) -> None:
+        job = self.db.get_job(job_id)
+        if job is None:
+            return
+        job_dir = ensure_dir(self.config.job_dir(job_id))
+        manifest_path = job_dir / "manifest.json"
+
+        # Several processes may refresh a manifest (the runner at exit, any CLI
+        # doing reconciliation). A writer that read the database *before* the
+        # job finished could otherwise land after the runner and leave stale,
+        # non-terminal provenance on disk. State only ever moves forward.
+        if not job.state_enum.is_terminal and manifest_path.exists():
+            try:
+                existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if JobState(existing.get("state", "")).is_terminal:
+                    return
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
+
+        manifest = {
+            "gpuq_job_id": job.id,
+            "gpuq_version": __version__,
+            "backend": job.backend,
+            "backend_job_id": job.backend_job_id,
+            "project": job.project,
+            "label": job.label,
+            "priority": job.priority,
+            "command": job.command,
+            "shell_mode": bool(job.shell_mode),
+            "submitted_cwd": job.submitted_cwd,
+            "execution_cwd": job.execution_cwd,
+            "repo_root": job.repo_root,
+            "snapshot_mode": job.snapshot_mode,
+            "snapshot_commit": job.snapshot_commit,
+            "snapshot_path": job.snapshot_path,
+            "snapshot_passthrough": job.passthrough,
+            "gpu_count": job.requested_gpu_count,
+            "gpu_mode": job.gpu_mode,
+            "env": job.env,
+            "submitted_at": job.queued_at,
+            "started_at": job.started_at,
+            "finished_at": job.finished_at,
+            "state": job.state,
+            "exit_code": job.exit_code,
+            "log_path": job.log_path,
+            "host": job.host,
+            "submitter_agent": job.submitter_agent,
+        }
+        atomic_write_text(
+            manifest_path, json.dumps(manifest, indent=2, ensure_ascii=False) + "\n"
+        )
+
+    # ------------------------------------------------------------------
+    # Queries
+    # ------------------------------------------------------------------
+    def get_job(self, job_id: int, *, refresh: bool = True) -> Job:
+        self.ensure_ready()
+        job = self.db.get_job(job_id)
+        if job is None:
+            raise JobNotFound(f"no such gpuq job: {job_id}")
+        if refresh and not job.is_terminal:
+            self.reconcile_job(job)
+            job = self.db.get_job(job_id) or job
+        return job
+
+    def list_jobs(
+        self,
+        *,
+        all_jobs: bool = False,
+        project: str | None = None,
+        state: str | None = None,
+        limit: int = 40,
+        refresh: bool = True,
+    ) -> list[Job]:
+        self.ensure_ready()
+        if refresh:
+            self.reconcile(mutate=True)
+
+        states: list[str] | None = None
+        if state:
+            try:
+                states = [JobState(state.upper()).value]
+            except ValueError:
+                raise GPUQError(
+                    f"invalid state {state!r}; choose from "
+                    + ", ".join(s.value for s in JobState)
+                ) from None
+
+        jobs = self.db.list_jobs(states=states, project=project, limit=None)
+        if not all_jobs and states is None:
+            active = [j for j in jobs if not j.is_terminal]
+            finished = [j for j in jobs if j.is_terminal][: max(0, limit - len(active))]
+            jobs = active + finished
+        elif limit:
+            jobs = jobs[:limit]
+        return self.sort_for_display(jobs)
+
+    def sort_for_display(self, jobs: list[Job]) -> list[Job]:
+        """RUNNING, then QUEUED in dispatch order, then newest finished."""
+        order = self._queue_order()
+
+        def key(job: Job) -> tuple:
+            state = job.state_enum
+            if state is JobState.RUNNING:
+                return (0, 0, job.id)
+            if state in (JobState.QUEUED, JobState.PREPARING):
+                return (1, order.get(job.id, 10**9), job.id)
+            return (2, -_sort_ts(job.finished_at or job.updated_at), -job.id)
+
+        return sorted(jobs, key=key)
+
+    def _queue_order(self) -> dict[int, int]:
+        """Map gpuq job id -> position the dispatcher will actually run it in."""
+        try:
+            backend_jobs = self.backend.list_jobs()
+        except Exception:
+            return {}
+        order: dict[int, int] = {}
+        position = 0
+        for bjob in backend_jobs:
+            if bjob.state != BACKEND_QUEUED:
+                continue
+            job_id = _job_id_from_label(bjob.label)
+            if job_id is not None:
+                order[job_id] = position
+                position += 1
+        return order
+
+    def _queue_position(self, job_id: int) -> int | None:
+        return self._queue_order().get(job_id)
+
+    def queue_wait_reason(self, job: Job) -> str | None:
+        if job.backend_job_id is None:
+            return None
+        try:
+            return self.backend.get_job(job.backend_job_id).wait_reason
+        except Exception:
+            return None
+
+    def job_detail(self, job_id: int) -> dict[str, Any]:
+        job = self.get_job(job_id)
+        data = job.to_dict()
+        backend_state = None
+        wait_reason = None
+        if job.backend_job_id is not None:
+            try:
+                bjob = self.backend.get_job(job.backend_job_id)
+                backend_state = bjob.state
+                wait_reason = bjob.wait_reason
+                if bjob.output_path and not data.get("log_path"):
+                    data["log_path"] = str(bjob.output_path)
+            except Exception:
+                backend_state = "UNKNOWN"
+        data["backend_state"] = backend_state
+        data["wait_reason"] = wait_reason
+        data["queue_position"] = self._queue_position(job_id)
+        data["manifest_path"] = str(self.config.job_dir(job_id) / "manifest.json")
+        result_path = self.config.job_dir(job_id) / "result.json"
+        if result_path.exists():
+            try:
+                data["result"] = json.loads(result_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                pass
+        return data
+
+    def resolve_log_path(self, job: Job) -> Path | None:
+        if job.log_path:
+            path = expand_path(job.log_path)
+            if path.exists():
+                return path
+        if job.backend_job_id is not None:
+            try:
+                candidate = self.backend.output_path(job.backend_job_id)
+            except Exception:
+                candidate = None
+            if candidate and Path(candidate).exists():
+                return Path(candidate)
+        fallback = self.config.log_path(job.id)
+        return fallback if fallback.exists() else None
+
+    # ------------------------------------------------------------------
+    # Control
+    # ------------------------------------------------------------------
+    def cancel(self, job_id: int, *, force: bool = False) -> dict[str, Any]:
+        job = self.get_job(job_id)
+        if job.is_terminal:
+            return {
+                "job_id": job.id,
+                "state": job.state,
+                "action": "none",
+                "message": f"job #{job.id} already finished in state {job.state}",
+            }
+        if job.backend_job_id is None:
+            self.db.try_update_state(
+                job_id, JobState.CANCELLED, finished_at=utcnow_iso(), error="cancelled before enqueue"
+            )
+            return {
+                "job_id": job.id,
+                "state": JobState.CANCELLED.value,
+                "action": "removed",
+                "message": f"job #{job.id} cancelled before it reached the queue",
+            }
+
+        action = self.backend.cancel(job.backend_job_id, force=force)
+        if action == "removed":
+            self.db.try_update_state(
+                job_id, JobState.CANCELLED, finished_at=utcnow_iso(), error="cancelled while queued"
+            )
+            message = f"job #{job.id} removed from the queue; it will not run"
+        elif action == "terminating":
+            self.db.update_job(job_id, error="cancellation requested")
+            confirmed = self.backend.wait_until_finished(
+                job.backend_job_id,
+                timeout=(2.0 if force else self.config.core.cancel_grace_seconds + 10.0),
+            )
+            if confirmed:
+                self.db.try_update_state(
+                    job_id,
+                    JobState.CANCELLED,
+                    finished_at=utcnow_iso(),
+                    error="cancelled while running",
+                )
+                message = f"job #{job.id} was running and has been terminated"
+            else:
+                message = (
+                    f"job #{job.id} termination requested; the process tree has not "
+                    "exited yet. Re-run with --force to kill it immediately."
+                )
+        else:
+            self.reconcile_job(job)
+            refreshed = self.db.get_job(job_id) or job
+            return {
+                "job_id": job.id,
+                "state": refreshed.state,
+                "action": "none",
+                "message": f"job #{job.id} already finished in state {refreshed.state}",
+            }
+
+        self._write_manifest(job_id)
+        final = self.db.get_job(job_id) or job
+        return {
+            "job_id": job.id,
+            "state": final.state,
+            "action": action,
+            "message": message,
+        }
+
+    def promote(self, job_id: int) -> dict[str, Any]:
+        job = self.get_job(job_id)
+        if job.state_enum is not JobState.QUEUED:
+            raise GPUQError(
+                f"job #{job.id} is {job.state}; only QUEUED jobs can be promoted "
+                "(gpuq never preempts a running job)"
+            )
+        if job.backend_job_id is None:
+            raise GPUQError(f"job #{job.id} has no backend job to promote")
+        self.backend.promote(job.backend_job_id)
+        return {
+            "job_id": job.id,
+            "state": job.state,
+            "queue_position": self._queue_position(job.id),
+            "message": f"job #{job.id} moved to the front of the queue",
+        }
+
+    def set_concurrency(self, count: int) -> dict[str, Any]:
+        if count < 1:
+            raise GPUQError("concurrency must be >= 1")
+        from gpuq.config import set_dotted_and_save
+
+        self.config = set_dotted_and_save(self.config, "core.max_concurrent_jobs", count)
+        self.backend.config = self.config
+        self.backend.set_slots(count)
+        return {"max_concurrent_jobs": count, "backend_slots": self.backend.get_slots()}
+
+    def get_concurrency(self) -> dict[str, Any]:
+        return {
+            "config": self.config.core.max_concurrent_jobs,
+            "backend_slots": self.backend.get_slots(),
+        }
+
+    def set_gpu_threshold(self, percent: int) -> dict[str, Any]:
+        if not 0 <= percent <= 100:
+            raise GPUQError("gpu threshold must be between 0 and 100")
+        from gpuq.config import set_dotted_and_save
+
+        self.config = set_dotted_and_save(
+            self.config, "gpu.free_memory_threshold_percent", percent
+        )
+        self.backend.config = self.config
+        self.backend.set_gpu_free_percent(percent)
+        return {
+            "free_memory_threshold_percent": percent,
+            "backend": self.backend.get_gpu_free_percent(),
+        }
+
+    # ------------------------------------------------------------------
+    # Reconciliation (spec section 11.9)
+    # ------------------------------------------------------------------
+    def reconcile_job(self, job: Job, *, mutate: bool = True) -> str | None:
+        """Align one DB row with backend truth. Returns a change description."""
+        if job.is_terminal:
+            return None
+
+        if job.backend_job_id is None:
+            # PREPARING rows from a crashed submit never reached the queue.
+            if job.state_enum is JobState.PREPARING:
+                age = _age_or_zero(job.created_at)
+                if age > 300:
+                    if mutate:
+                        self.db.try_update_state(
+                            job.id,
+                            JobState.LOST,
+                            error="submission did not complete (process exited during preparation)",
+                            finished_at=utcnow_iso(),
+                        )
+                    return f"job #{job.id}: stale PREPARING -> LOST"
+            return None
+
+        try:
+            bjob: BackendJob = self.backend.get_job(job.backend_job_id)
+        except Exception:
+            return None
+
+        target = map_backend_state(bjob.state, bjob.exit_code)
+        if target is None or target is job.state_enum:
+            return None
+
+        # Never resurrect a cancelled job, and never overwrite a runner-recorded
+        # terminal state with a coarser backend guess.
+        if bjob.state == BACKEND_REMOVED:
+            target = JobState.CANCELLED
+
+        updates: dict[str, Any] = {}
+        if target is JobState.RUNNING:
+            if not job.started_at and bjob.started_at:
+                updates["started_at"] = bjob.started_at
+            if bjob.pid:
+                updates["runner_pid"] = bjob.pid
+        elif target.is_terminal:
+            updates["finished_at"] = job.finished_at or bjob.finished_at or utcnow_iso()
+            if bjob.exit_code is not None and job.exit_code is None:
+                updates["exit_code"] = bjob.exit_code
+            if target is JobState.FAILED and bjob.exit_code is None and not job.error:
+                updates["error"] = "job ended without recording an exit code"
+
+        if not mutate:
+            return f"job #{job.id}: {job.state} -> {target.value}"
+
+        changed = self.db.try_update_state(job.id, target, **updates)
+        if changed is None:
+            return None
+        self._write_manifest(job.id)
+        return f"job #{job.id}: {job.state} -> {target.value}"
+
+    def reconcile(self, *, mutate: bool = True) -> list[str]:
+        """Repair metadata after crashes/restarts."""
+        self.ensure_ready()
+        changes: list[str] = []
+        for job in self.db.list_jobs(states=[s.value for s in ACTIVE_STATES]):
+            try:
+                change = self.reconcile_job(job, mutate=mutate)
+            except Exception as exc:  # never let one bad row break status
+                change = f"job #{job.id}: reconcile error: {exc}"
+            if change:
+                changes.append(change)
+        changes.extend(self._recover_lost_backend_ids(mutate=mutate))
+        return changes
+
+    def _recover_lost_backend_ids(self, *, mutate: bool) -> list[str]:
+        """Re-attach rows whose backend id was never written (crash mid-submit)."""
+        changes: list[str] = []
+        orphans = [
+            j
+            for j in self.db.list_jobs(states=[JobState.PREPARING.value])
+            if j.backend_job_id is None
+        ]
+        if not orphans:
+            return changes
+        try:
+            backend_jobs = self.backend.list_jobs()
+        except Exception:
+            return changes
+        by_job_id = {}
+        for bjob in backend_jobs:
+            jid = _job_id_from_label(bjob.label)
+            if jid is not None:
+                by_job_id[jid] = bjob
+        for job in orphans:
+            bjob = by_job_id.get(job.id)
+            if bjob is None:
+                continue
+            if mutate:
+                self.db.update_job(job.id, backend_job_id=bjob.backend_id)
+                self.db.try_update_state(job.id, JobState.QUEUED)
+            changes.append(f"job #{job.id}: recovered backend job {bjob.backend_id} from label")
+        return changes
+
+    # ------------------------------------------------------------------
+    # GPU
+    # ------------------------------------------------------------------
+    def gpu_info(self) -> GpuInfo:
+        return query_gpus()
+
+    def own_gpu_pids(self) -> set[int]:
+        """PIDs belonging to jobs gpuq launched, for foreign-process detection.
+
+        Two PIDs are collected per job. On Windows a virtualenv `python.exe`
+        can be a trampoline that re-execs the real interpreter as a child, so
+        the PID the dispatcher launched and the PID the runner reports are
+        both legitimate and frequently differ. Missing either would make
+        `doctor` report gpuq's own job as a foreign GPU process.
+        """
+        pids: set[int] = set()
+        for job in self.db.list_jobs(states=[JobState.RUNNING.value]):
+            if job.runner_pid:
+                pids.add(int(job.runner_pid))
+            if job.backend_job_id is not None:
+                try:
+                    backend_pid = self.backend.get_job(job.backend_job_id).pid
+                except Exception:
+                    backend_pid = None
+                if backend_pid:
+                    pids.add(int(backend_pid))
+        return pids
+
+    def status_summary(self) -> dict[str, Any]:
+        counts = self.db.count_by_state()
+        return {
+            "concurrency": self.config.core.max_concurrent_jobs,
+            "backend_slots": self.backend.get_slots(),
+            "gpu_free_threshold_percent": self.backend.get_gpu_free_percent(),
+            "daemon_running": self.backend.daemon_running(),
+            "state_dir": str(self.config.state_dir),
+            "counts": counts,
+        }
+
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+
+
+def _job_id_from_label(label: str | None) -> int | None:
+    if not label or not label.startswith("gpuq:"):
+        return None
+    parts = label.split(":")
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
+
+
+def _sort_ts(value: str | None) -> float:
+    from gpuq.util import parse_iso
+
+    dt = parse_iso(value)
+    return dt.timestamp() if dt else 0.0
+
+
+def _age_or_zero(value: str | None) -> float:
+    from gpuq.util import age_seconds
+
+    return age_seconds(value) or 0.0
+
+
+def detect_agent() -> str | None:
+    """Best-effort identification of the agent/terminal that submitted a job."""
+    for key in ("CLAUDECODE", "CLAUDE_CODE"):
+        if os.environ.get(key):
+            return "claude-code"
+    if os.environ.get("CURSOR_TRACE_ID"):
+        return "cursor"
+    if os.environ.get("CODEX_SANDBOX") or os.environ.get("CODEX_HOME"):
+        return "codex"
+    term = os.environ.get("TERM_PROGRAM")
+    return term or None

@@ -1,0 +1,436 @@
+# GPUQ — Agent GPU Workload Broker
+
+One shared gate for GPU-heavy work, so several AI coding agents can run in
+parallel across projects without their training/eval jobs colliding and OOMing
+the GPU.
+
+Submit expensive work in seconds, keep coding, and trust that the machine will
+not start another broker-managed heavy job until it is safe.
+
+---
+
+## Start using this now
+
+```bash
+gpuq doctor                                   # check the machine is healthy
+
+gpuq submit --project my-project -- \
+  python train.py --config configs/exp17.yaml # queue a job, return immediately
+
+gpuq status                                   # what is running / next
+gpuq logs 1 --follow                          # stream a job's output
+```
+
+That is the whole daily loop. Everything below is detail.
+
+The four things worth knowing:
+
+1. **Only one heavy job runs at a time** (`max_concurrent_jobs = 1`). A 3 GiB
+   job may monopolise a 32 GiB GPU. That is deliberate: reliability beats
+   utilisation.
+2. **Jobs outlive your terminal.** Close the shell, close the editor, the job
+   keeps running and the logs stay readable from any new shell.
+3. **A queued job runs the source as it was at submission time.** Keep editing
+   the repo the moment you have submitted; the job is unaffected.
+4. **gpuq never runs your command directly.** If the queue is unreachable,
+   submission fails loudly and tells you to run `gpuq doctor`.
+
+---
+
+## Daily agent workflow
+
+### Submit a training job
+
+```bash
+gpuq submit --project arc-agi -- \
+  python train.py --config configs/exp17.yaml
+```
+
+### Urgent blocking evaluation
+
+```bash
+gpuq submit --project arc-agi --priority critical -- \
+  python evaluate.py --checkpoint latest
+```
+
+`critical` jumps ahead of everything queued. It never interrupts a job that is
+already running.
+
+### See the queue
+
+```bash
+gpuq status
+gpuq status --json          # for scripts and agents
+```
+
+```text
+GPU 0: NVIDIA GeForce RTX 5090  2.9 / 31.8 GiB used  (91% free)
+Concurrency: 1   GPU free threshold: 85%   Dispatcher: running
+
+ ID  STATE     PRI       PROJECT          AGE/RUNTIME  GPU  BE  COMMAND
+ 58  RUNNING   normal    pokemon-ai        12m           1  14  python train.py ...
+ 59  QUEUED    critical  arc-agi           4m wait       1  15  python evaluate.py ...
+ 60  QUEUED    normal    biohub            1m wait       1  16  python sweep.py ...
+```
+
+### Follow logs
+
+```bash
+gpuq logs 42 --follow
+gpuq logs 42 --tail 100
+```
+
+### Cancel
+
+```bash
+gpuq cancel 42            # queued -> removed; running -> stopped
+gpuq cancel 42 --force    # skip the grace period, kill the process tree now
+```
+
+### Inspect source provenance
+
+```bash
+gpuq show 42
+```
+
+Tells you the snapshot commit, the exact directory the job ran in, the assigned
+`CUDA_VISIBLE_DEVICES`, exit code, and where the logs are.
+
+### Check system health
+
+```bash
+gpuq doctor
+```
+
+Exit code `0` healthy, `1` degraded but usable, `2` broken — do not submit.
+
+---
+
+## Installation
+
+Requires Python 3.11+, git, and (for GPU gating) a working NVIDIA driver.
+
+```bash
+uv tool install --from . gpuq        # from a clone
+gpuq init
+gpuq claude-policy install
+gpuq doctor
+```
+
+`gpuq init` is idempotent: it creates the state directories, the database and
+the dispatcher, and re-applies your configured concurrency and GPU threshold.
+
+`scripts/bootstrap.sh` does all of the above in one step and finishes with a
+non-destructive queue smoke test.
+
+### Where things live
+
+```text
+~/.config/gpuq/config.toml          configuration
+~/.local/state/gpuq/
+    gpuq.sqlite3                    job metadata
+    logs/job-000042.log             job output
+    snapshots/42/repo               frozen source for job 42
+    jobs/42/manifest.json           provenance, environment, result
+    backend/queue.sqlite3           dispatcher queue state
+    run/                            dispatcher lock, heartbeat, daemon log
+```
+
+---
+
+## Teaching your agents to use it
+
+```bash
+gpuq claude-policy install
+```
+
+This writes a marker-delimited block into `~/.claude/CLAUDE.md`, the user-level
+memory file Claude Code reads across all projects. It is idempotent, backs the
+file up before the first change, preserves every other instruction, and can be
+removed cleanly:
+
+```bash
+gpuq claude-policy status
+gpuq claude-policy remove
+```
+
+Claude's own documentation distinguishes `CLAUDE.md` guidance from enforceable
+hooks and permissions, so treat this as behavioural guidance — one layer of
+defence, not a hard boundary.
+
+An optional stronger measure exists and is **not** enabled by default:
+
+```bash
+gpuq claude-safe-launcher install
+```
+
+It creates `claude-gpu-safe`, which starts Claude Code with
+`CUDA_VISIBLE_DEVICES=""` so a command the agent runs directly cannot reach the
+GPU. Trade-off: legitimate lightweight GPU probes run directly will also see no
+device. Queued gpuq jobs are unaffected — the dispatcher restores the real
+device list.
+
+---
+
+## Source snapshots
+
+The problem this solves: you submit job #42, then keep editing. Without
+snapshots, #42 would run whatever the code looks like when it finally starts.
+
+For a Git repository, `gpuq submit` freezes the working tree at submission time
+— tracked content, staged changes, unstaged changes, and untracked non-ignored
+files — into an ephemeral commit built through a **temporary Git index**. Your
+real index, working tree, branch and HEAD are never touched. The job then runs
+in a detached worktree of that commit.
+
+```bash
+gpuq show 42          # Snapshot commit: 9f613e2...
+```
+
+### Ignored data your job still needs
+
+Datasets and checkpoints are usually gitignored, so they are not in the
+snapshot. Link them in rather than copying:
+
+```toml
+# .gpuq.toml in your repo root
+[snapshot]
+passthrough = ["data", "datasets", "checkpoints"]
+```
+
+or per submission:
+
+```bash
+gpuq submit --passthrough data --passthrough checkpoints -- python train.py
+```
+
+Directories become junctions/symlinks back to the live path — no bulk copying.
+Relative passthrough paths may not escape the repository; only an explicit
+absolute path may.
+
+### Opting out
+
+```bash
+gpuq submit --live-worktree -- python train.py   # run against the live tree
+gpuq submit --no-snapshot -- python train.py     # same, no snapshot at all
+```
+
+A non-Git directory refuses snapshot mode with a clear message rather than
+pretending a live directory is immutable.
+
+---
+
+## Priorities
+
+```text
+critical   front of the queue
+high       ahead of normal/low
+normal     FIFO
+low        behind everything else
+```
+
+All four are stored exactly as given. The dispatcher orders strictly by
+priority, then by arrival. **No priority ever preempts a running job**, and
+priority never relaxes a resource-safety rule.
+
+```bash
+gpuq promote 42        # move a queued job to the front by hand
+```
+
+---
+
+## Concurrency and the GPU threshold
+
+```bash
+gpuq concurrency               # show
+gpuq concurrency 2 --yes       # raise (warns; --yes required)
+gpuq gpu-threshold 85          # require 85% free VRAM before starting a GPU job
+```
+
+The GPU threshold is what protects you from *foreign* work — a job someone
+started outside gpuq, or a browser holding VRAM. A queued GPU job waits until a
+device is at least this free, and `gpuq status` shows what it is waiting for.
+
+On a desktop machine the compositor and browsers hold a few GiB permanently, so
+a 90% threshold can stall the queue. `gpuq init` and `gpuq doctor` detect this
+and suggest a value; they never change it silently.
+
+---
+
+## Configuration
+
+```bash
+gpuq config show
+gpuq config set core.max_concurrent_jobs 1
+gpuq config set gpu.free_memory_threshold_percent 85
+```
+
+Precedence: **CLI flag > `GPUQ_*` environment variable > `config.toml` >
+built-in default.**
+
+```toml
+[core]
+state_dir = "~/.local/state/gpuq"
+max_concurrent_jobs = 1
+default_priority = "normal"
+snapshot_mode = "git"
+cleanup_successful_snapshots_after_days = 7
+cleanup_failed_snapshots_after_days = 14
+cancel_grace_seconds = 15
+
+[gpu]
+default_gpu_count = 1
+free_memory_threshold_percent = 90
+exclusive_by_default = true
+
+[backend]
+name = "local_dispatcher"
+max_finished = 1000
+poll_interval_seconds = 0.25
+
+[claude]
+install_user_policy = true
+hide_cuda_in_safe_launcher = false
+```
+
+Set `GPUQ_PROFILE=test` to get a completely separate queue, database and state
+directory — that is how the test suite avoids touching your real queue.
+
+---
+
+## Maintenance
+
+```bash
+gpuq reconcile              # repair metadata after a crash or reboot
+gpuq cleanup --dry-run      # see what retention would remove
+gpuq cleanup                # remove expired snapshots and orphan temp files
+gpuq uninstall --dry-run    # see exactly what removal would touch
+```
+
+Cleanup never deletes an active job's snapshot or logs, never touches anything
+outside the gpuq state directory, and keeps failed-job evidence for its own
+longer retention window.
+
+After a reboot:
+
+```bash
+gpuq init && gpuq reconcile && gpuq status
+```
+
+Jobs that were **running** when the machine went down are reported `LOST`, not
+silently marked complete. Jobs that were still **queued** are recovered and run.
+
+---
+
+## MCP (optional)
+
+The CLI is the supported interface. An MCP adapter over the same core API is
+available if you prefer tool calls:
+
+```bash
+uv tool install --from . --with 'mcp[cli]' gpuq
+gpuq mcp test          # build the server in-process, list its tools
+gpuq mcp command       # print the stdio command to register
+```
+
+Tools: `gpu_submit`, `gpu_status`, `gpu_job`, `gpu_logs`, `gpu_cancel`,
+`gpu_promote`, `gpu_info`. It is a thin shim — all logic lives in
+`GPUQService`, exactly as the CLI uses it. stdio only; no network listener.
+
+---
+
+## How it works
+
+```text
+Claude A ─┐
+Claude B ─┼── gpuq CLI ──► GPUQ Core ──► dispatcher daemon ──► your GPU job
+Claude C ─┘                (SQLite,       (one detached
+                            snapshots)     process, N slots)
+```
+
+`gpuq submit` validates, snapshots, records the job and enqueues it — then
+returns. A single detached dispatcher daemon owns execution: it is the only
+process that launches user work, which is what makes the one-job-at-a-time
+invariant hold across unrelated terminals.
+
+Backends sit behind a `SchedulerBackend` protocol
+(`src/gpuq/backends/base.py`). V1 ships `LocalDispatcherBackend`. On Linux the
+same protocol is the seam where GPU Task Spooler would slot in, and it is where
+a remote or Slurm backend goes later.
+
+See [docs/architecture.md](docs/architecture.md),
+[docs/troubleshooting.md](docs/troubleshooting.md) and
+[docs/future-slurm.md](docs/future-slurm.md).
+
+---
+
+## Command reference
+
+| Command | Purpose |
+| --- | --- |
+| `gpuq init` | Create state, database and dispatcher. Idempotent. |
+| `gpuq submit -- CMD` | Queue a job and return immediately. |
+| `gpuq status` / `gpuq list` | Show the queue. `--json` for agents. |
+| `gpuq show ID` | Full detail and source provenance. |
+| `gpuq logs ID [--follow] [--tail N]` | Job output. |
+| `gpuq cancel ID [--force]` | Cancel queued or running work. |
+| `gpuq promote ID` | Move a queued job to the front. |
+| `gpuq doctor` | Health checks. Exit 0/1/2. |
+| `gpuq gpu` | GPU inventory and who holds VRAM. |
+| `gpuq reconcile` | Repair metadata after a crash. |
+| `gpuq cleanup` | Retention for snapshots and temp files. |
+| `gpuq concurrency [N]` | Show/set concurrent job limit. |
+| `gpuq gpu-threshold [N]` | Show/set required free VRAM percent. |
+| `gpuq config show/get/set` | Configuration. |
+| `gpuq claude-policy install/status/remove` | Agent policy block. |
+| `gpuq mcp command/test/serve` | Optional MCP adapter. |
+| `gpuq uninstall --dry-run` | Preview removal. |
+
+Every command that produces data supports `--json`, which writes only JSON to
+stdout. Errors always go to stderr.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+---
+
+## Windows notes
+
+gpuq runs natively on Windows and gates Windows-native CUDA jobs (your project
+venv's `python.exe` with `torch+cuXXX`), which is where the OOM risk actually
+lives on this machine.
+
+**Name the interpreter with an absolute path.** A queued job runs a frozen
+snapshot of your repository, and `.venv` is normally gitignored — so a relative
+`.venv/Scripts/python.exe` will not exist inside the snapshot:
+
+```bash
+# good
+gpuq submit --project my-project -- \
+  C:/Users/you/Documents/my-project/.venv/Scripts/python.exe train.py
+
+# also fine
+gpuq submit --project my-project --passthrough .venv -- \
+  .venv/Scripts/python.exe train.py
+```
+
+gpuq tells you this explicitly if a job fails that way.
+
+**No terminal windows.** gpuq's dispatcher and job wrappers run under
+`pythonw.exe`, and every helper command it shells out to (`nvidia-smi`, `git`,
+`taskkill`) is launched with `CREATE_NO_WINDOW`. Both are necessary: a
+console-less parent that launches a console program makes Windows open a new
+*visible* console for it, and the dispatcher polls `nvidia-smi` regularly. The
+test suite asserts that no visible window ever appears.
+
+**Cancellation** uses Windows Job Objects, so `gpuq cancel` kills the whole
+process tree — including detached grandchildren such as dataloader workers or
+`torchrun` ranks. Windows cannot deliver a POSIX `SIGTERM` to a console-less
+child, so the polite stop is best-effort and the tree kill is the guarantee;
+`--force` skips the grace period.
+
+**`--shell`** runs through `cmd.exe /c` on Windows (`/bin/sh -c` elsewhere).
+
+**Job encoding.** Logs are UTF-8, so jobs get `PYTHONIOENCODING=utf-8` unless
+you override it with `--env`.

@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gpuq"
+version = "1.0.0"
+description = "Agent GPU workload broker - one gate for heavy GPU jobs across concurrent AI coding agents"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "samsundar989@gmail.com" }]
+dependencies = [
+    "typer>=0.12",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp[cli]>=2,<3"]
+dev = ["pytest>=8.0", "pytest-timeout>=2.3"]
+
+[project.scripts]
+gpuq = "gpuq.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gpuq"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+timeout = 300
+markers = [
+    "integration: end-to-end tests that spawn a real gpuq dispatcher daemon",
+    "gpu: requires a working NVIDIA GPU",
+]
