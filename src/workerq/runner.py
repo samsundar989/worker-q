@@ -74,10 +74,15 @@ def _capture_environment(config: Config, job: Job, argv: list[str]) -> dict[str,
     }
 
 
-def _cancel_requested(config: Config, job: Job) -> tuple[bool, bool]:
-    """(cancel_requested, force) as recorded by the backend for this job."""
+def _stop_intent(config: Config, job: Job) -> tuple[bool, bool, int | None]:
+    """(stop_requested, force, preempted_by) as recorded by the backend.
+
+    Cancellation and preemption both stop the child, but they mean opposite
+    things afterwards: a cancelled job is finished, a preempted one returns to
+    the queue and runs again later.
+    """
     if job.backend_job_id is None:
-        return False, False
+        return False, False, None
     try:
         from workerq.backends.queue_store import QueueStore
 
@@ -85,10 +90,12 @@ def _cancel_requested(config: Config, job: Job) -> tuple[bool, bool]:
         row = store.get(job.backend_job_id)
         store.close()
         if not row:
-            return False, False
-        return bool(row.get("cancel_requested")), bool(row.get("cancel_force"))
+            return False, False, None
+        if row.get("preempt_requested"):
+            return True, False, row.get("preempt_by")
+        return bool(row.get("cancel_requested")), bool(row.get("cancel_force")), None
     except Exception:
-        return False, False
+        return False, False, None
 
 
 def run_job(
@@ -234,6 +241,9 @@ def run_job(
 
     stop_watch = threading.Event()
     cancelled = threading.Event()
+    #: Backend id of the job that displaced this one, if any. Non-empty means
+    #: the job was preempted rather than cancelled or finished.
+    preempted_by: list[int] = []
 
     def _forward(signum: int, _frame: Any) -> None:
         """A signal aimed at the runner must reach the whole child tree."""
@@ -259,13 +269,28 @@ def run_job(
         grace = max(0, config.core.cancel_grace_seconds)
         signalled_at: float | None = None
         while not stop_watch.wait(_CANCEL_POLL_SECONDS):
-            requested, force = _cancel_requested(config, job)
+            requested, force, by = _stop_intent(config, job)
             if not requested:
                 continue
-            cancelled.set()
+            if by is not None:
+                # Preemption, not cancellation: do not mark the job cancelled,
+                # and allow the job's own grace period to stop cleanly.
+                if not preempted_by:
+                    preempted_by.append(int(by))
+                grace = max(0, config.preemption.grace_seconds)
+            else:
+                cancelled.set()
             if signalled_at is None:
                 signalled_at = time.monotonic()
-                print("\nworker-q: cancellation requested; stopping job", flush=True)
+                if by is not None:
+                    print(
+                        f"\nworker-q: PREEMPTED by a higher-priority job "
+                        f"(backend job #{by}). Stopping cleanly; this job goes "
+                        "back to the queue and will run again from the start.",
+                        flush=True,
+                    )
+                else:
+                    print("\nworker-q: cancellation requested; stopping job", flush=True)
                 group.signal_break()
                 if not force:
                     continue
@@ -291,6 +316,43 @@ def run_job(
 
     # ---- 9/10. persist final state -------------------------------------
     current = db.get_job(job_id)
+
+    # A preempted job did not finish: it goes back to QUEUED with its
+    # provenance recorded, so the worker can see why it stopped and follow it.
+    if preempted_by and (current is None or not current.is_terminal):
+        by = preempted_by[0]
+        displacer = db.get_job_by_backend_id(job.backend, by)
+        who = (
+            f"job #{displacer.id} ({displacer.project}, {displacer.priority})"
+            if displacer
+            else f"backend job #{by}"
+        )
+        reason = f"preempted by {who}"
+        db.try_update_state(
+            job_id,
+            JobState.QUEUED,
+            started_at=None,
+            runner_pid=None,
+            exit_code=None,
+            preemption_count=(current.preemption_count if current else 0) + 1,
+            preempted_at=finished_at,
+            preempted_by=displacer.id if displacer else None,
+            preempted_reason=reason,
+            error=reason,
+        )
+        _write_result(job_dir, job_id, exit_code, JobState.QUEUED, started_at, reason)
+        print(
+            f"worker-q: {'-' * 60}\n"
+            f"worker-q: job #{job_id} PREEMPTED at {finished_at} - {reason}.\n"
+            f"worker-q: It is QUEUED again, keeps id #{job_id}, and will re-run "
+            "its command from the start.\n"
+            f"worker-q: Track it with 'workerq show {job_id}' or block on it "
+            f"with 'workerq wait {job_id}'.",
+            flush=True,
+        )
+        db.close()
+        return exit_code
+
     if current is not None and current.is_terminal:
         final_state = current.state_enum  # already CANCELLED by the CLI
     elif cancelled.is_set():

@@ -197,6 +197,12 @@ def submit(
         None, "--vram", help="Peak VRAM this job needs, in GiB."
     ),
     cpus: Optional[int] = typer.Option(None, "--cpus", help="CPU cores this job needs."),
+    preemptible: Optional[bool] = typer.Option(
+        None,
+        "--preemptible/--no-preemptible",
+        help="Allow a higher-priority job to stop this one and requeue it. "
+        "Only safe if the command is resumable or cheap to repeat.",
+    ),
     label: Optional[str] = typer.Option(None, "--label", help="Free-text label."),
     cwd: Optional[str] = typer.Option(None, "--cwd", help="Directory to submit from."),
     snapshot: bool = typer.Option(
@@ -257,6 +263,7 @@ def submit(
         ram_gb=ram,
         vram_gb=vram,
         cpus=cpus,
+        preemptible=preemptible,
     )
 
     try:
@@ -300,6 +307,8 @@ def submit(
         footprint.append(f"{job.requested_cpus} CPU")
     if job.requested_gpu_count:
         footprint.append(f"{job.requested_gpu_count} GPU")
+    if job.preemptible:
+        footprint.append("preemptible")
     if footprint:
         console.print("Requests: " + ", ".join(footprint))
     console.print(f"Logs:     workerq logs {job.id} --follow")
@@ -497,6 +506,10 @@ def show(
         ("RAM requested", _fmt_gib(detail.get("requested_ram_mib"))),
         ("VRAM requested", _fmt_gib(detail.get("requested_vram_mib"))),
         ("CPUs requested", str(detail.get("requested_cpus") or "-")),
+        ("Preemptible", "yes" if detail.get("preemptible") else "no"),
+        ("Times preempted", str(detail.get("preemption_count") or 0)),
+        ("Last preempted", detail.get("preempted_at") or "-"),
+        ("Preempted by", str(detail.get("preempted_by") or "-")),
         ("GPU mode", detail["gpu_mode"]),
         ("CUDA_VISIBLE_DEVICES", detail.get("cuda_visible_devices") or "-"),
         ("Repo root", detail["repo_root"] or "-"),
@@ -1012,6 +1025,92 @@ def report(
     console.print()
     console.print(f"[bold]{data['verdict']}[/bold]")
     service.close()
+
+
+@app.command()
+def bump(
+    job_id: int = typer.Argument(..., help="worker-q job id."),
+    level: str = typer.Argument("critical", help="critical | high | normal | low"),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Raise one job's priority so it runs sooner.
+
+    A queued job jumps ahead of everything it now outranks. If the machine is
+    busy, it may also displace a *running* job - but only one that was submitted
+    `--preemptible`, because requeuing re-runs a command from the start.
+    """
+    service = get_service()
+    try:
+        result = service.bump_job(job_id, level)
+    except (JobNotFound, GPUQError) as exc:
+        service.close()
+        fail(str(exc))
+        return
+
+    if json_output:
+        emit_json(result)
+        service.close()
+        return
+
+    console.print(result["message"])
+    if result.get("state") == JobState.QUEUED.value:
+        console.print(
+            f"[dim]Watch it with: workerq wait {job_id}   "
+            f"(or workerq show {job_id})[/dim]"
+        )
+    service.close()
+
+
+@app.command()
+def wait(
+    job_id: int = typer.Argument(..., help="worker-q job id."),
+    timeout: Optional[float] = typer.Option(
+        None, "--timeout", help="Give up after this many seconds."
+    ),
+    poll: float = typer.Option(2.0, "--poll", help="Seconds between checks."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Block until a job finishes, then exit with the job's own exit code.
+
+    This is how a worker follows a job that was displaced: the id never changes,
+    so waiting on it survives any number of preemptions.
+    """
+    service = get_service()
+    try:
+        job = service.wait_for(job_id, timeout=timeout, poll=poll)
+    except JobNotFound as exc:
+        service.close()
+        fail(str(exc))
+        return
+    except KeyboardInterrupt:  # pragma: no cover
+        service.close()
+        raise typer.Exit(130)
+
+    payload = {
+        "job_id": job.id,
+        "state": job.state,
+        "exit_code": job.exit_code,
+        "preemption_count": job.preemption_count,
+        "timed_out": not job.is_terminal,
+    }
+    if json_output:
+        emit_json(payload)
+    elif not job.is_terminal:
+        console.print(f"job #{job.id} is still {job.state} (timed out waiting)")
+    else:
+        style = STATE_STYLES.get(job.state, "")
+        console.print(
+            f"job #{job.id} [{style}]{job.state}[/] (exit {job.exit_code})"
+            + (
+                f" after being preempted {job.preemption_count}x"
+                if job.preemption_count
+                else ""
+            )
+        )
+    service.close()
+    if not job.is_terminal:
+        raise typer.Exit(124)  # timeout, like coreutils
+    raise typer.Exit(job.exit_code if job.exit_code is not None else 1)
 
 
 @app.command()

@@ -36,10 +36,11 @@ from workerq.telemetry import (
     EVENT_BLOCKED,
     EVENT_DAEMON,
     EVENT_FINISHED,
+    EVENT_PREEMPTED,
     EVENT_STARTED,
     open_telemetry,
 )
-from workerq.util import ensure_dir, utcnow_iso
+from workerq.util import age_seconds, ensure_dir, utcnow_iso
 from workerq.winproc import (
     ProcessGroup,
     ExclusiveLock,
@@ -63,6 +64,10 @@ META_INTERPRETER = "interpreter"
 
 _GPU_CACHE_SECONDS = 3.0
 _SAMPLE_INTERVAL_SECONDS = 10.0
+#: How long after the runner's own grace period the dispatcher waits
+#: before killing it. The runner needs this window to record why the job
+#: stopped; killing it sooner loses the worker's only trace.
+_PREEMPT_BACKSTOP_MARGIN_SECONDS = 20.0
 
 
 @dataclass
@@ -236,6 +241,143 @@ class Dispatcher:
             EVENT_BLOCKED, backend_job_id=backend_id, detail=reason
         )
 
+    # -- preemption ---------------------------------------------------------
+    def _preemption_candidates(self, waiter: dict[str, Any]) -> list[dict[str, Any]]:
+        """Running jobs this waiter is allowed to displace, cheapest first.
+
+        Every guard here exists to stop preemption destroying work for nothing:
+        it must outrank the victim, the victim must have opted in, must have run
+        long enough to be worth interrupting, and must not already have been
+        displaced so often that it would starve.
+        """
+        cfg = self.config.preemption
+        if not cfg.enabled:
+            return []
+
+        waiter_rank = int(waiter.get("priority_rank") or 100)
+        candidates: list[dict[str, Any]] = []
+        for row in self.store.running():
+            backend_id = int(row["id"])
+            if row.get("preempt_requested"):
+                continue  # already stopping
+            if int(row.get("priority_rank") or 100) <= waiter_rank:
+                continue  # equal or higher priority is never displaced
+            if cfg.require_opt_in and not row.get("preemptible"):
+                continue
+            started = row.get("started_at")
+            ran_for = age_seconds(started) or 0.0
+            if ran_for < cfg.min_runtime_seconds:
+                continue
+            if backend_id not in self.running and backend_id not in self.adopted:
+                continue  # not ours to stop
+            candidates.append(row)
+
+        # Displace the least work: lowest priority first, then shortest running.
+        candidates.sort(
+            key=lambda r: (
+                -int(r.get("priority_rank") or 100),
+                -(age_seconds(r.get("started_at")) or 0.0),
+            )
+        )
+        return candidates
+
+    def _consider_preemption(self, waiter: dict[str, Any], reason: str | None) -> None:
+        """Displace running work only if doing so actually unblocks `waiter`.
+
+        Killing a job that does not free enough to let the waiter start would
+        lose the victim's progress and leave the waiter blocked anyway, so the
+        admission check is re-run against the reduced set of reservations before
+        anything is stopped.
+        """
+        cfg = self.config.preemption
+        if not cfg.enabled:
+            return
+
+        candidates = self._preemption_candidates(waiter)
+        if not candidates:
+            return
+
+        slots = max(1, self.store.get_meta_int(META_SLOTS, self.config.core.max_concurrent_jobs))
+        want = self._request_for(waiter)
+        running_rows = {int(r["id"]): r for r in self.store.running()}
+        in_flight = len(self.running) + len(self.adopted)
+
+        chosen: list[dict[str, Any]] = []
+        for victim in candidates:
+            chosen.append(victim)
+            remaining = [
+                self._request_for(r)
+                for bid, r in running_rows.items()
+                if bid not in {int(c["id"]) for c in chosen}
+            ]
+            frees_a_slot = (in_flight - len(chosen)) < slots
+            fits = res.admit(
+                self.config, want, remaining, gpu=self._gpu_info(), mem=host.memory()
+            ).admit
+            if frees_a_slot and fits:
+                break
+        else:
+            # Even displacing every candidate would not let the waiter run.
+            return
+
+        for victim in chosen:
+            victim_id = int(victim["id"])
+            if self.store.request_preempt(victim_id, by_backend_id=int(waiter["id"])):
+                self.log(
+                    f"job {victim_id}: preempted by job {waiter['id']} "
+                    f"(rank {waiter.get('priority_rank')} beats {victim.get('priority_rank')}); "
+                    f"{reason or 'higher priority'}"
+                )
+                self.telemetry.record_event(
+                    EVENT_PREEMPTED,
+                    backend_job_id=victim_id,
+                    detail=f"displaced by backend job {waiter['id']}",
+                    data={
+                        "by_backend_job_id": int(waiter["id"]),
+                        "waiter_rank": waiter.get("priority_rank"),
+                        "victim_rank": victim.get("priority_rank"),
+                        "reason": reason,
+                    },
+                )
+
+    def _service_preemptions(self) -> None:
+        """Backstop for a requested preemption.
+
+        The runner owns the stop: it sees the flag, stops its child within the
+        configured grace period, and records *why* it stopped so the worker can
+        find its job again. Killing the runner would destroy exactly that
+        record, so this only fires well after the runner's own deadline has
+        passed - it is for a wedged runner, not the normal path.
+        """
+        cfg = self.config.preemption
+        backstop = cfg.grace_seconds + _PREEMPT_BACKSTOP_MARGIN_SECONDS
+        rows = self.store.conn.execute(
+            "SELECT id, preempt_at, pid, pid_creation FROM bjobs "
+            "WHERE COALESCE(preempt_requested, 0) = 1 AND state = ?",
+            (BACKEND_RUNNING,),
+        ).fetchall()
+        for row in rows:
+            backend_id = int(row["id"])
+            waited = age_seconds(row["preempt_at"]) or 0.0
+            if waited < backstop:
+                continue  # let the runner stop cleanly and record the reason
+
+            job = self.running.get(backend_id)
+            if job is None:
+                # Adopted from a previous dispatcher: no handle, verified kill.
+                pid, creation = row["pid"], row["pid_creation"]
+                if pid:
+                    self.log(f"job {backend_id}: preemption backstop killing pid {pid}")
+                    terminate_tree(int(pid), expected_creation=creation)
+                continue
+
+            self.log(
+                f"job {backend_id}: runner did not stop within {backstop:.0f}s of "
+                "preemption; killing its process tree"
+            )
+            job.group.terminate()
+            terminate_tree(job.proc.pid)
+
     # -- telemetry ----------------------------------------------------------
     def _sample_resources(self) -> None:
         """Cheap periodic snapshot so failures can be explained afterwards."""
@@ -361,12 +503,17 @@ class Dispatcher:
         first_blocked_reason: str | None = None
 
         for row in queued:
-            if in_flight >= slots:
-                break
             if row.get("cancel_requested"):
                 continue  # handled by the cancellation pass
 
             backend_id = int(row["id"])
+
+            if in_flight >= slots:
+                # No slot free. The highest-priority waiter still gets a chance
+                # to displace something it outranks; if it cannot, nobody
+                # further down the queue could either.
+                self._consider_preemption(row, "waiting for a free slot")
+                break
 
             # Admission control: does this job's declared RAM/CPU/VRAM fit in
             # the headroom that is actually free, once running reservations and
@@ -377,6 +524,7 @@ class Dispatcher:
                     first_blocked_reason = decision.reason
                     self.store.update(backend_id, wait_reason=decision.reason)
                     self._note_blocked(backend_id, decision.reason or "blocked")
+                    self._consider_preemption(row, decision.reason)
                 break
 
             devices, reason = self._allocate_devices(int(row.get("gpu_count") or 0))
@@ -387,6 +535,7 @@ class Dispatcher:
                     first_blocked_reason = reason
                     self.store.update(backend_id, wait_reason=reason)
                     self._note_blocked(backend_id, reason or "blocked")
+                    self._consider_preemption(row, reason)
                 break
 
             if self._start_job(row, devices):
@@ -408,6 +557,19 @@ class Dispatcher:
                 except OSError:
                     pass
             job.group.close()
+
+            # A displaced job goes back to the queue rather than being recorded
+            # as finished: it did not fail, it was interrupted.
+            row = self.store.get(backend_id) or {}
+            if row.get("preempt_requested"):
+                self.store.requeue(backend_id)
+                self.log(f"job {backend_id}: requeued after preemption (exit={code})")
+                self.telemetry.record_event(
+                    EVENT_PREEMPTED, backend_job_id=backend_id,
+                    detail="requeued", data={"exit_code": code},
+                )
+                continue
+
             self.store.finish(backend_id, exit_code=code)
             self.log(f"job {backend_id}: finished exit={code}")
             self.telemetry.record_event(
@@ -525,6 +687,7 @@ class Dispatcher:
                     self._sample_resources()
                     self._reap()
                     self._service_cancellations()
+                    self._service_preemptions()
                     self._start_ready_jobs()
                     trim_counter += 1
                     if trim_counter >= int(60 / max(interval, 0.05)):

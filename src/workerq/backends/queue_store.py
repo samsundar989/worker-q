@@ -65,13 +65,17 @@ _ADDED_COLUMNS = (
     ("ram_mib", "REAL"),
     ("vram_mib", "REAL"),
     ("cpus", "INTEGER"),
+    ("preemptible", "INTEGER NOT NULL DEFAULT 0"),
+    ("preempt_requested", "INTEGER NOT NULL DEFAULT 0"),
+    ("preempt_by", "INTEGER"),
+    ("preempt_at", "TEXT"),
 )
 
 _COLUMNS = (
     "id, label, argv_json, cwd, env_json, gpu_count, slots, priority_rank, position, "
     "log_path, state, exit_code, pid, pid_creation, assigned_devices, cancel_requested, "
     "cancel_force, cancel_at, wait_reason, enqueued_at, started_at, finished_at, "
-    "ram_mib, vram_mib, cpus"
+    "ram_mib, vram_mib, cpus, preemptible, preempt_requested, preempt_by, preempt_at"
 )
 
 
@@ -154,6 +158,7 @@ class QueueStore:
         ram_mib: float | None = None,
         vram_mib: float | None = None,
         cpus: int | None = None,
+        preemptible: bool = False,
     ) -> int:
         with self.transaction() as conn:
             row = conn.execute("SELECT COALESCE(MAX(position), 0) AS p FROM bjobs").fetchone()
@@ -161,8 +166,8 @@ class QueueStore:
             cur = conn.execute(
                 "INSERT INTO bjobs (label, argv_json, cwd, env_json, gpu_count, slots, "
                 "priority_rank, position, log_path, state, enqueued_at, ram_mib, "
-                "vram_mib, cpus) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "vram_mib, cpus, preemptible) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     label,
                     json.dumps(argv, ensure_ascii=False),
@@ -178,6 +183,7 @@ class QueueStore:
                     ram_mib,
                     vram_mib,
                     cpus,
+                    1 if preemptible else 0,
                 ),
             )
             return int(cur.lastrowid)
@@ -274,6 +280,56 @@ class QueueStore:
             )
             return cur.rowcount == 1
 
+    def request_preempt(self, backend_id: int, *, by_backend_id: int | None) -> bool:
+        """Ask a running job to stop so a higher-priority one can start."""
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE bjobs SET preempt_requested = 1, preempt_by = ?, preempt_at = ? "
+                "WHERE id = ? AND state = ? AND COALESCE(preempt_requested, 0) = 0",
+                (by_backend_id, utcnow_iso(), backend_id, BACKEND_RUNNING),
+            )
+            return cur.rowcount == 1
+
+    def requeue(self, backend_id: int, *, priority_rank: int | None = None) -> bool:
+        """Return a displaced job to the queue rather than finishing it.
+
+        It goes to the head of its own priority tier: it already waited once and
+        was interrupted, so it should not also go to the back of the line.
+        """
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT priority_rank FROM bjobs WHERE id = ?", (backend_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            rank = priority_rank if priority_rank is not None else int(row["priority_rank"])
+            head = conn.execute(
+                "SELECT COALESCE(MIN(position), 0) AS p FROM bjobs WHERE state = ?",
+                (BACKEND_QUEUED,),
+            ).fetchone()
+            cur = conn.execute(
+                "UPDATE bjobs SET state = ?, priority_rank = ?, position = ?, "
+                "pid = NULL, pid_creation = NULL, started_at = NULL, "
+                "assigned_devices = NULL, preempt_requested = 0, preempt_by = NULL, "
+                "preempt_at = NULL, wait_reason = ? WHERE id = ?",
+                (
+                    BACKEND_QUEUED,
+                    rank,
+                    int(head["p"]) - 1,
+                    "requeued after preemption",
+                    backend_id,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def set_preemptible(self, backend_id: int, preemptible: bool) -> bool:
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE bjobs SET preemptible = ? WHERE id = ?",
+                (1 if preemptible else 0, backend_id),
+            )
+            return cur.rowcount == 1
+
     def set_priority(self, backend_id: int, priority_rank: int) -> bool:
         """Re-rank a queued job in place, keeping its arrival order within the tier."""
         with self.transaction() as conn:
@@ -341,5 +397,8 @@ def row_to_backend_job(row: dict[str, Any]) -> BackendJob:
             "ram_mib": row.get("ram_mib"),
             "vram_mib": row.get("vram_mib"),
             "cpus": row.get("cpus"),
+            "preemptible": bool(row.get("preemptible")),
+            "preempt_requested": bool(row.get("preempt_requested")),
+            "preempt_by": row.get("preempt_by"),
         },
     )

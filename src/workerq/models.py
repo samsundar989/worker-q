@@ -50,8 +50,18 @@ ALLOWED_TRANSITIONS: dict[JobState, frozenset[JobState]] = {
             JobState.LOST,
         }
     ),
+    # RUNNING -> QUEUED is legal *only* for preemption: a higher-priority job
+    # displaced this one, so it goes back to the queue rather than failing. It
+    # is the one backwards edge in this machine; everything else still moves
+    # forward only, and a terminal state is still permanent.
     JobState.RUNNING: frozenset(
-        {JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED, JobState.LOST}
+        {
+            JobState.QUEUED,
+            JobState.SUCCEEDED,
+            JobState.FAILED,
+            JobState.CANCELLED,
+            JobState.LOST,
+        }
     ),
     JobState.SUCCEEDED: frozenset(),
     JobState.FAILED: frozenset(),
@@ -154,6 +164,11 @@ class Job:
     requested_ram_mib: float | None = None
     requested_vram_mib: float | None = None
     requested_cpus: int | None = None
+    preemptible: int = 0
+    preemption_count: int = 0
+    preempted_at: str | None = None
+    preempted_by: int | None = None
+    preempted_reason: str | None = None
     passthrough_json: str | None = None
     env_json: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
@@ -229,6 +244,11 @@ class Job:
             "requested_ram_mib": self.requested_ram_mib,
             "requested_vram_mib": self.requested_vram_mib,
             "requested_cpus": self.requested_cpus,
+            "preemptible": bool(self.preemptible),
+            "preemption_count": self.preemption_count,
+            "preempted_at": self.preempted_at,
+            "preempted_by": self.preempted_by,
+            "preempted_reason": self.preempted_reason,
             "gpu_mode": self.gpu_mode,
             "snapshot_mode": self.snapshot_mode,
             "snapshot_commit": self.snapshot_commit,

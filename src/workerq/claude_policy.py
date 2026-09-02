@@ -54,12 +54,37 @@ parallel and serialise big ones, instead of guessing:
 
     workerq submit --project <project> --ram 24 --vram 12 --cpus 4 -- <command>
 
+Add `--preemptible` when the command is resumable, so urgent work can
+displace it instead of waiting:
+
+    workerq submit --project <project> --ram 24 --preemptible -- <command>
+
 `--ram` and `--vram` are peak GiB. Estimate high rather than low; an undeclared
 job is charged a small default and may be admitted when it should have waited.
 A job that asks for more than the machine has is rejected immediately rather
 than queued forever.
 
 Use `--priority critical` only for work that is genuinely blocking urgent progress.
+
+**Raising a job you already submitted.** If work becomes urgent after you queued
+it, raise that job rather than resubmitting:
+
+    workerq bump <job_id> critical
+
+A raised job jumps ahead of everything it now outranks. If the machine is busy it
+may also stop a *running* job - but only one submitted `--preemptible`.
+
+**If your job stops with PREEMPTED.** It was not cancelled and it did not fail:
+a higher-priority job displaced it. It keeps the same job id, goes back to the
+queue, and runs again from the start. Do not resubmit it - that would duplicate
+the work. Find it with `workerq show <job_id>`, which reports what displaced it
+and how many times, and follow it with:
+
+    workerq wait <job_id>      blocks until it finishes, exits with its exit code
+
+**Only mark a job `--preemptible` if re-running it is safe** - it resumes from a
+checkpoint, or it is cheap to repeat. An expensive job with no checkpointing
+should never be preemptible, because being displaced throws away its progress.
 
 Some projects carry a standing priority set by the machine's owner, which your
 submissions inherit automatically - you do not need to pass `--priority` to get

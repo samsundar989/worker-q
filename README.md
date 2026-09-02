@@ -337,6 +337,68 @@ priority never relaxes a resource-safety rule.
 workerq promote 42        # move a queued job to the front by hand
 ```
 
+### Raising a job after you submitted it
+
+```bash
+workerq bump 42 critical      # this job now outranks everything below it
+```
+
+A raised job jumps ahead of everything queued that it now outranks. If the
+machine is busy it can also **stop a running job** — but only one that was
+submitted `--preemptible`.
+
+### Preemption
+
+```bash
+workerq submit --project arc-agi --ram 20 --preemptible -- python train.py
+```
+
+`--preemptible` means *"safe to stop and re-run"*. A displaced job is **not**
+cancelled and has **not** failed: it returns to the queue, keeps the same job
+id, and runs its command again from the start.
+
+That last part is the whole risk. **Only mark a job preemptible if re-running it
+is safe** — it resumes from a checkpoint, or it is cheap to repeat. A six-hour
+training run with no checkpointing should never be preemptible, because being
+displaced throws the six hours away.
+
+Nothing is displaced unless every one of these holds:
+
+- preemption is enabled, and the waiting job **strictly outranks** the running one;
+- the running job declared `--preemptible`;
+- it has already run for `min_runtime_seconds` (default 60), so a burst of urgent
+  work cannot leave nothing making progress;
+- displacing it **actually lets the waiter start** — the admission check is re-run
+  against the freed resources first, so no work is destroyed for nothing.
+
+A displaced job writes a banner into its own log, and `workerq show` reports what
+stopped it:
+
+```text
+Times preempted    1
+Preempted by       58
+```
+
+Follow it to completion with:
+
+```bash
+workerq wait 42     # blocks, then exits with the job's own exit code
+```
+
+`wait` is the notification primitive: the job id never changes, so waiting on it
+survives any number of preemptions.
+
+Tune the guard rails in `[preemption]`:
+
+```toml
+[preemption]
+enabled = true
+require_opt_in = true      # false lets any lower-priority job be displaced
+min_runtime_seconds = 60
+max_preemptions = 3
+grace_seconds = 30         # time to stop cleanly before the tree is killed
+```
+
 ### Making a whole project more important
 
 Rather than remembering `--priority` on every submission, set it once for the
@@ -506,6 +568,8 @@ See [docs/architecture.md](docs/architecture.md),
 | `workerq logs ID [--follow] [--tail N]` | Job output. |
 | `workerq cancel ID [--force]` | Cancel queued or running work. |
 | `workerq promote ID` | Move a queued job to the front. |
+| `workerq bump ID LEVEL` | Raise one job's priority; may displace running work. |
+| `workerq wait ID` | Block until a job finishes; exits with its exit code. |
 | `workerq priority [PROJECT LEVEL]` | Show/set a project's default priority. |
 | `workerq doctor` | Health checks. Exit 0/1/2. |
 | `workerq gpu` | GPU inventory and who holds VRAM. |

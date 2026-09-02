@@ -22,7 +22,7 @@ from workerq.models import (
 )
 from workerq.util import ensure_dir, restrict_permissions, utcnow_iso
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _MIGRATIONS: list[tuple[int, str]] = [
     (
@@ -110,6 +110,20 @@ _MIGRATIONS: list[tuple[int, str]] = [
         );
         """,
     ),
+    (
+        4,
+        """
+        -- Preemption. A job is only ever displaced if it declared itself safe
+        -- to stop and re-run, because requeuing means re-executing the command
+        -- from the start. The counters exist so a displaced job cannot be
+        -- starved by repeated preemption.
+        ALTER TABLE jobs ADD COLUMN preemptible INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE jobs ADD COLUMN preemption_count INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE jobs ADD COLUMN preempted_at TEXT;
+        ALTER TABLE jobs ADD COLUMN preempted_by INTEGER;
+        ALTER TABLE jobs ADD COLUMN preempted_reason TEXT;
+        """,
+    ),
 ]
 
 _JOB_COLUMNS = (
@@ -118,7 +132,8 @@ _JOB_COLUMNS = (
     "snapshot_commit, snapshot_path, host, submitter_pid, submitter_agent, state, exit_code, "
     "runner_pid, queued_at, started_at, finished_at, error, created_at, updated_at, log_path, "
     "cuda_visible_devices, passthrough_json, env_json, requested_ram_mib, "
-    "requested_vram_mib, requested_cpus"
+    "requested_vram_mib, requested_cpus, preemptible, preemption_count, "
+    "preempted_at, preempted_by, preempted_reason"
 )
 
 #: Columns callers are allowed to update through `update_job`.
@@ -144,6 +159,11 @@ _UPDATABLE = frozenset(
         "requested_ram_mib",
         "requested_vram_mib",
         "requested_cpus",
+        "preemptible",
+        "preemption_count",
+        "preempted_at",
+        "preempted_by",
+        "preempted_reason",
     }
 )
 

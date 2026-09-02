@@ -220,6 +220,12 @@ def test_policy_text_matches_the_spec():
         "--ram 24 --vram 12 --cpus 4",
         "workerq top",
         "workerq report",
+        # Preemption is destructive for non-resumable work, so the policy
+        # must teach both the lever and the caveat.
+        "workerq bump <job_id> critical",
+        "workerq wait <job_id>",
+        "--preemptible",
+        "Do not resubmit it",
     ):
         assert required in body
 

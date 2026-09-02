@@ -115,6 +115,30 @@ class ResourcesConfig:
 
 
 @dataclass
+class PreemptionConfig:
+    """When a higher-priority job may displace a running one.
+
+    Preemption requeues the displaced job, which means its command runs again
+    from the start. That is destructive for anything not resumable, so it is
+    opt-in per job by default and hedged with guards against thrashing and
+    starvation.
+    """
+
+    enabled: bool = True
+    #: Only displace jobs that declared `--preemptible`. Turning this off lets
+    #: any lower-priority job be displaced, which will lose work.
+    require_opt_in: bool = True
+    #: A job must have run this long before it can be displaced, so a burst of
+    #: high-priority submissions cannot leave nothing making progress.
+    min_runtime_seconds: int = 60
+    #: After this many displacements a job stops being a candidate, so it
+    #: cannot be starved forever.
+    max_preemptions: int = 3
+    #: Time allowed for the job to stop cleanly before its tree is killed.
+    grace_seconds: int = 30
+
+
+@dataclass
 class ClaudeConfig:
     install_user_policy: bool = True
     hide_cuda_in_safe_launcher: bool = False
@@ -126,6 +150,7 @@ class Config:
     gpu: GpuConfig = field(default_factory=GpuConfig)
     backend: BackendConfig = field(default_factory=BackendConfig)
     resources: ResourcesConfig = field(default_factory=ResourcesConfig)
+    preemption: PreemptionConfig = field(default_factory=PreemptionConfig)
     claude: ClaudeConfig = field(default_factory=ClaudeConfig)
 
     #: Path the config was loaded from (may not exist yet).
@@ -229,6 +254,10 @@ class Config:
             raise ConfigError("backend.max_finished must be >= 1")
         if b.poll_interval_seconds <= 0:
             raise ConfigError("backend.poll_interval_seconds must be > 0")
+        pre = self.preemption
+        for name in ("min_runtime_seconds", "max_preemptions", "grace_seconds"):
+            if getattr(pre, name) < 0:
+                raise ConfigError(f"preemption.{name} must be >= 0")
         r = self.resources
         for name in ("default_ram_gb", "default_vram_gb", "reserve_ram_gb", "reserve_vram_gb"):
             if getattr(r, name) < 0:
@@ -248,6 +277,7 @@ class Config:
             "gpu": asdict(self.gpu),
             "backend": asdict(self.backend),
             "resources": asdict(self.resources),
+            "preemption": asdict(self.preemption),
             "claude": asdict(self.claude),
         }
 
@@ -299,6 +329,7 @@ _SECTION_TYPES: dict[str, type] = {
     "gpu": GpuConfig,
     "backend": BackendConfig,
     "resources": ResourcesConfig,
+    "preemption": PreemptionConfig,
     "claude": ClaudeConfig,
 }
 
@@ -400,6 +431,7 @@ def _from_dict(
         gpu=GpuConfig(**data.get("gpu", {})),
         backend=BackendConfig(**data.get("backend", {})),
         resources=ResourcesConfig(**data.get("resources", {})),
+        preemption=PreemptionConfig(**data.get("preemption", {})),
         claude=ClaudeConfig(**data.get("claude", {})),
         source_path=source_path,
         profile=profile,

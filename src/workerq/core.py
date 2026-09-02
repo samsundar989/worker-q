@@ -100,6 +100,8 @@ class SubmitRequest:
     ram_gb: float | None = None
     vram_gb: float | None = None
     cpus: int | None = None
+    #: Safe to stop and re-run, so a higher-priority job may displace it.
+    preemptible: bool | None = None
 
 
 @dataclass
@@ -235,6 +237,7 @@ class GPUQService:
         repo_root = find_repo_root(submitted_cwd)
         project = request.project or self._infer_project(repo_root, submitted_cwd)
         priority = self.resolve_priority(project, request.priority, repo_root)
+        preemptible = self.resolve_preemptible(request.preemptible, repo_root)
 
         passthrough = list(request.passthrough or [])
         passthrough += [p for p in load_project_passthrough(repo_root) if p not in passthrough]
@@ -281,6 +284,7 @@ class GPUQService:
             requested_ram_mib=ram_mib,
             requested_vram_mib=vram_mib,
             requested_cpus=cpus,
+            preemptible=1 if preemptible else 0,
             log_path=str(self.config.log_path(0)),  # placeholder, fixed below
         )
 
@@ -322,6 +326,7 @@ class GPUQService:
                 ram_mib=ram_mib,
                 vram_mib=vram_mib,
                 cpus=cpus,
+                preemptible=preemptible,
             )
 
             # ---- 5/6. record backend id, mark QUEUED -----------------
@@ -412,6 +417,20 @@ class GPUQService:
         except ValueError:
             return Priority.NORMAL
 
+    @staticmethod
+    def resolve_preemptible(explicit: bool | None, repo_root: Path | None) -> bool:
+        """Whether this job may be displaced.
+
+        Explicit `--preemptible/--no-preemptible` wins; otherwise a repository
+        may opt in for all its jobs via `[project] preemptible` in `.gpuq.toml`.
+        Defaults to False, because requeuing re-runs the command from the start
+        and that is destructive for anything not resumable.
+        """
+        if explicit is not None:
+            return bool(explicit)
+        value = load_project_defaults(repo_root).get("preemptible")
+        return bool(value) if isinstance(value, bool) else False
+
     # ------------------------------------------------------------------
     # Project policy
     # ------------------------------------------------------------------
@@ -459,6 +478,93 @@ class GPUQService:
                 + (f"; re-ranked {requeued} queued job(s)" if requeued else "")
             ),
         }
+
+    def bump_job(self, job_id: int, level: str) -> dict[str, Any]:
+        """Raise (or lower) one job's priority.
+
+        A queued job is re-ranked immediately. A *running* job is re-ranked too,
+        which matters because the dispatcher compares a waiter's rank against
+        what is running when it decides whether anything may be displaced.
+        """
+        try:
+            priority = Priority(level)
+        except ValueError:
+            raise GPUQError(
+                f"invalid priority {level!r}; choose from critical, high, normal, low"
+            ) from None
+
+        job = self.get_job(job_id)
+        if job.is_terminal:
+            raise GPUQError(
+                f"job #{job_id} already finished in state {job.state}; nothing to raise"
+            )
+        if job.backend_job_id is None:
+            self.db.update_job(job_id, priority=priority.value)
+            return {
+                "job_id": job_id,
+                "priority": priority.value,
+                "message": f"job #{job_id} set to '{priority.value}' (not yet queued)",
+            }
+
+        rank = priority_rank(priority)
+        self.db.update_job(job_id, priority=priority.value)
+        try:
+            self.backend.set_priority(job.backend_job_id, rank)
+        except BackendUnavailable:
+            # A running job has no queue position to re-rank; the recorded
+            # priority is what the dispatcher reads, so this is not an error.
+            self.backend.store.update(job.backend_job_id, priority_rank=rank)
+
+        return {
+            "job_id": job_id,
+            "priority": priority.value,
+            "state": job.state,
+            "message": (
+                f"job #{job_id} raised to '{priority.value}'"
+                + (
+                    "; it may now displace lower-priority preemptible work"
+                    if job.state == JobState.QUEUED.value
+                    else ""
+                )
+            ),
+        }
+
+    def preemption_report(self, job_id: int) -> dict[str, Any]:
+        """Why a job stopped and where it now sits, for the worker that owns it."""
+        job = self.get_job(job_id)
+        position = self._queue_position(job_id)
+        displacer = self.db.get_job(job.preempted_by) if job.preempted_by else None
+        return {
+            "job_id": job.id,
+            "state": job.state,
+            "preemptible": bool(job.preemptible),
+            "preemption_count": job.preemption_count,
+            "preempted_at": job.preempted_at,
+            "preempted_by": job.preempted_by,
+            "preempted_by_project": displacer.project if displacer else None,
+            "preempted_reason": job.preempted_reason,
+            "queue_position": position,
+            "wait_reason": self.queue_wait_reason(job),
+        }
+
+    def wait_for(
+        self, job_id: int, *, timeout: float | None = None, poll: float = 2.0
+    ) -> Job:
+        """Block until a job reaches a terminal state.
+
+        This is the notification primitive: a worker whose job was displaced can
+        wait on the same id rather than polling `status` and guessing.
+        """
+        import time as _time
+
+        deadline = None if timeout is None else _time.monotonic() + timeout
+        while True:
+            job = self.get_job(job_id)
+            if job.is_terminal:
+                return job
+            if deadline is not None and _time.monotonic() >= deadline:
+                return job
+            _time.sleep(max(0.2, poll))
 
     def list_project_priorities(self) -> list[dict[str, Any]]:
         self.ensure_ready()

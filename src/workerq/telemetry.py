@@ -64,6 +64,7 @@ EVENT_STARTED = "job_started"
 EVENT_FINISHED = "job_finished"
 EVENT_BLOCKED = "job_blocked"
 EVENT_CANCEL = "job_cancel"
+EVENT_PREEMPTED = "job_preempted"
 EVENT_DAEMON = "daemon"
 EVENT_PRESSURE = "resource_pressure"
 

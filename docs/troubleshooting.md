@@ -274,6 +274,50 @@ page file raises the limit if that is genuinely what you want.
 
 ---
 
+## My job says PREEMPTED — did it fail?
+
+No. It was not cancelled and it did not crash: a higher-priority job displaced
+it. It keeps the same job id, went back to the queue, and will run its command
+again from the start.
+
+**Do not resubmit it** — that would duplicate the work. Track the original:
+
+```bash
+workerq show 42     # "Times preempted", "Preempted by"
+workerq wait 42     # blocks until it finishes, exits with its exit code
+```
+
+Its log carries a banner naming what displaced it.
+
+### Why was it eligible at all?
+
+Only because it was submitted `--preemptible`. Without that flag nothing
+displaces a running job. If a job should never be interrupted, submit it without
+the flag — or remove `preemptible = true` from the project's `.gpuq.toml`.
+
+### It keeps getting preempted
+
+`max_preemptions` (default 3) caps this: after that many displacements a job
+stops being a candidate, so it cannot be starved indefinitely. If it is still
+thrashing, the usual cause is a stream of `critical` submissions — check with:
+
+```bash
+workerq report
+workerq priority              # is a whole project pinned high?
+```
+
+### Turning preemption off
+
+```bash
+workerq config set preemption.enabled false
+```
+
+Running jobs then always finish, and urgent work waits for a free slot.
+
+---
+
+---
+
 ## Cancel did not stop everything
 
 ```bash

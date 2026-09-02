@@ -264,6 +264,7 @@ class LocalDispatcherBackend:
         ram_mib: float | None = None,
         vram_mib: float | None = None,
         cpus: int | None = None,
+        preemptible: bool = False,
     ) -> int:
         """Enqueue an argv vector. No shell, no string concatenation."""
         argv = [str(a) for a in argv]
@@ -285,6 +286,7 @@ class LocalDispatcherBackend:
             ram_mib=ram_mib,
             vram_mib=vram_mib,
             cpus=cpus,
+            preemptible=preemptible,
         )
 
     def list_jobs(self, *, limit: int | None = None) -> list[BackendJob]:
