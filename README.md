@@ -334,6 +334,34 @@ priority never relaxes a resource-safety rule.
 gpuq promote 42        # move a queued job to the front by hand
 ```
 
+### Making a whole project more important
+
+Rather than remembering `--priority` on every submission, set it once for the
+project. Every worker on it inherits the setting, and queued jobs are re-ranked
+immediately:
+
+```bash
+gpuq priority arc-agi high --note "comp deadline Friday"
+gpuq priority                       # show all project policies
+gpuq priority arc-agi --clear       # back to the default
+```
+
+Precedence, most specific first:
+
+1. `--priority` on the submission (a worker asking for something specific wins)
+2. the project policy set by `gpuq priority`
+3. `[project] priority` in that repo's `.gpuq.toml`
+4. `core.default_priority`
+
+Use `gpuq priority` for "this project matters *this week*" — it needs no repo
+edits and no worker changes. Use `.gpuq.toml` for a project that is permanently
+more or less important than the rest.
+
+> Ordering is strict: a steady stream of `critical` work will keep `low` work
+> waiting indefinitely. There is no aging in V1, so prefer `high` over
+> `critical` for sustained importance, and reserve `critical` for genuinely
+> blocking work.
+
 ---
 
 ## Concurrency and the GPU threshold
@@ -475,6 +503,7 @@ See [docs/architecture.md](docs/architecture.md),
 | `gpuq logs ID [--follow] [--tail N]` | Job output. |
 | `gpuq cancel ID [--force]` | Cancel queued or running work. |
 | `gpuq promote ID` | Move a queued job to the front. |
+| `gpuq priority [PROJECT LEVEL]` | Show/set a project's default priority. |
 | `gpuq doctor` | Health checks. Exit 0/1/2. |
 | `gpuq gpu` | GPU inventory and who holds VRAM. |
 | `gpuq reconcile` | Repair metadata after a crash. |

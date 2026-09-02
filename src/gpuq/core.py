@@ -85,7 +85,8 @@ def map_backend_state(backend_state: str, exit_code: int | None) -> JobState | N
 class SubmitRequest:
     command: list[str]
     project: str | None = None
-    priority: str = "normal"
+    #: None means "not specified" - the project's own policy then decides.
+    priority: str | None = None
     gpus: int | None = None
     label: str | None = None
     cwd: str | None = None
@@ -195,13 +196,14 @@ class GPUQService:
                     "Usage: gpuq submit --project NAME -- <command> [args...]"
                 )
 
-        try:
-            priority = Priority(request.priority)
-        except ValueError:
-            raise GPUQError(
-                f"invalid priority {request.priority!r}; "
-                "choose from critical, high, normal, low"
-            ) from None
+        if request.priority is not None:
+            try:
+                Priority(request.priority)
+            except ValueError:
+                raise GPUQError(
+                    f"invalid priority {request.priority!r}; "
+                    "choose from critical, high, normal, low"
+                ) from None
 
         gpus = self.config.gpu.default_gpu_count if request.gpus is None else request.gpus
         if gpus < 0:
@@ -232,6 +234,7 @@ class GPUQService:
 
         repo_root = find_repo_root(submitted_cwd)
         project = request.project or self._infer_project(repo_root, submitted_cwd)
+        priority = self.resolve_priority(project, request.priority, repo_root)
 
         passthrough = list(request.passthrough or [])
         passthrough += [p for p in load_project_passthrough(repo_root) if p not in passthrough]
@@ -368,6 +371,98 @@ class GPUQService:
             if isinstance(exc, (SnapshotError, GPUQError)):
                 raise GPUQError(f"job not submitted: {exc}") from exc
             raise
+
+    def resolve_priority(
+        self,
+        project: str,
+        explicit: str | None,
+        repo_root: Path | None = None,
+    ) -> Priority:
+        """Decide a job's priority.
+
+        Precedence, most specific first:
+
+        1. `--priority` on the submission
+        2. the project's policy (`gpuq priority <project> high`) - set once,
+           machine-wide, so every worker on that project inherits it without
+           editing anything
+        3. `[project] priority` in the repo's `.gpuq.toml`
+        4. `core.default_priority`
+        """
+        if explicit:
+            return Priority(explicit)
+
+        self.ensure_ready()
+        policy = self.db.get_project_priority(project)
+        if policy:
+            try:
+                return Priority(policy)
+            except ValueError:
+                pass  # a hand-edited row must not break submission
+
+        repo_default = load_project_defaults(repo_root).get("priority")
+        if isinstance(repo_default, str):
+            try:
+                return Priority(repo_default.strip())
+            except ValueError:
+                pass
+
+        try:
+            return Priority(self.config.core.default_priority)
+        except ValueError:
+            return Priority.NORMAL
+
+    # ------------------------------------------------------------------
+    # Project policy
+    # ------------------------------------------------------------------
+    def set_project_priority(
+        self, project: str, priority: str | None, *, note: str | None = None
+    ) -> dict[str, Any]:
+        """Set a project's default priority and re-rank its queued work.
+
+        Re-ranking is the point: marking a project urgent should affect the
+        jobs already waiting, not only the next one submitted.
+        """
+        self.ensure_ready()
+        if priority is not None:
+            try:
+                Priority(priority)
+            except ValueError:
+                raise GPUQError(
+                    f"invalid priority {priority!r}; "
+                    "choose from critical, high, normal, low"
+                ) from None
+
+        self.db.set_project_priority(project, priority, note=note)
+
+        requeued = 0
+        if priority is not None:
+            rank = priority_rank(priority)
+            for job in self.db.list_jobs(states=[JobState.QUEUED.value], project=project):
+                if job.backend_job_id is None:
+                    continue
+                try:
+                    self.backend.set_priority(job.backend_job_id, rank)
+                    self.db.update_job(job.id, priority=priority)
+                    requeued += 1
+                except Exception:
+                    continue
+
+        return {
+            "project": project,
+            "priority": priority,
+            "requeued": requeued,
+            "message": (
+                f"project '{project}' priority cleared"
+                if priority is None
+                else f"project '{project}' now submits at '{priority}'"
+                + (f"; re-ranked {requeued} queued job(s)" if requeued else "")
+            ),
+        }
+
+    def list_project_priorities(self) -> list[dict[str, Any]]:
+        self.ensure_ready()
+        return self.db.list_project_priorities()
 
     def _reject_impossible(
         self, ram_mib: float | None, vram_mib: float | None, cpus: int | None

@@ -61,6 +61,12 @@ than queued forever.
 
 Use `--priority critical` only for work that is genuinely blocking urgent progress.
 
+Some projects carry a standing priority set by the machine's owner, which your
+submissions inherit automatically - you do not need to pass `--priority` to get
+it. Do not run `gpuq priority` yourself; which project matters most is not an
+agent's decision. Passing an explicit `--priority` overrides that policy for a
+single job, so only do it when this particular job really differs.
+
 After submitting, continue independent coding/research/testing instead of waiting
 unless the result is required for the next action.
 

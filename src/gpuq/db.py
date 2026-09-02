@@ -22,7 +22,7 @@ from gpuq.models import (
 )
 from gpuq.util import ensure_dir, restrict_permissions, utcnow_iso
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _MIGRATIONS: list[tuple[int, str]] = [
     (
@@ -94,6 +94,20 @@ _MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE jobs ADD COLUMN requested_ram_mib REAL;
         ALTER TABLE jobs ADD COLUMN requested_vram_mib REAL;
         ALTER TABLE jobs ADD COLUMN requested_cpus INTEGER;
+        """,
+    ),
+    (
+        3,
+        """
+        -- Per-project scheduling policy. Lets a whole project be marked more
+        -- important once, machine-wide, instead of every worker remembering to
+        -- pass --priority on every submission.
+        CREATE TABLE IF NOT EXISTS project_policy (
+            project TEXT PRIMARY KEY,
+            priority TEXT,
+            note TEXT,
+            updated_at TEXT NOT NULL
+        );
         """,
     ),
 ]
@@ -317,6 +331,43 @@ class Database:
 
     def set_error(self, job_id: int, message: str, *, state: JobState = JobState.FAILED) -> None:
         self.try_update_state(job_id, state, error=message, finished_at=utcnow_iso())
+
+
+    # -- project policy ---------------------------------------------------
+    def get_project_priority(self, project: str) -> str | None:
+        try:
+            row = self.conn.execute(
+                "SELECT priority FROM project_policy WHERE project = ?", (project,)
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return None
+        return row["priority"] if row and row["priority"] else None
+
+    def set_project_priority(
+        self, project: str, priority: str | None, *, note: str | None = None
+    ) -> None:
+        """Set (or clear, with priority=None) a project's default priority."""
+        with self.transaction() as conn:
+            if priority is None:
+                conn.execute("DELETE FROM project_policy WHERE project = ?", (project,))
+                return
+            conn.execute(
+                "INSERT INTO project_policy(project, priority, note, updated_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(project) DO UPDATE SET "
+                "priority = excluded.priority, note = excluded.note, "
+                "updated_at = excluded.updated_at",
+                (project, priority, note, utcnow_iso()),
+            )
+
+    def list_project_priorities(self) -> list[dict[str, Any]]:
+        try:
+            rows = self.conn.execute(
+                "SELECT project, priority, note, updated_at FROM project_policy "
+                "ORDER BY project"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return [dict(r) for r in rows]
 
 
 def _row_to_job(row: sqlite3.Row) -> Job:

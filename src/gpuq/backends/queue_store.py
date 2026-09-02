@@ -274,6 +274,15 @@ class QueueStore:
             )
             return cur.rowcount == 1
 
+    def set_priority(self, backend_id: int, priority_rank: int) -> bool:
+        """Re-rank a queued job in place, keeping its arrival order within the tier."""
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE bjobs SET priority_rank = ? WHERE id = ? AND state = ?",
+                (int(priority_rank), backend_id, BACKEND_QUEUED),
+            )
+            return cur.rowcount == 1
+
     def promote(self, backend_id: int) -> bool:
         """Move a queued job to the head of the dispatch order."""
         with self.transaction() as conn:

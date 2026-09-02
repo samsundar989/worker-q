@@ -350,6 +350,14 @@ class LocalDispatcherBackend:
             time.sleep(0.1)
         return False
 
+    def set_priority(self, backend_id: int, priority_rank: int) -> None:
+        """Change a queued job's dispatch rank (used by project policy)."""
+        self._ensure_store()
+        if not self.store.set_priority(backend_id, priority_rank):
+            raise BackendUnavailable(
+                f"backend job {backend_id} is not queued; only queued jobs can be re-ranked"
+            )
+
     def promote(self, backend_id: int) -> None:
         self._ensure_store()
         if not self.store.promote(backend_id):

@@ -184,8 +184,10 @@ def submit(
         None, help="Command to run, after a '--' separator."
     ),
     project: Optional[str] = typer.Option(None, "--project", "-p", help="Project name."),
-    priority: str = typer.Option(
-        "normal", "--priority", help="critical | high | normal | low"
+    priority: Optional[str] = typer.Option(
+        None,
+        "--priority",
+        help="critical | high | normal | low. Defaults to the project's policy.",
     ),
     gpus: Optional[int] = typer.Option(None, "--gpus", help="GPUs to request (default 1)."),
     ram: Optional[float] = typer.Option(
@@ -1009,6 +1011,93 @@ def report(
 
     console.print()
     console.print(f"[bold]{data['verdict']}[/bold]")
+    service.close()
+
+
+@app.command()
+def priority(
+    project: Optional[str] = typer.Argument(None, help="Project to set."),
+    level: Optional[str] = typer.Argument(
+        None, help="critical | high | normal | low"
+    ),
+    clear: bool = typer.Option(False, "--clear", help="Remove this project's policy."),
+    note: Optional[str] = typer.Option(None, "--note", help="Why, e.g. a deadline."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Show or set a project's default priority.
+
+    Set once and every worker on that project inherits it - no repo edits, no
+    remembering --priority on each submit. Queued jobs are re-ranked too.
+    """
+    service = get_service()
+
+    if project is None:
+        rows = service.list_project_priorities()
+        if json_output:
+            emit_json(
+                {
+                    "projects": rows,
+                    "fallback": service.config.core.default_priority,
+                }
+            )
+            service.close()
+            return
+        if not rows:
+            console.print("[dim]No project priorities set.[/dim]")
+            console.print(
+                f"[dim]Everything submits at '{service.config.core.default_priority}' "
+                "unless --priority says otherwise.[/dim]"
+            )
+        else:
+            table = Table(box=None, pad_edge=False)
+            table.add_column("PROJECT", width=24)
+            table.add_column("PRIORITY", width=10)
+            table.add_column("NOTE", overflow="fold")
+            for row in rows:
+                table.add_row(
+                    row["project"],
+                    Text(
+                        row["priority"] or "-",
+                        style=PRIORITY_STYLES.get(row["priority"] or "", ""),
+                    ),
+                    row.get("note") or "",
+                )
+            console.print(table)
+            console.print(
+                f"\n[dim]Everything else submits at "
+                f"'{service.config.core.default_priority}'.[/dim]"
+            )
+        service.close()
+        return
+
+    if not clear and level is None:
+        current = service.db.get_project_priority(project)
+        message = (
+            f"{project}: {current}"
+            if current
+            else f"{project}: no policy (submits at "
+            f"'{service.config.core.default_priority}')"
+        )
+        if json_output:
+            emit_json({"project": project, "priority": current})
+        else:
+            console.print(message)
+        service.close()
+        return
+
+    try:
+        result = service.set_project_priority(
+            project, None if clear else level, note=note
+        )
+    except GPUQError as exc:
+        service.close()
+        fail(str(exc))
+        return
+
+    if json_output:
+        emit_json(result)
+    else:
+        console.print(result["message"])
     service.close()
 
 
