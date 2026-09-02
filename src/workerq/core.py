@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -118,6 +118,9 @@ class SubmitResult:
     snapshot: Snapshot
     backend_job_id: int
     queue_position: int | None = None
+    #: Non-fatal warnings about this submission, e.g. a declaration unlikely
+    #: ever to be admitted on this machine.
+    advisories: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -131,6 +134,7 @@ class SubmitResult:
             "execution_cwd": self.job.execution_cwd,
             "log_path": self.job.log_path,
             "queue_position": self.queue_position,
+            "advisories": self.advisories,
         }
 
 
@@ -232,6 +236,7 @@ class GPUQService:
         # Refuse a request the machine could never satisfy, rather than
         # letting it sit QUEUED forever.
         self._reject_impossible(ram_mib, vram_mib, cpus)
+        advisories = self._admission_advisories(ram_mib)
 
         submitted_cwd = resolve_path(request.cwd or Path.cwd())
         if not submitted_cwd.is_dir():
@@ -359,6 +364,7 @@ class GPUQService:
                 snapshot=snapshot,
                 backend_job_id=backend_job_id,
                 queue_position=self._queue_position(job_id),
+                advisories=advisories,
             )
 
         except BaseException as exc:
@@ -659,6 +665,44 @@ class GPUQService:
                 f"{capacity.usable_vram_mib / 1024:.1f} GiB is usable. "
                 "This job would never start."
             )
+
+    def _admission_advisories(self, ram_mib: float | None) -> list[str]:
+        """Warn about a declaration that will pass submit and then never start.
+
+        `_reject_impossible` compares against installed capacity, but admission
+        compares against what is *free*. On a machine with a large steady
+        baseline - editors, browsers, a row of agents - those are very
+        different numbers, so a job can be accepted and then wait for headroom
+        that never arrives. Advisory rather than fatal: the submitter may know
+        the machine is about to free up, and refusing outright would be worse
+        than saying so.
+        """
+        if ram_mib is None or not self.config.resources.enforce:
+            return []
+        try:
+            from workerq.telemetry import open_telemetry
+
+            telemetry = open_telemetry(self.config.state_dir)
+            floor_mib = (host.memory().total_mib or 0.0) * (
+                self.config.resources.min_host_free_percent / 100.0
+            )
+            ok, total = telemetry.admission_likelihood(ram_mib, floor_mib)
+        except Exception:
+            return []
+        if total < 100 or ok * 100 >= total * 25:
+            return []
+        percent = 100.0 * ok / total
+        if ok == 0:
+            return [
+                f"{ram_mib / 1024:.0f} GiB RAM has never been free on this machine in "
+                f"{total} samples. This job will queue but is unlikely to ever start. "
+                "Declare what it really needs, or free memory first."
+            ]
+        return [
+            f"{ram_mib / 1024:.0f} GiB RAM has been available only {percent:.0f}% of the "
+            f"time here ({ok} of {total} samples), so this may wait a long time. "
+            "If that is more than the job really needs, declaring less will start it sooner."
+        ]
 
     def _create_snapshot(
         self,

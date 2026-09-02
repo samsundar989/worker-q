@@ -337,6 +337,8 @@ def submit(
     if footprint:
         console.print("Requests: " + ", ".join(footprint))
     console.print(f"Logs:     workerq logs {job.id} --follow")
+    for advisory in result.advisories:
+        console.print(f"\n[yellow]Heads up:[/yellow] {advisory}")
     service.close()
 
 

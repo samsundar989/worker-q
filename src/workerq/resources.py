@@ -242,15 +242,29 @@ def admit(
     # These apply even to a job that asks for nothing: if the machine is
     # already in trouble, starting more work is how a dev box falls over.
     commit = mem.commit_percent
-    if commit is not None and commit >= r.max_commit_percent:
-        return Decision(
-            False,
-            f"system commit charge is {commit:.0f}% (limit {r.max_commit_percent}%) - "
-            f"{_gib(mem.commit_used_mib)} of {_gib(mem.commit_limit_mib)} committed",
-            detail,
-        )
-
     free_percent = mem.free_percent
+    if commit is not None:
+        if commit >= r.max_commit_percent:
+            return Decision(
+                False,
+                f"system commit charge is {commit:.0f}% (limit {r.max_commit_percent}%) - "
+                f"{_gib(mem.commit_used_mib)} of {_gib(mem.commit_limit_mib)} committed",
+                detail,
+            )
+        # A high commit charge with plenty of physical RAM free is the normal
+        # state of a loaded workstation with a growing pagefile, not a warning.
+        # It only means trouble when physical memory is short too.
+        if commit >= r.commit_soft_percent and (
+            free_percent is not None and free_percent < r.commit_soft_free_percent
+        ):
+            return Decision(
+                False,
+                f"system commit charge is {commit:.0f}% and only "
+                f"{free_percent:.0f}% of RAM is free ({_gib(mem.available_mib)}); "
+                "starting more work here is how the machine locks up",
+                detail,
+            )
+
     if free_percent is not None and free_percent < r.min_host_free_percent:
         return Decision(
             False,

@@ -105,13 +105,65 @@ class ResourcesConfig:
     reserve_vram_gb: float = 1.0
     reserve_cpus: int = 2
 
-    #: Hard stops. Windows fails allocations near the commit limit even while
-    #: physical RAM still looks available, so commit is tracked separately.
-    max_commit_percent: int = 88
+    #: Hard stops.
+    #:
+    #: Commit charge is a real failure mode - Windows refuses allocations once
+    #: the system commit limit is reached - but the limit is not fixed: a
+    #: system-managed pagefile grows on demand. A high percentage on its own
+    #: therefore says little. Measured on a live workstation, half of all
+    #: samples taken while a job ran exceeded 88% commit while physical RAM
+    #: stayed around 42% free, and the limit itself drifted from 81 to 94 GiB.
+    #: Blocking there stops work for no reason.
+    #:
+    #: So commit blocks outright only close to the limit, where growth may not
+    #: keep up. In the band below that it blocks only when physical memory is
+    #: short as well - the combination that actually precedes thrashing.
+    max_commit_percent: int = 97
+    commit_soft_percent: int = 88
+    commit_soft_free_percent: int = 25
+    #: Physical memory floor. This is the primary gate: it is the thing whose
+    #: exhaustion actually freezes a desktop.
     min_host_free_percent: int = 10
 
     #: How long a job may sit blocked before gpuq says so loudly.
     blocked_warning_seconds: int = 900
+
+
+@dataclass
+class SchedulingConfig:
+    """How the dispatcher walks the queue.
+
+    Strict head-of-line order is safest but wastes the machine: one oversized
+    job at the head parks a queue full of work that would fit alongside what is
+    already running. Backfill looks past it - bounded, so a large job cannot be
+    deferred indefinitely by a stream of small ones.
+    """
+
+    #: Let jobs further down the queue start when the head cannot. Off restores
+    #: strict head-of-line order.
+    backfill: bool = True
+    #: How far past a blocked job to look in one tick. Bounds the work done per
+    #: tick and keeps the queue roughly in priority order.
+    backfill_max_skip: int = 8
+    #: Once the blocked job at the head has waited this long, backfill stops and
+    #: the queue drains until it can run. This is the starvation guard: it caps
+    #: how long backfill may delay a job that cannot be packed.
+    backfill_head_wait_seconds: int = 900
+
+    #: Run job processes below normal priority so the desktop stays responsive
+    #: when several of them share the CPUs. Scheduling priority only - it does
+    #: not cap CPU or memory, and a job alone on an idle machine is unaffected.
+    background_priority: bool = True
+
+    #: Runtime pressure guard. Admission is a prediction; this is what happens
+    #: when the prediction is wrong - an under-declared job, a foreign
+    #: workload, a game launched without claiming a reserve. Sustained physical
+    #: memory pressure stops new work and then displaces the newest
+    #: preemptible job. Two thresholds, so it does not oscillate.
+    pressure_free_percent: int = 12
+    pressure_recover_percent: int = 20
+    #: Consecutive 10s samples below the floor before acting.
+    pressure_samples: int = 3
 
 
 @dataclass
@@ -150,6 +202,7 @@ class Config:
     gpu: GpuConfig = field(default_factory=GpuConfig)
     backend: BackendConfig = field(default_factory=BackendConfig)
     resources: ResourcesConfig = field(default_factory=ResourcesConfig)
+    scheduling: SchedulingConfig = field(default_factory=SchedulingConfig)
     preemption: PreemptionConfig = field(default_factory=PreemptionConfig)
     claude: ClaudeConfig = field(default_factory=ClaudeConfig)
 
@@ -258,6 +311,20 @@ class Config:
         for name in ("min_runtime_seconds", "max_preemptions", "grace_seconds"):
             if getattr(pre, name) < 0:
                 raise ConfigError(f"preemption.{name} must be >= 0")
+        sch = self.scheduling
+        if sch.backfill_max_skip < 0:
+            raise ConfigError("scheduling.backfill_max_skip must be >= 0")
+        if sch.backfill_head_wait_seconds < 0:
+            raise ConfigError("scheduling.backfill_head_wait_seconds must be >= 0")
+        for name in ("pressure_free_percent", "pressure_recover_percent"):
+            if not 0 <= getattr(sch, name) <= 100:
+                raise ConfigError(f"scheduling.{name} must be between 0 and 100")
+        if sch.pressure_recover_percent < sch.pressure_free_percent:
+            raise ConfigError(
+                "scheduling.pressure_recover_percent must be >= pressure_free_percent"
+            )
+        if sch.pressure_samples < 1:
+            raise ConfigError("scheduling.pressure_samples must be >= 1")
         r = self.resources
         for name in ("default_ram_gb", "default_vram_gb", "reserve_ram_gb", "reserve_vram_gb"):
             if getattr(r, name) < 0:
@@ -277,6 +344,7 @@ class Config:
             "gpu": asdict(self.gpu),
             "backend": asdict(self.backend),
             "resources": asdict(self.resources),
+            "scheduling": asdict(self.scheduling),
             "preemption": asdict(self.preemption),
             "claude": asdict(self.claude),
         }
@@ -329,6 +397,7 @@ _SECTION_TYPES: dict[str, type] = {
     "gpu": GpuConfig,
     "backend": BackendConfig,
     "resources": ResourcesConfig,
+    "scheduling": SchedulingConfig,
     "preemption": PreemptionConfig,
     "claude": ClaudeConfig,
 }
@@ -431,6 +500,7 @@ def _from_dict(
         gpu=GpuConfig(**data.get("gpu", {})),
         backend=BackendConfig(**data.get("backend", {})),
         resources=ResourcesConfig(**data.get("resources", {})),
+        scheduling=SchedulingConfig(**data.get("scheduling", {})),
         preemption=PreemptionConfig(**data.get("preemption", {})),
         claude=ClaudeConfig(**data.get("claude", {})),
         source_path=source_path,

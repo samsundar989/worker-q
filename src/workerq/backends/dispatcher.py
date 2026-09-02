@@ -37,6 +37,7 @@ from workerq.telemetry import (
     EVENT_DAEMON,
     EVENT_FINISHED,
     EVENT_PREEMPTED,
+    EVENT_PRESSURE,
     EVENT_RESERVE,
     EVENT_STARTED,
     open_telemetry,
@@ -69,6 +70,7 @@ META_STARTED_AT = "daemon_started_at"
 META_SHUTDOWN = "shutdown_requested"
 META_VERSION = "daemon_version"
 META_INTERPRETER = "interpreter"
+
 
 def read_reserve(store: Any, config: Config) -> res.Reserve:
     """The live reserve, falling back to config for anything unset."""
@@ -137,6 +139,8 @@ class Dispatcher:
         #: cannot be admitted is reported once rather than every tick.
         self._blocked: dict[int, tuple[float, str]] = {}
         self._log_path = config.state_dir / "run" / "dispatcher.log"
+        #: Consecutive samples under the memory floor, for the pressure guard.
+        self._pressure_strikes = 0
         self._stop = False
 
     # -- logging ----------------------------------------------------------
@@ -476,8 +480,88 @@ class Dispatcher:
                 queued_count=len(self.store.queued()),
                 top_consumers=top,
             )
+            self._relieve_pressure(mem)
         except Exception:
             pass
+
+    # -- pressure guard -----------------------------------------------------
+    def _relieve_pressure(self, mem: host.HostMemory) -> None:
+        """Stop work when the machine is genuinely running out of memory.
+
+        Admission control is a prediction made before a job starts. This is the
+        backstop for when the prediction was wrong - a job that under-declared,
+        a foreign workload, a game launched without claiming a reserve. Nothing
+        else in worker-q can act on a machine that is already in trouble:
+        preemption for memory pressure cannot help, because freeing a
+        *reservation* does not change *measured* free memory until the victim
+        actually exits.
+
+        Two thresholds and a sample count, so a brief spike does not kill a
+        long training run.
+        """
+        sched = self.config.scheduling
+        free = mem.free_percent
+        if free is None:
+            return
+        if free >= sched.pressure_recover_percent:
+            if self._pressure_strikes:
+                self.log(f"host memory recovered to {free:.0f}% free")
+            self._pressure_strikes = 0
+            return
+        if free >= sched.pressure_free_percent:
+            return  # between the two thresholds: hold, do not escalate or clear
+        self._pressure_strikes += 1
+        if self._pressure_strikes < sched.pressure_samples:
+            return
+
+        victim = self._pressure_victim()
+        if victim is None:
+            # Nothing safe to stop. Say so once per escalation rather than
+            # silently doing nothing about a machine that is struggling.
+            self.log(
+                f"host memory at {free:.0f}% free and no preemptible job to stop; "
+                "queue is holding but running work cannot be relieved"
+            )
+            self.telemetry.record_event(
+                EVENT_PRESSURE,
+                detail=f"{free:.0f}% RAM free, nothing preemptible to displace",
+            )
+            self._pressure_strikes = 0
+            return
+
+        victim_id = int(victim["id"])
+        detail = (
+            f"host memory at {free:.0f}% free "
+            f"({(mem.available_mib or 0) / 1024:.1f} GiB); "
+            f"stopping job {victim_id} to keep the machine usable"
+        )
+        if self.store.request_preempt(victim_id, by_backend_id=None):
+            self.log(detail)
+            self.telemetry.record_event(
+                EVENT_PRESSURE, backend_job_id=victim_id, detail=detail
+            )
+        self._pressure_strikes = 0
+
+    def _pressure_victim(self) -> dict[str, Any] | None:
+        """The newest preemptible running job - the least work to lose.
+
+        Only jobs that opted in are ever stopped. The contract is the same as
+        priority preemption: being displaced means re-running from the start,
+        so a job that did not declare itself safe to repeat is never chosen,
+        however bad the pressure gets.
+        """
+        active = set(self.running) | set(self.adopted)
+        candidates = [
+            row
+            for row in self.store.running()
+            if int(row["id"]) in active
+            and row.get("preemptible")
+            and not row.get("preempt_requested")
+        ]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda r: age_seconds(r.get("started_at")) or 0.0)
+        return candidates[0]
 
     # -- start ------------------------------------------------------------
     def _start_job(self, row: dict[str, Any], devices: list[int]) -> bool:
@@ -517,7 +601,9 @@ class Dispatcher:
             "stdout": handle if handle else subprocess.DEVNULL,
             "stderr": subprocess.STDOUT if handle else subprocess.DEVNULL,
             "close_fds": True,
-            "creationflags": child_creationflags(),
+            "creationflags": child_creationflags(
+                background=self.config.scheduling.background_priority
+            ),
             **posix_child_kwargs(),
         }
         if not kwargs["creationflags"]:
@@ -562,50 +648,86 @@ class Dispatcher:
         )
         return True
 
+    def _blocked_wait_seconds(self, backend_id: int) -> float:
+        """How long this job has been continuously unable to start."""
+        entry = self._blocked.get(backend_id)
+        if entry is None:
+            return 0.0
+        return max(0.0, time.monotonic() - entry[0])
+
+    def _record_wait(self, backend_id: int, reason: str | None) -> None:
+        """Persist why a job is not running, so `status` can explain it.
+
+        Every waiting job gets a reason, not just the one at the head. With
+        several jobs running, "there is no reason recorded" is indistinguishable
+        from "nobody has looked at it", and that is the difference between a
+        queue you can reason about and one that looks stuck.
+        """
+        self.store.update(backend_id, wait_reason=reason)
+        self._note_blocked(backend_id, reason or "blocked")
+
     def _start_ready_jobs(self) -> None:
         slots = max(1, self.store.get_meta_int(META_SLOTS, self.config.core.max_concurrent_jobs))
         # Adopted jobs occupy slots exactly like jobs we launched.
         in_flight = len(self.running) + len(self.adopted)
-        queued = self.store.queued()
-        first_blocked_reason: str | None = None
+        queued = [row for row in self.store.queued() if not row.get("cancel_requested")]
+        sched = self.config.scheduling
 
-        for row in queued:
-            if row.get("cancel_requested"):
-                continue  # handled by the cancellation pass
+        #: Set once a job has been passed over, so the job that caused it can be
+        #: told apart from the ones merely behind it.
+        head_blocked: dict[str, Any] | None = None
+        skipped = 0
 
+        for position, row in enumerate(queued):
             backend_id = int(row["id"])
 
             if in_flight >= slots:
-                # No slot free. The highest-priority waiter still gets a chance
-                # to displace something it outranks; if it cannot, nobody
-                # further down the queue could either.
-                self._consider_preemption(row, "waiting for a free slot")
-                break
+                # Every slot is busy. Nothing further down can start either, so
+                # say so for the rest of the queue rather than leaving it blank.
+                reason = f"waiting for a free slot ({in_flight} of {slots} in use)"
+                if head_blocked is None:
+                    self._consider_preemption(row, reason)
+                for rest in queued[position:]:
+                    self._record_wait(int(rest["id"]), reason)
+                return
 
             # Admission control: does this job's declared RAM/CPU/VRAM fit in
             # the headroom that is actually free, once running reservations and
             # foreign workloads are accounted for?
+            devices: list[int] | None = []
             decision = self._admit(row)
             if not decision.admit:
-                if first_blocked_reason is None:
-                    first_blocked_reason = decision.reason
-                    self.store.update(backend_id, wait_reason=decision.reason)
-                    self._note_blocked(backend_id, decision.reason or "blocked")
-                    self._consider_preemption(row, decision.reason)
-                break
+                blocked_reason = decision.reason
+            else:
+                devices, blocked_reason = self._allocate_devices(int(row.get("gpu_count") or 0))
+                if devices is not None:
+                    blocked_reason = None
 
-            devices, reason = self._allocate_devices(int(row.get("gpu_count") or 0))
-            if devices is None:
-                # Head-of-line blocking is intentional: a queued critical job
-                # must not be overtaken just because the GPU is busy.
-                if first_blocked_reason is None:
-                    first_blocked_reason = reason
-                    self.store.update(backend_id, wait_reason=reason)
-                    self._note_blocked(backend_id, reason or "blocked")
-                    self._consider_preemption(row, reason)
-                break
+            if blocked_reason is not None:
+                self._record_wait(backend_id, blocked_reason)
+                if head_blocked is None:
+                    head_blocked = row
+                    self._consider_preemption(row, blocked_reason)
 
-            if self._start_job(row, devices):
+                # Backfill: a job this one cannot make room for may still fit
+                # alongside what is running. Bounded two ways - how far we look,
+                # and how long the blocked job has already waited - so a large
+                # job cannot be deferred forever by a stream of small ones.
+                if not sched.backfill:
+                    return
+                waited = self._blocked_wait_seconds(int(head_blocked["id"]))
+                if waited >= sched.backfill_head_wait_seconds:
+                    self.log(
+                        f"job {head_blocked['id']}: waited {waited:.0f}s; "
+                        "holding the queue for it instead of backfilling"
+                    )
+                    return
+                skipped += 1
+                if skipped > sched.backfill_max_skip:
+                    return
+                continue
+
+            if self._start_job(row, devices or []):
                 self._blocked.pop(backend_id, None)
                 in_flight += 1
 

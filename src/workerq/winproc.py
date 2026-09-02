@@ -26,11 +26,13 @@ if IS_WINDOWS:  # pragma: no branch
     CREATE_NEW_PROCESS_GROUP = 0x00000200
     CREATE_NO_WINDOW = 0x08000000
     CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+    BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
 else:  # pragma: no cover - POSIX fallback
     DETACHED_PROCESS = 0
     CREATE_NEW_PROCESS_GROUP = 0
     CREATE_NO_WINDOW = 0
     CREATE_BREAKAWAY_FROM_JOB = 0
+    BELOW_NORMAL_PRIORITY_CLASS = 0
 
 
 def detached_creationflags() -> int:
@@ -40,11 +42,29 @@ def detached_creationflags() -> int:
     return DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
 
 
-def child_creationflags() -> int:
-    """Flags for a job child: its own process group so it can be signalled."""
+def child_creationflags(*, background: bool = False) -> int:
+    """Flags for a job child: its own process group so it can be signalled.
+
+    `background` additionally runs it below normal priority. With several jobs
+    sharing the CPUs, that is what keeps the desktop responsive: Windows hands
+    the interactive session the CPU it needs regardless of how much work is
+    queued behind it. Children inherit the class, so setting it on the runner
+    covers the whole job tree.
+
+    It changes scheduling priority only. It does not cap CPU or memory, and a
+    job alone on an idle machine runs at full speed.
+    """
     if not IS_WINDOWS:  # pragma: no cover
         return 0
-    return CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+    flags = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+    if background:
+        flags |= BELOW_NORMAL_PRIORITY_CLASS
+    return flags
+
+
+def posix_background_niceness(background: bool) -> int:
+    """`nice` increment for a job child on POSIX. 0 means unchanged."""
+    return 5 if background else 0
 
 
 def no_window_kwargs() -> dict[str, Any]:

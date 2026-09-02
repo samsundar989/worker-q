@@ -287,6 +287,28 @@ class Telemetry:
             pass
 
 
+    def admission_likelihood(self, needed_mib: float, floor_mib: float) -> tuple[int, int]:
+        """(samples that would have admitted `needed_mib`, samples total).
+
+        Answers "could this declaration ever actually start here?". A machine
+        with a large steady baseline - editors, browsers, a row of agents - has
+        far less free RAM than it has installed, so a request can pass the
+        submit-time capacity check and then wait forever for headroom that
+        never arrives. This is what makes that visible at submit time.
+        """
+        try:
+            total = self.conn.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+            if not total:
+                return 0, 0
+            ok = self.conn.execute(
+                "SELECT COUNT(*) FROM samples WHERE host_available_mib >= ?",
+                (needed_mib + floor_mib,),
+            ).fetchone()[0]
+        except Exception:
+            return 0, 0
+        return int(ok), int(total)
+
+
 def open_telemetry(state_dir: Path) -> Telemetry:
     store = Telemetry(state_dir / "telemetry.sqlite3")
     store.initialize()

@@ -376,3 +376,78 @@ def test_expiry_is_only_reached_once_the_deadline_passes():
     assert not Reserve(ram_mib=0, vram_mib=0, cpus=0).is_expired
     assert not Reserve(ram_mib=0, vram_mib=0, cpus=0, expires_at=future).is_expired
     assert Reserve(ram_mib=0, vram_mib=0, cpus=0, expires_at=past).is_expired
+
+
+# --------------------------------------------------------------------------
+# Commit charge, recalibrated
+# --------------------------------------------------------------------------
+
+
+def _default_commit_config(tmp_path) -> Config:
+    """A config using the shipped commit thresholds, not the pinned 88."""
+    return Config(
+        core=CoreConfig(state_dir=str(tmp_path)),
+        resources=ResourcesConfig(),
+        source_path=tmp_path / "config.toml",
+    )
+
+
+def test_high_commit_with_plenty_of_free_ram_is_not_a_stop(tmp_path):
+    """The measured normal state of a loaded box with a growing pagefile.
+
+    Half of all samples taken on the live machine while a job ran sat above
+    88% commit with ~42% of RAM free. Blocking there stopped work for no
+    reason.
+    """
+    config = _default_commit_config(tmp_path)
+    decision = admit(
+        config,
+        request(4),
+        [],
+        gpu=gpu(),
+        mem=mem(total_gb=64, free_gb=27, commit_percent=94),
+    )
+    assert decision.admit, decision.reason
+
+
+def test_high_commit_with_little_free_ram_is_a_stop(tmp_path):
+    """The combination that actually precedes thrashing."""
+    config = _default_commit_config(tmp_path)
+    decision = admit(
+        config,
+        request(4),
+        [],
+        gpu=gpu(),
+        mem=mem(total_gb=64, free_gb=10, commit_percent=94),
+    )
+    assert not decision.admit
+    assert "commit charge" in (decision.reason or "")
+    assert "locks up" in (decision.reason or "")
+
+
+def test_commit_at_the_limit_is_still_a_hard_stop(tmp_path):
+    """Close to the limit, pagefile growth may not keep up. Refuse regardless."""
+    config = _default_commit_config(tmp_path)
+    decision = admit(
+        config,
+        ResourceRequest(),
+        [],
+        gpu=gpu(),
+        mem=mem(total_gb=64, free_gb=40, commit_percent=99),
+    )
+    assert not decision.admit
+    assert "commit charge" in (decision.reason or "")
+
+
+def test_the_physical_floor_still_governs_regardless_of_commit(tmp_path):
+    """Physical exhaustion is the thing that freezes a desktop."""
+    config = _default_commit_config(tmp_path)
+    decision = admit(
+        config,
+        request(1),
+        [],
+        gpu=gpu(),
+        mem=mem(total_gb=64, free_gb=3, commit_percent=50),
+    )
+    assert not decision.admit
+    assert "floor" in (decision.reason or "")

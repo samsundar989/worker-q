@@ -80,15 +80,18 @@ def _capture_environment(config: Config, job: Job, argv: list[str]) -> dict[str,
     }
 
 
-def _stop_intent(config: Config, job: Job) -> tuple[bool, bool, int | None]:
-    """(stop_requested, force, preempted_by) as recorded by the backend.
+def _stop_intent(config: Config, job: Job) -> tuple[bool, bool, bool, int | None]:
+    """(stop_requested, force, is_preemption, preempted_by) from the backend.
 
     Cancellation and preemption both stop the child, but they mean opposite
     things afterwards: a cancelled job is finished, a preempted one returns to
-    the queue and runs again later.
+    the queue and runs again later. `is_preemption` is reported separately from
+    `preempted_by` because a job can be displaced with nobody to name - the
+    dispatcher's pressure guard stops work to save the machine. Inferring one
+    from the other would silently cancel those jobs instead of requeuing them.
     """
     if job.backend_job_id is None:
-        return False, False, None
+        return False, False, False, None
     try:
         from workerq.backends.queue_store import QueueStore
 
@@ -96,12 +99,12 @@ def _stop_intent(config: Config, job: Job) -> tuple[bool, bool, int | None]:
         row = store.get(job.backend_job_id)
         store.close()
         if not row:
-            return False, False, None
+            return False, False, False, None
         if row.get("preempt_requested"):
-            return True, False, row.get("preempt_by")
-        return bool(row.get("cancel_requested")), bool(row.get("cancel_force")), None
+            return True, False, True, row.get("preempt_by")
+        return bool(row.get("cancel_requested")), bool(row.get("cancel_force")), False, None
     except Exception:
-        return False, False, None
+        return False, False, False, None
 
 
 def run_job(
@@ -219,7 +222,7 @@ def run_job(
         "close_fds": True,
         **posix_child_kwargs(),
     }
-    flags = child_creationflags()
+    flags = child_creationflags(background=config.scheduling.background_priority)
     if flags:
         kwargs["creationflags"] = flags
 
@@ -253,9 +256,10 @@ def run_job(
 
     stop_watch = threading.Event()
     cancelled = threading.Event()
-    #: Backend id of the job that displaced this one, if any. Non-empty means
-    #: the job was preempted rather than cancelled or finished.
-    preempted_by: list[int] = []
+    #: Non-empty means the job was preempted rather than cancelled or finished.
+    #: The single entry is the displacing backend job id, or None when the
+    #: pressure guard stopped it and there is nobody to name.
+    preempted: list[int | None] = []
 
     def _forward(signum: int, _frame: Any) -> None:
         """A signal aimed at the runner must reach the whole child tree."""
@@ -310,14 +314,15 @@ def run_job(
         grace = max(0, config.core.cancel_grace_seconds)
         signalled_at: float | None = None
         while not stop_watch.wait(_CANCEL_POLL_SECONDS):
-            requested, force, by = _stop_intent(config, job)
+            requested, force, is_preemption, by = _stop_intent(config, job)
             if not requested:
                 continue
-            if by is not None:
+            if is_preemption:
                 # Preemption, not cancellation: do not mark the job cancelled,
-                # and allow the job's own grace period to stop cleanly.
-                if not preempted_by:
-                    preempted_by.append(int(by))
+                # and allow the job's own grace period to stop cleanly. `by` may
+                # be None - the pressure guard displaces with nobody to name.
+                if not preempted:
+                    preempted.append(by if by is None else int(by))
                 grace = max(0, config.preemption.grace_seconds)
             else:
                 cancelled.set()
@@ -415,15 +420,18 @@ def run_job(
 
     # A preempted job did not finish: it goes back to QUEUED with its
     # provenance recorded, so the worker can see why it stopped and follow it.
-    if preempted_by and (current is None or not current.is_terminal):
-        by = preempted_by[0]
-        displacer = db.get_job_by_backend_id(job.backend, by)
-        who = (
-            f"job #{displacer.id} ({displacer.project}, {displacer.priority})"
-            if displacer
-            else f"backend job #{by}"
-        )
-        reason = f"preempted by {who}"
+    if preempted and (current is None or not current.is_terminal):
+        by = preempted[0]
+        displacer = db.get_job_by_backend_id(job.backend, by) if by is not None else None
+        if displacer is not None:
+            who = f"job #{displacer.id} ({displacer.project}, {displacer.priority})"
+            reason = f"preempted by {who}"
+        elif by is None:
+            # No displacing job: the dispatcher's pressure guard stopped this to
+            # keep the machine usable. There is nobody to name.
+            reason = "preempted to relieve host memory pressure"
+        else:
+            reason = f"preempted by backend job #{by}"
         db.try_update_state(
             job_id,
             JobState.QUEUED,
