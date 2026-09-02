@@ -127,17 +127,18 @@ class Dashboard:
         rows.add_column()
 
         if gpu.available and gpu.devices:
-            device = gpu.devices[0]
-            rows.add_row(
-                "VRAM",
-                _bar(device.memory_used_mib, device.memory_total_mib),
-                f"{_gib(device.memory_used_mib)} / {_gib(device.memory_total_mib)} GiB"
-                + (
-                    f"   util {device.utilization_percent:.0f}%"
-                    if device.utilization_percent is not None
-                    else ""
-                ),
-            )
+            for device in gpu.devices:
+                label = "VRAM" if len(gpu.devices) == 1 else f"VRAM{device.index}"
+                rows.add_row(
+                    label,
+                    _bar(device.memory_used_mib, device.memory_total_mib),
+                    f"{_gib(device.memory_used_mib)} / {_gib(device.memory_total_mib)} GiB"
+                    + (
+                        f"   util {device.utilization_percent:.0f}%"
+                        if device.utilization_percent is not None
+                        else ""
+                    ),
+                )
         else:
             rows.add_row("VRAM", Text("no NVIDIA GPU", style="dim"), gpu.error or "")
 
@@ -147,7 +148,8 @@ class Dashboard:
             f"{_gib(mem.used_mib)} / {_gib(mem.total_mib)} GiB"
             f"   free {_gib(mem.available_mib)} GiB",
         )
-        commit_style = "bold red" if (mem.commit_percent or 0) >= 88 else ""
+        commit_limit = self.service.config.resources.max_commit_percent
+        commit_style = "bold red" if (mem.commit_percent or 0) >= commit_limit else ""
         rows.add_row(
             "Commit",
             _bar(mem.commit_used_mib, mem.commit_limit_mib),
@@ -208,11 +210,18 @@ class Dashboard:
                 reason = self.service.queue_wait_reason(job)
                 if reason:
                     table.add_row(
-                        "", "", "", "", "", "", Text(f"{_glyphs()[3]} {reason}", style="yellow")
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        Text(f"{_glyphs()[3]} {reason}", style="yellow"),
                     )
 
         if not shown:
-            table.add_row("", Text("idle", style="dim"), "", "", "", "", "")
+            table.add_row("", Text("idle", style="dim"), "", "", "", "", "", "")
 
         daemon = (
             Text("running", style="green")

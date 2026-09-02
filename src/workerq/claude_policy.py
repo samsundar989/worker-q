@@ -59,6 +59,19 @@ displace it instead of waiting:
 
     workerq submit --project <project> --ram 24 --preemptible -- <command>
 
+**Jobs run in parallel when their declared footprints fit**, so declaring
+honestly is what gets your job started sooner - and what stops the machine
+falling over. Over-declaring is safe but keeps other work waiting; under-
+declaring is how a box is taken down. Check yourself with:
+
+    workerq resources --verify        declared vs what jobs actually used
+
+If a job needs a GPU but not the whole card, `--share-gpu` lets it run beside
+another job that also opted in. It requires `--vram`, because packing is judged
+on the declaration alone:
+
+    workerq submit --project <project> --vram 10 --share-gpu -- <command>
+
 **Say what the job is and how long it takes.** worker-q cannot infer either from
 a command line, and without them the queue view cannot tell anyone what is
 happening or when it will end:

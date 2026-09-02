@@ -74,12 +74,19 @@ def tool_gpu_submit(
     *,
     command: list[str],
     project: str | None = None,
-    priority: str = "normal",
+    priority: str | None = None,
     gpus: int = 1,
     cwd: str | None = None,
     snapshot: bool = True,
     label: str | None = None,
     env: dict[str, str] | None = None,
+    ram_gb: float | None = None,
+    vram_gb: float | None = None,
+    cpus: int | None = None,
+    preemptible: bool | None = None,
+    describe: str | None = None,
+    blocks: str | None = None,
+    eta_seconds: float | None = None,
 ) -> dict[str, Any]:
     service = _service(config)
     try:
@@ -93,9 +100,17 @@ def tool_gpu_submit(
                 cwd=cwd,
                 snapshot=snapshot,
                 env=env or {},
+                ram_gb=ram_gb,
+                vram_gb=vram_gb,
+                cpus=cpus,
+                preemptible=preemptible,
+                describe=describe,
+                blocks=blocks,
+                eta_seconds=eta_seconds,
             )
         )
     except GPUQError as exc:
+        service.close()
         return {"error": str(exc), "submitted": False}
     finally_payload = {
         "job_id": result.job.id,
@@ -105,6 +120,7 @@ def tool_gpu_submit(
         "backend_job_id": result.backend_job_id,
         "snapshot_commit": result.job.snapshot_commit,
         "queue_position": result.queue_position,
+        "advisories": result.advisories,
         "message": SUBMIT_FOLLOWUP,
     }
     service.close()
@@ -222,9 +238,12 @@ def build_server(config: Config | None = None) -> Any:
     server = server_class(
         name="workerq",
         instructions=(
-            "Broker for GPU-heavy workloads on this machine. Submit expensive work with "
-            "gpu_submit instead of running it directly, then continue with other work; "
-            "only one heavy job runs at a time so concurrent agents cannot OOM the GPU."
+            "Broker for heavy workloads on this machine - GPU, RAM and CPU. Submit "
+            "expensive work with gpu_submit instead of running it directly, then "
+            "continue with other work. Jobs run in parallel only when their declared "
+            "footprints fit, so always pass ram_gb, vram_gb and cpus: an undeclared "
+            "job is charged a small default and may be admitted when it should have "
+            "waited."
         ),
     )
 
@@ -232,12 +251,19 @@ def build_server(config: Config | None = None) -> Any:
     def gpu_submit(
         command: list[str],
         project: str | None = None,
-        priority: Literal["critical", "high", "normal", "low"] = "normal",
+        priority: Literal["critical", "high", "normal", "low"] | None = None,
         gpus: int = 1,
         cwd: str | None = None,
         snapshot: bool = True,
         label: str | None = None,
         env: dict[str, str] | None = None,
+        ram_gb: float | None = None,
+        vram_gb: float | None = None,
+        cpus: int | None = None,
+        preemptible: bool | None = None,
+        describe: str | None = None,
+        blocks: str | None = None,
+        eta_seconds: float | None = None,
     ) -> dict[str, Any]:
         return tool_gpu_submit(
             config,
@@ -249,6 +275,13 @@ def build_server(config: Config | None = None) -> Any:
             snapshot=snapshot,
             label=label,
             env=env,
+            ram_gb=ram_gb,
+            vram_gb=vram_gb,
+            cpus=cpus,
+            preemptible=preemptible,
+            describe=describe,
+            blocks=blocks,
+            eta_seconds=eta_seconds,
         )
 
     @server.tool(description="List running, queued and recently finished worker-q jobs.")

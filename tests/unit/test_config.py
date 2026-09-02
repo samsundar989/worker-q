@@ -22,7 +22,7 @@ from workerq.config import (
 def test_defaults_load(tmp_path: Path):
     """Built-in defaults, isolated from any real config file on this machine."""
     config = load_config(tmp_path / "absent.toml", environ={})
-    assert config.core.max_concurrent_jobs == 1
+    assert config.core.max_concurrent_jobs == 4
     assert config.core.default_priority == "normal"
     assert config.core.snapshot_mode == "git"
     assert config.gpu.free_memory_threshold_percent == 90
@@ -167,7 +167,7 @@ def test_set_dotted_validates(tmp_path: Path):
 
 def test_get_dotted(tmp_path: Path):
     config = load_config(tmp_path / "absent.toml", environ={})
-    assert get_dotted(config, "core.max_concurrent_jobs") == 1
+    assert get_dotted(config, "core.max_concurrent_jobs") == 4
     with pytest.raises(ConfigError):
         get_dotted(config, "core.does_not_exist")
 

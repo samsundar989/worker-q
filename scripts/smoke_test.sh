@@ -85,6 +85,10 @@ step "0. Initialise the isolated queue"
 # ---------------------------------------------------------------------------
 if "$GPUQ" init >/dev/null 2>&1; then pass "gpuq init"; else bad "gpuq init"; exit 2; fi
 "$GPUQ" gpu-threshold 0 >/dev/null 2>&1   # never gate on GPU memory in the smoke test
+# Several checks below prove *serialisation* - a blocker job holds the queue
+# while the source tree is edited underneath it. That is a property of one
+# slot, not of the shipped default, which is now a ceiling. Pin it.
+"$GPUQ" concurrency 1 >/dev/null 2>&1
 
 # ---------------------------------------------------------------------------
 step "1. Build a temporary git repository"

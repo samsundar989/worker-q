@@ -57,6 +57,10 @@ B="$(make_project project-b 5)"
 C="$(make_project project-c 5)"
 pass "three git repositories created"
 
+# This scenario is about ordering under a single slot: A runs, C and B queue
+# behind it. Concurrency is a ceiling now, so pin it rather than assume it.
+"$GPUQ" concurrency 1 >/dev/null 2>&1
+
 # ---------------------------------------------------------------------------
 step "Submit from three separate terminals, each of which then exits"
 # ---------------------------------------------------------------------------
@@ -81,7 +85,7 @@ printf '  A=%s  B=%s  C=%s\n' "$SA" "$SB" "$SC"
 RUNNING_COUNT="$("$GPUQ" status --json --all | python -c "
 import json,sys
 print(sum(1 for j in json.load(sys.stdin)['jobs'] if j['state']=='RUNNING'))")"
-[ "$RUNNING_COUNT" -le 1 ] && pass "only one job running (count=$RUNNING_COUNT)" \
+[ "$RUNNING_COUNT" -le 1 ] && pass "one job at a time at concurrency 1 (count=$RUNNING_COUNT)" \
                            || bad "$RUNNING_COUNT jobs running simultaneously"
 
 POS_B="$("$GPUQ" show "$ID_B" --json | jq_get "['queue_position']")"

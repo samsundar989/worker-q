@@ -1,6 +1,7 @@
 # Parallel execution and live resource limits
 
-Status: Phases 0 and 1 implemented. Phases 2-6 are still plan.
+Status: implemented. This is kept as the record of why it is built this way,
+and of the evidence behind each threshold.
 
 This document covers two changes that belong together:
 
@@ -362,25 +363,25 @@ routine.
 presets, expiry, `--evict`, and status/top visibility. Deliberately before
 parallelism: it is the brake, and it should exist before the accelerator.
 
-**Phase 2 — Multi-slot execution with ledger admission. NEXT.**
+**Phase 2 — Multi-slot execution with ledger admission. DONE.**
 Raise the ceiling; bounded backfill with a head-of-queue reservation and
 starvation guard; store a wait reason for *every* queued job. Today only the
 head job gets one, and slot exhaustion stores none at all — with N slots that is
 the first confusing thing anyone will hit.
 
-**Phase 3 — Recalibrate the hard stops.**
+**Phase 3 — Recalibrate the hard stops. DONE.**
 Physical availability as the primary gate; commit charge as a secondary,
 growth-aware guard. This is what makes Phase 2 useful in practice rather than
 vetoed half the time.
 
-**Phase 4 — Pressure guard and process priority.**
+**Phase 4 — Pressure guard and process priority. DONE.**
 The runtime backstop (4.4) and `BELOW_NORMAL_PRIORITY_CLASS` (4.5).
 
-**Phase 5 — Shared GPU mode.**
+**Phase 5 — Shared GPU mode. DONE (opt-in via `--share-gpu`).**
 Opt-in per-device VRAM ledger (4.6). Only after Phase 0 has produced real
 declared-versus-actual VRAM data.
 
-**Phase 6 — Fallout and parity.**
+**Phase 6 — Fallout and parity. DONE.**
 Detailed in §6.
 
 ---
@@ -480,3 +481,48 @@ re-seeds from the DB on restart (`dispatcher.py:664-667`). Editing config.toml
 and restarting therefore does nothing. Use `workerq concurrency N --yes`. The
 same will be true of the reserve, by design — `workerq reserve` is the interface,
 and config only supplies the fallback and the presets.
+
+---
+
+## 9. What shipped, in the end
+
+`max_concurrent_jobs` defaults to **4** and is a ceiling, not the scheduler.
+Admission control decides what runs.
+
+| Phase | Change |
+|---|---|
+| 0 | per-job usage sampling (schema v6), `job_samples` telemetry, `workerq resources --verify` |
+| 1 | `Reserve` in dispatcher meta, re-read per tick; `workerq reserve` with `--for` expiry |
+| 2 | bounded backfill with a starvation guard; a wait reason for every queued job |
+| 3 | commit charge blocks near the limit, or lower only when physical RAM is short too |
+| 4 | pressure guard displaces the newest preemptible job; jobs run below normal priority |
+| 5 | `--share-gpu`: per-device VRAM packing between jobs that both opted in |
+| 6 | MCP resource parity, doctor, dashboard, forecast, scripts, docs |
+
+### Deliberately not built
+
+**`workerq reserve --evict`.** Tightening the reserve leaves running jobs alone;
+the command reports what is holding resources and which of those are
+preemptible, and the choice is made by hand with `workerq cancel`. Automatic
+eviction is a small addition to `set_reserve` when it is wanted.
+
+**Named reserve presets.** `Config.to_toml()` regenerates the file from flat
+dataclass sections, so a nested `[reserve_presets.gaming]` table would be
+deleted by the next `config set`. That needs the config writer taught about
+nested tables first; `--label` covers the naming need meanwhile.
+
+**Learned resource declarations.** Phase 0 records what jobs use, and `eta.py`
+already learns durations per command signature. Learning a RAM default the same
+way is the obvious next step, but wants more than one machine's data before it
+starts overriding what people declare.
+
+### Two bugs this work surfaced
+
+`Reserve.is_expired` was written on `age_seconds()`, which clamps at zero, so a
+deadline an hour away read as already reached and every timed reserve would have
+been released on the next tick.
+
+The runner told preemption from cancellation by whether `preempt_by` was set. A
+pressure-guard stop has nobody to name, so it would have been read as a
+cancellation and the job marked CANCELLED instead of requeued, losing the work.
+The intent is carried explicitly now.

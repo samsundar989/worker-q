@@ -43,11 +43,27 @@ cat ~/.local/state/gpuq/run/dispatcher.out    # startup errors
 cat ~/.local/state/gpuq/run/dispatcher.log    # per-tick activity
 ```
 
-### Another job is genuinely running
+### The machine is genuinely full
 
-That is the design. `workerq status` shows the running job. Use
-`workerq promote <id>` to move a queued job to the front — it will still wait for
-the current job to finish, because worker-q never preempts.
+`workerq status` prints the reason under each queued job — which resource is
+short, and how much of it running jobs have reserved. `workerq promote <id>`
+moves a job to the front of the queue, but it still has to fit.
+
+If the job it is waiting behind was submitted `--preemptible`, `workerq bump
+<id> critical` can displace it. Otherwise the running work finishes first.
+
+### It says there is plenty of RAM free, and my job still will not start
+
+Admission compares your declared `--ram` against what is *free*, minus the
+`min_host_free_percent` floor — not against installed RAM. On a machine with a
+large steady baseline (editors, browsers, several agents) those are very
+different numbers, and a job can be accepted at submit and then wait for
+headroom that never arrives.
+
+`workerq resources --verify` shows what past jobs actually used against what
+they declared. Over-declaring is safe but packs badly, and a declaration well
+above real usage is the usual cause of a job that queues forever. Submitting
+now warns when a declaration has rarely been satisfiable on this machine.
 
 ---
 

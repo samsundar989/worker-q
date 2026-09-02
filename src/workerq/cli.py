@@ -208,6 +208,12 @@ def submit(
         help="Allow a higher-priority job to stop this one and requeue it. "
         "Only safe if the command is resumable or cheap to repeat.",
     ),
+    share_gpu: bool = typer.Option(
+        False,
+        "--share-gpu",
+        help="Let this job share a GPU with another job that also opted in. "
+        "Requires --vram: packing is judged on the declaration alone.",
+    ),
     label: Optional[str] = typer.Option(None, "--label", help="Free-text label."),
     describe: Optional[str] = typer.Option(
         None, "--describe", help="What this job is doing, in a few words."
@@ -286,6 +292,7 @@ def submit(
         vram_gb=vram,
         cpus=cpus,
         preemptible=preemptible,
+        share_gpu=share_gpu,
         describe=describe,
         blocks=blocks,
         eta_seconds=eta_seconds,
@@ -334,6 +341,8 @@ def submit(
         footprint.append(f"{job.requested_gpu_count} GPU")
     if job.preemptible:
         footprint.append("preemptible")
+    if job.gpu_mode == "shared":
+        footprint.append("shares its GPU")
     if footprint:
         console.print("Requests: " + ", ".join(footprint))
     console.print(f"Logs:     workerq logs {job.id} --follow")
@@ -1695,12 +1704,18 @@ def concurrency(
         service.close()
         return
 
-    if count > 1 and not yes:
+    # Raising the ceiling is only dangerous when nothing checks whether jobs
+    # fit. With admission control on it is a supported configuration, so the
+    # confirmation is reserved for the case that really can exhaust memory.
+    if count > 1 and not yes and not service.config.resources.enforce:
         service.close()
         err_console.print(
-            "[bold yellow]WARNING: concurrent GPU jobs can cause VRAM OOM.[/bold yellow]\n"
-            "worker-q V1 assumes exclusive heavy-job execution.\n"
-            f"Re-run with --yes to set concurrency to {count}."
+            "[bold yellow]WARNING: admission control is off "
+            "(resources.enforce = false).[/bold yellow]\n"
+            "Nothing would check that concurrent jobs fit, so they can exhaust RAM "
+            "or VRAM.\n"
+            f"Re-run with --yes to set concurrency to {count} anyway, or turn "
+            "enforcement back on."
         )
         raise typer.Exit(1)
 
@@ -1717,8 +1732,9 @@ def concurrency(
         console.print(f"max_concurrent_jobs = {info['max_concurrent_jobs']}")
         if count > 1:
             console.print(
-                "[yellow]Heavy jobs may now overlap and exhaust VRAM. "
-                "Set it back with: workerq concurrency 1[/yellow]"
+                f"[dim]Up to {count} jobs may now run at once. Admission control "
+                "decides which actually do: a job starts only when its declared "
+                "RAM/VRAM/CPU fits alongside what is already running.[/dim]"
             )
     service.close()
 

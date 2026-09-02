@@ -221,7 +221,8 @@ foreign GPU process.
 
 ## Foreign workloads
 
-Broker-managed jobs are safe from each other at `max_concurrent_jobs = 1`.
+Broker-managed jobs are safe from each other because admission control only
+starts a job whose declared footprint fits alongside what is already running.
 Work started *outside* worker-q is not something worker-q can control, and the tool
 does not pretend otherwise. Two partial mitigations:
 
@@ -260,19 +261,39 @@ crash, which is what `workerq reconcile` repairs.
 
 ## Concurrency and multiple GPUs
 
-`max_concurrent_jobs = 1` is the shipped default and the tested configuration.
-The dispatcher does allocate distinct devices per job, so raising the slot
-count on a multi-GPU host is coherent — but it is opt-in behind `--yes` and a
-loud warning, because two jobs on one GPU is exactly the OOM this tool exists
-to prevent.
+`max_concurrent_jobs` (default 4) is a **ceiling**, not the scheduler. It exists
+so a bug cannot launch twenty processes, and so the machine still has a bound
+when `resources.enforce` is off. What actually decides is admission control: a
+job starts when its declared RAM/VRAM/CPU fits alongside the reservations of
+everything already running.
 
-Head-of-line blocking when the GPU is busy is intentional: a queued `critical`
-job must not be overtaken by a `low` one merely because it needs a device that
-is momentarily unavailable.
+Devices are allocated whole by default, so two GPU jobs do not share one. A job
+submitted `--share-gpu` may join a device whose current occupants also opted in,
+if their declared VRAM fits the device together. Sharing is judged entirely on
+declarations: VRAM has no swap, and on consumer cards in WDDM mode `nvidia-smi`
+reports no per-process VRAM at all, so there is nothing to check a guess
+against. A job that declares no VRAM is never packed onto an occupied device.
+
+Head-of-line blocking was intentional but too strict: one oversized job at the
+head parked a queue full of work that would have fitted. The dispatcher now
+looks past a job it cannot place, bounded both by how far it looks in a tick and
+by how long the blocked job has already waited. The second bound is the
+starvation guard — without it a stream of small jobs could defer a large one
+indefinitely.
+
+Two things act on a machine already in trouble, which admission control cannot
+do because it only runs before a job starts:
+
+* the **pressure guard** displaces the newest `--preemptible` job when physical
+  memory stays short across several samples;
+* the **reserve** (`workerq reserve`) lets the machine's owner claim RAM, VRAM
+  or CPU back at any moment. It lives in the dispatcher's meta table and is
+  re-read every tick, so it applies without a restart — the same mechanism as
+  the slot count and the GPU threshold.
 
 ## Deferred by design
 
-Remote workers, Slurm, fractional VRAM scheduling, MIG, preemption and
-checkpointing are out of scope for V1. The schema reserves `node`,
+Remote workers, Slurm, fractional VRAM scheduling, MIG and checkpointing are
+out of scope. The schema reserves `node`,
 `minimum_vram_gb` and `estimated_duration_seconds` so adding them later is a
 migration, not a redesign. See [future-slurm.md](future-slurm.md).

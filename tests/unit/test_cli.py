@@ -405,11 +405,34 @@ def test_config_set_rejects_invalid(runner: CliRunner, cli_env: Config):
     assert result.exit_code != 0
 
 
-def test_concurrency_above_one_requires_yes(runner: CliRunner, cli_env: Config):
+def test_raising_concurrency_needs_yes_when_nothing_checks_fit(
+    runner: CliRunner, cli_env: Config
+):
+    """With admission control off the slot count is the only limit."""
+    assert cli_env.resources.enforce is False
     result = invoke(runner, "concurrency", "2")
     assert result.exit_code != 0
     assert "WARNING" in result.output
-    assert "OOM" in result.output
+    assert "admission control is off" in result.output
+
+
+def test_raising_concurrency_is_allowed_when_admission_is_enforced(
+    runner: CliRunner, cli_env: Config, tmp_path
+):
+    """Several jobs at once is a supported configuration, not a hazard.
+
+    Admission control decides what actually runs; the slot count is a ceiling.
+    """
+    from workerq.config import set_dotted_and_save
+
+    set_dotted_and_save(cli_env, "resources.enforce", "true")
+    try:
+        result = invoke(runner, "concurrency", "3", "--json")
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["max_concurrent_jobs"] == 3
+    finally:
+        set_dotted_and_save(cli_env, "resources.enforce", "false")
+        invoke(runner, "concurrency", "1")
 
 
 def test_concurrency_with_yes_succeeds(runner: CliRunner, cli_env: Config):

@@ -69,13 +69,17 @@ _ADDED_COLUMNS = (
     ("preempt_requested", "INTEGER NOT NULL DEFAULT 0"),
     ("preempt_by", "INTEGER"),
     ("preempt_at", "TEXT"),
+    # Whether this job will share a GPU with another. The dispatcher needs it
+    # for placement, so it has to live here and not only in the jobs table.
+    ("gpu_mode", "TEXT NOT NULL DEFAULT 'exclusive'"),
 )
 
 _COLUMNS = (
     "id, label, argv_json, cwd, env_json, gpu_count, slots, priority_rank, position, "
     "log_path, state, exit_code, pid, pid_creation, assigned_devices, cancel_requested, "
     "cancel_force, cancel_at, wait_reason, enqueued_at, started_at, finished_at, "
-    "ram_mib, vram_mib, cpus, preemptible, preempt_requested, preempt_by, preempt_at"
+    "ram_mib, vram_mib, cpus, preemptible, preempt_requested, preempt_by, preempt_at, "
+    "gpu_mode"
 )
 
 
@@ -159,6 +163,7 @@ class QueueStore:
         vram_mib: float | None = None,
         cpus: int | None = None,
         preemptible: bool = False,
+        gpu_mode: str = "exclusive",
     ) -> int:
         with self.transaction() as conn:
             row = conn.execute("SELECT COALESCE(MAX(position), 0) AS p FROM bjobs").fetchone()
@@ -166,8 +171,8 @@ class QueueStore:
             cur = conn.execute(
                 "INSERT INTO bjobs (label, argv_json, cwd, env_json, gpu_count, slots, "
                 "priority_rank, position, log_path, state, enqueued_at, ram_mib, "
-                "vram_mib, cpus, preemptible) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "vram_mib, cpus, preemptible, gpu_mode) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     label,
                     json.dumps(argv, ensure_ascii=False),
@@ -184,6 +189,7 @@ class QueueStore:
                     vram_mib,
                     cpus,
                     1 if preemptible else 0,
+                    gpu_mode,
                 ),
             )
             return int(cur.lastrowid)

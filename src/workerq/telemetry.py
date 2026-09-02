@@ -45,6 +45,15 @@ CREATE TABLE IF NOT EXISTS samples (
 );
 CREATE INDEX IF NOT EXISTS idx_samples_at ON samples(at);
 
+CREATE TABLE IF NOT EXISTS job_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id INTEGER NOT NULL,
+    at TEXT NOT NULL,
+    job_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_job_samples_job ON job_samples(job_id);
+CREATE INDEX IF NOT EXISTS idx_job_samples_sample ON job_samples(sample_id);
+
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     at TEXT NOT NULL,
@@ -131,9 +140,17 @@ class Telemetry:
         running_job_id: int | None = None,
         queued_count: int | None = None,
         top_consumers: list[dict[str, Any]] | None = None,
+        running_job_ids: list[int] | None = None,
     ) -> None:
+        """Record one machine-wide sample.
+
+        `running_job_id` is a single column and stays for compatibility with
+        everything that already reads it; with several jobs running it names an
+        arbitrary one. `running_job_ids` records them all in `job_samples`, so
+        pressure can be attributed to the whole set rather than a coin flip.
+        """
         try:
-            self.conn.execute(
+            cursor = self.conn.execute(
                 "INSERT INTO samples (at, gpu_used_mib, gpu_total_mib, gpu_free_percent, "
                 "gpu_utilization, host_total_mib, host_available_mib, host_free_percent, "
                 "commit_used_mib, commit_limit_mib, commit_percent, running_job_id, "
@@ -156,6 +173,13 @@ class Telemetry:
                     json.dumps(top_consumers, ensure_ascii=False) if top_consumers else None,
                 ),
             )
+            if running_job_ids:
+                sample_id = int(cursor.lastrowid or 0)
+                at = utcnow_iso()
+                self.conn.executemany(
+                    "INSERT INTO job_samples (sample_id, at, job_id) VALUES (?,?,?)",
+                    [(sample_id, at, int(j)) for j in running_job_ids],
+                )
         except Exception:
             pass
 

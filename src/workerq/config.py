@@ -55,7 +55,11 @@ def default_config_path(profile: str | None = None) -> Path:
 @dataclass
 class CoreConfig:
     state_dir: str = ""  # filled in Config.__post_init__
-    max_concurrent_jobs: int = 1
+    #: Ceiling, not the scheduler. Admission control decides what actually
+    #: runs: a job starts only when its declared RAM/VRAM/CPU fits alongside
+    #: what is already running. This exists so a bug cannot launch twenty
+    #: processes, and so the machine has a bound even with enforcement off.
+    max_concurrent_jobs: int = 4
     default_priority: str = "normal"
     snapshot_mode: str = "git"
     cleanup_successful_snapshots_after_days: int = 7

@@ -194,12 +194,21 @@ class Doctor:
         slots = health["slots"]
         configured = self.config.core.max_concurrent_jobs
         if slots == configured:
+            # More than one slot is a supported configuration, not a defect:
+            # admission control decides what actually runs, and the slot count
+            # is only a ceiling. It is worth a note when enforcement is off,
+            # because then the slot count really is the only limit.
+            enforced = self.config.resources.enforce
+            if slots == 1:
+                detail = "one heavy job at a time"
+            elif enforced:
+                detail = f"up to {slots} jobs, admitted only when their declared needs fit"
+            else:
+                detail = f"up to {slots} jobs with admission control OFF - nothing checks fit"
             self.add(
                 f"Queue concurrency = {slots}",
-                PASS if slots == 1 else WARN,
-                "exclusive heavy-job execution"
-                if slots == 1
-                else f"{slots} concurrent jobs may exhaust VRAM",
+                PASS if (slots == 1 or enforced) else WARN,
+                detail,
             )
         else:
             self.add(

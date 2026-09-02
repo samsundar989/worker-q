@@ -28,9 +28,11 @@ That is the whole daily loop. Everything below is detail.
 
 The four things worth knowing:
 
-1. **Only one heavy job runs at a time** (`max_concurrent_jobs = 1`). A 3 GiB
-   job may monopolise a 32 GiB GPU. That is deliberate: reliability beats
-   utilisation.
+1. **Jobs run together only when they fit.** What decides is the footprint each
+   job declares, not a slot count: a job starts when its `--ram/--vram/--cpus`
+   fit alongside everything already running. Small jobs overlap, large ones
+   serialise. Declare honestly - an undeclared job is charged a small default
+   and may be admitted when it should have waited.
 2. **Jobs outlive your terminal.** Close the shell, close the editor, the job
    keeps running and the logs stay readable from any new shell.
 3. **A queued job runs the source as it was at submission time.** Keep editing
@@ -56,8 +58,8 @@ workerq submit --project arc-agi --priority critical -- \
   python evaluate.py --checkpoint latest
 ```
 
-`critical` jumps ahead of everything queued. It never interrupts a job that is
-already running.
+`critical` jumps ahead of everything queued. It interrupts a running job only if
+that job was submitted `--preemptible`.
 
 ### See the queue
 
@@ -68,11 +70,13 @@ workerq status --json          # for scripts and agents
 
 ```text
 GPU 0: NVIDIA GeForce RTX 5090  2.9 / 31.8 GiB used  (91% free)
-Concurrency: 1   GPU free threshold: 85%   Dispatcher: running
+Concurrency: 4   GPU free threshold: 85%   Dispatcher: running
 
  ID  STATE     PRI       PROJECT          AGE/RUNTIME  GPU  BE  COMMAND
  58  RUNNING   normal    pokemon-ai        12m           1  14  python train.py ...
+ 61  RUNNING   normal    kaggriculture      3m           0  17  python features.py ...
  59  QUEUED    critical  arc-agi           4m wait       1  15  python evaluate.py ...
+                         ^ needs 22.0 GiB VRAM; running job(s) reserve 20.0 GiB of 30.8 usable
  60  QUEUED    normal    biohub            1m wait       1  16  python sweep.py ...
 ```
 
@@ -142,12 +146,9 @@ Undeclared jobs are charged a modest default (4 GiB RAM, 1 CPU) so they are
 never treated as free — but estimate properly, since a job that under-declares
 can be admitted when it should have waited.
 
-To run more than one job at a time, raise the slot cap; admission control keeps
-it honest:
-
-```bash
-workerq concurrency 4 --yes
-```
+`max_concurrent_jobs` (default 4) is a ceiling, not the scheduler - it exists so
+a bug cannot launch twenty processes. Admission control decides what actually
+runs. Raise or lower it with `workerq concurrency N`.
 
 Tune the guard rails in `[resources]` (see `workerq resources` for current values):
 
@@ -157,9 +158,40 @@ enforce = true
 reserve_ram_gb = 8.0        # never handed out: OS, editors, agents
 reserve_cpus = 2
 min_host_free_percent = 10  # floor a job may not eat into
-max_commit_percent = 88     # hard stop; Windows fails allocations near this
+max_commit_percent = 97     # hard stop, close to the commit limit
 default_ram_gb = 4.0        # charged to jobs that declare nothing
 ```
+
+### Taking the machine back
+
+To play a game, join a call, or just get the desktop back, claim resources from
+the queue. It applies at once - no restart - and running jobs are left to
+finish:
+
+```bash
+workerq reserve --ram 24 --vram 22 --cpus 8 --label gaming --for 2h
+workerq reserve              # what is held, and what is left for jobs
+workerq reserve --clear      # give it back
+```
+
+Anything blocked by a reserve says so by name. `--for` releases it
+automatically, so a temporary claim cannot become a permanent mystery.
+
+Job processes also run below normal priority, so the desktop stays responsive
+when several share the CPUs. Turn that off with
+`scheduling.background_priority = false`.
+
+### Checking declarations against reality
+
+Admission control is only as good as the numbers jobs declare, so worker-q
+measures what they actually use:
+
+```bash
+workerq resources --verify
+```
+
+Over-declaring is safe but packs badly; under-declaring is what takes the
+machine down.
 
 ---
 
@@ -388,9 +420,12 @@ normal     FIFO
 low        behind everything else
 ```
 
-All four are stored exactly as given. The dispatcher orders strictly by
-priority, then by arrival. **No priority ever preempts a running job**, and
-priority never relaxes a resource-safety rule.
+All four are stored exactly as given. The dispatcher orders by priority, then by
+arrival, and starts a job when it fits. A job it cannot fit does not park the
+queue: work behind it that *does* fit may start first, bounded so the blocked
+job cannot be deferred indefinitely. **Priority never relaxes a resource-safety
+rule**, and it displaces a running job only if that job opted in with
+`--preemptible`.
 
 ```bash
 workerq promote 42        # move a queued job to the front by hand
@@ -510,7 +545,7 @@ and suggest a value; they never change it silently.
 
 ```bash
 workerq config show
-workerq config set core.max_concurrent_jobs 1
+workerq config set core.max_concurrent_jobs 4
 workerq config set gpu.free_memory_threshold_percent 85
 ```
 
@@ -520,7 +555,7 @@ built-in default.**
 ```toml
 [core]
 state_dir = "~/.local/state/gpuq"
-max_concurrent_jobs = 1
+max_concurrent_jobs = 4
 default_priority = "normal"
 snapshot_mode = "git"
 cleanup_successful_snapshots_after_days = 7

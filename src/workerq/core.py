@@ -104,6 +104,9 @@ class SubmitRequest:
     cpus: int | None = None
     #: Safe to stop and re-run, so a higher-priority job may displace it.
     preemptible: bool | None = None
+    #: Willing to share a GPU with another job that also opted in. Requires an
+    #: explicit --vram, since packing is judged on the declaration alone.
+    share_gpu: bool = False
     #: What this job is doing, and what is waiting on it. Supplied by the
     #: worker: worker-q cannot infer intent from a command line.
     describe: str | None = None
@@ -238,6 +241,20 @@ class GPUQService:
         self._reject_impossible(ram_mib, vram_mib, cpus)
         advisories = self._admission_advisories(ram_mib)
 
+        # Sharing a GPU is judged entirely on declared VRAM: there is no
+        # per-process VRAM accounting to check it against on consumer cards,
+        # and VRAM has no swap to absorb a mistake. So an undeclared job is
+        # never packed onto an occupied device.
+        if request.share_gpu and gpus > 0 and not vram_mib:
+            raise GPUQError(
+                "--share-gpu needs --vram: a job may only share a device when it "
+                "has said how much VRAM it will use."
+            )
+        if request.share_gpu:
+            gpu_mode = "shared"
+        else:
+            gpu_mode = "exclusive" if self.config.gpu.exclusive_by_default else "shared"
+
         submitted_cwd = resolve_path(request.cwd or Path.cwd())
         if not submitted_cwd.is_dir():
             raise GPUQError(f"working directory does not exist: {submitted_cwd}")
@@ -286,7 +303,7 @@ class GPUQService:
             command_json=json_dumps(command),
             shell_mode=1 if shell_mode else 0,
             requested_gpu_count=gpus,
-            gpu_mode="exclusive" if self.config.gpu.exclusive_by_default else "shared",
+            gpu_mode=gpu_mode,
             snapshot_mode=mode.value,
             host=hostname(),
             submitter_pid=os.getpid(),
@@ -344,6 +361,7 @@ class GPUQService:
                 vram_mib=vram_mib,
                 cpus=cpus,
                 preemptible=preemptible,
+                gpu_mode=gpu_mode,
             )
 
             # ---- 5/6. record backend id, mark QUEUED -----------------
@@ -352,7 +370,9 @@ class GPUQService:
             )
 
             if priority is Priority.CRITICAL:
-                # Spec 11.7: critical goes to the front, but never preempts.
+                # Spec 11.7: critical goes to the front of the queue. Whether
+                # it also displaces running work is the dispatcher's call, and
+                # only for jobs that opted in with --preemptible.
                 try:
                     self.backend.promote(backend_job_id)
                 except BackendUnavailable:
@@ -1032,8 +1052,10 @@ class GPUQService:
         job = self.get_job(job_id)
         if job.state_enum is not JobState.QUEUED:
             raise GPUQError(
-                f"job #{job.id} is {job.state}; only QUEUED jobs can be promoted "
-                "(worker-q never preempts a running job)"
+                f"job #{job.id} is {job.state}; only QUEUED jobs can be promoted. "
+                "To displace running work, raise its priority with "
+                "'workerq bump' - which stops a running job only if that job "
+                "was submitted --preemptible."
             )
         if job.backend_job_id is None:
             raise GPUQError(f"job #{job.id} has no backend job to promote")

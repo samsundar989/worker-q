@@ -75,6 +75,7 @@ class SchedulerBackend(Protocol):
         vram_mib: float | None = None,
         cpus: int | None = None,
         preemptible: bool = False,
+        gpu_mode: str = "exclusive",
     ) -> int: ...
 
     def list_jobs(self) -> list[BackendJob]: ...

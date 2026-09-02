@@ -290,6 +290,7 @@ class LocalDispatcherBackend:
         vram_mib: float | None = None,
         cpus: int | None = None,
         preemptible: bool = False,
+        gpu_mode: str = "exclusive",
     ) -> int:
         """Enqueue an argv vector. No shell, no string concatenation."""
         argv = [str(a) for a in argv]
@@ -312,6 +313,7 @@ class LocalDispatcherBackend:
             vram_mib=vram_mib,
             cpus=cpus,
             preemptible=preemptible,
+            gpu_mode=gpu_mode,
         )
 
     def list_jobs(self, *, limit: int | None = None) -> list[BackendJob]:

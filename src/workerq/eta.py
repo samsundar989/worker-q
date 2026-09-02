@@ -253,7 +253,14 @@ def forecast_queue(service: GPUQService, jobs: list[Job]) -> dict[int, dict[str,
     estimate ahead of it, and a job with an unknown duration makes everything
     behind it unknown too rather than silently optimistic.
     """
-    slots = max(1, service.config.core.max_concurrent_jobs)
+    # The dispatcher's own slot count, not the config value: `workerq
+    # concurrency` writes to the queue store and the two can diverge, and a
+    # forecast computed against a different number than status displays is
+    # worse than no forecast.
+    try:
+        slots = max(1, service.backend.get_slots())
+    except Exception:
+        slots = max(1, service.config.core.max_concurrent_jobs)
     now = utcnow()
     result: dict[int, dict[str, Any]] = {}
 

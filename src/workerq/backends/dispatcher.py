@@ -169,11 +169,44 @@ class Dispatcher:
             used.update(job.devices)
         return used
 
-    def _allocate_devices(self, gpu_count: int) -> tuple[list[int] | None, str | None]:
+    def _device_occupancy(self) -> dict[int, dict[str, Any]]:
+        """Per-device: who is on it, how much VRAM they declared, and the mode.
+
+        Placement is per-device, so the accounting has to be too. The aggregate
+        VRAM ledger in `resources.admit` sums every device's memory, which on a
+        multi-GPU host would happily pass two jobs that cannot both fit on the
+        one device they land on.
+        """
+        occupancy: dict[int, dict[str, Any]] = {}
+        rows = {int(r["id"]): r for r in self.store.running()}
+        for backend_id, job in self.running.items():
+            row = rows.get(backend_id, {})
+            mode = str(row.get("gpu_mode") or "exclusive")
+            vram = float(row.get("vram_mib") or 0.0)
+            for index in job.devices:
+                entry = occupancy.setdefault(
+                    index, {"jobs": [], "vram_mib": 0.0, "exclusive": False}
+                )
+                entry["jobs"].append(backend_id)
+                entry["vram_mib"] += vram
+                if mode != "shared":
+                    entry["exclusive"] = True
+        return occupancy
+
+    def _allocate_devices(
+        self, gpu_count: int, *, gpu_mode: str = "exclusive", vram_mib: float = 0.0
+    ) -> tuple[list[int] | None, str | None]:
         """Pick devices for a job, honouring the free-memory threshold.
 
         Returns (devices, wait_reason). `devices` is None when the job must
         wait; an empty list means the job needs no GPU.
+
+        A device already running a job is off limits unless both that job and
+        this one asked to share it, and their declared VRAM fits the device
+        together. VRAM has no swap and, on consumer cards in WDDM mode, no
+        per-process accounting to check the guess against - so sharing is
+        gated entirely on declarations, and a job that declares no VRAM is
+        never packed onto an occupied device.
         """
         if gpu_count <= 0:
             return [], None
@@ -187,12 +220,34 @@ class Dispatcher:
         threshold = self.store.get_meta_int(
             META_GPU_FREE_PERC, self.config.gpu.free_memory_threshold_percent
         )
-        in_use = self._devices_in_use()
+        reserve_vram = self._reserve().vram_mib
+        occupancy = self._device_occupancy()
+        wants_share = gpu_mode == "shared" and vram_mib > 0
         candidates: list[tuple[float, int]] = []
         blocked: list[str] = []
+
         for device in info.devices:
-            if device.index in in_use:
+            held = occupancy.get(device.index)
+            if held:
+                # Occupied. Only a shared job may join a device whose current
+                # occupants all agreed to share.
+                if not wants_share or held["exclusive"]:
+                    continue
+                total = device.memory_total_mib or 0.0
+                budget = max(0.0, total - reserve_vram)
+                committed = held["vram_mib"]
+                if committed + vram_mib > budget:
+                    blocked.append(
+                        f"GPU{device.index} shared: "
+                        f"{(committed + vram_mib) / 1024:.1f} GiB declared exceeds "
+                        f"{budget / 1024:.1f} GiB usable"
+                    )
+                    continue
+                # Sharing is judged on declarations, not the live free-memory
+                # threshold: the occupant's allocation is already counted.
+                candidates.append((-2.0, device.index))
                 continue
+
             free = device.free_percent
             if free is None:
                 # Unknown free memory: allow, but never prefer.
@@ -208,6 +263,7 @@ class Dispatcher:
                 return None, "waiting for GPU memory: " + "; ".join(blocked)
             return None, f"waiting for {gpu_count} free GPU(s)"
 
+        # Freest first, and an empty device always beats sharing one.
         candidates.sort(key=lambda pair: pair[0], reverse=True)
         return [index for _, index in candidates[:gpu_count]], None
 
@@ -477,6 +533,7 @@ class Dispatcher:
                 commit_limit_mib=mem.commit_limit_mib,
                 commit_percent=mem.commit_percent,
                 running_job_id=running_ids[0] if running_ids else None,
+                running_job_ids=running_ids,
                 queued_count=len(self.store.queued()),
                 top_consumers=top,
             )
@@ -699,7 +756,11 @@ class Dispatcher:
             if not decision.admit:
                 blocked_reason = decision.reason
             else:
-                devices, blocked_reason = self._allocate_devices(int(row.get("gpu_count") or 0))
+                devices, blocked_reason = self._allocate_devices(
+                    int(row.get("gpu_count") or 0),
+                    gpu_mode=str(row.get("gpu_mode") or "exclusive"),
+                    vram_mib=float(row.get("vram_mib") or 0.0),
+                )
                 if devices is not None:
                     blocked_reason = None
 
