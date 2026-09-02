@@ -2,7 +2,7 @@
 
 Without this, "why did my job die at 22:03?" is unanswerable: the evidence is
 gone by the time anyone looks. The dispatcher writes a cheap sample every few
-seconds and an event per state change, so `gpuq report` can say what the
+seconds and an event per state change, so `workerq report` can say what the
 machine actually looked like at the moment a job failed - and, crucially, what
 *else* was holding memory.
 
@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from gpuq.util import ensure_dir, parse_iso, utcnow_iso
+from workerq.util import ensure_dir, parse_iso, utcnow_iso
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS samples (

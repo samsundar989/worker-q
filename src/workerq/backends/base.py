@@ -1,6 +1,6 @@
 """Execution backend abstraction (spec section 7).
 
-GPUQ never constructs backend-specific commands outside a backend module. The
+worker-q never constructs backend-specific commands outside a backend module. The
 V1 implementation is `LocalDispatcherBackend`; `RemoteBackend` / `SlurmBackend`
 can be added without touching core, CLI or MCP code.
 """
@@ -25,7 +25,7 @@ class BackendUnavailable(BackendError):
     """
 
 
-# Backend-level states. The mapping to GPUQ `JobState` lives in one place only:
+# Backend-level states. The mapping to worker-q `JobState` lives in one place only:
 # `BACKEND_STATE_MAP` below.
 BACKEND_QUEUED = "QUEUED"
 BACKEND_RUNNING = "RUNNING"
@@ -52,7 +52,7 @@ class BackendJob:
 
 @runtime_checkable
 class SchedulerBackend(Protocol):
-    """Everything GPUQ needs from an execution backend."""
+    """Everything worker-q needs from an execution backend."""
 
     name: str
 

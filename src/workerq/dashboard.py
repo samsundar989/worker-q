@@ -1,7 +1,7 @@
-"""`gpuq top` - a live view of the queue and the machine it is protecting.
+"""`workerq top` - a live view of the queue and the machine it is protecting.
 
 Answers, at a glance, the three questions that matter when a box is falling
-over: what is running, what is holding resources (including work gpuq did not
+over: what is running, what is holding resources (including work worker-q did not
 start), and why is the next job not starting yet.
 """
 
@@ -17,11 +17,11 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from gpuq import __version__, host
-from gpuq.core import GPUQService
-from gpuq.models import JobState
-from gpuq.resources import capacity
-from gpuq.util import human_duration, truncate
+from workerq import __version__, host
+from workerq.core import GPUQService
+from workerq.models import JobState
+from workerq.resources import capacity
+from workerq.util import human_duration, truncate
 
 STATE_STYLES = {
     "RUNNING": "bold green",
@@ -189,7 +189,7 @@ class Dashboard:
         )
 
     def pressure_panel(self) -> Panel:
-        """Who is actually holding memory - including work gpuq never started."""
+        """Who is actually holding memory - including work worker-q never started."""
         own = self.service.own_pids()
         table = Table(box=None, pad_edge=False, expand=True)
         table.add_column("PID", justify="right", width=7)
@@ -200,7 +200,7 @@ class Dashboard:
         for proc in host.top_processes(8):
             if proc.memory_mib < 200:
                 continue
-            tag = Text("gpuq", style="green") if proc.pid in own else Text("foreign", style="yellow")
+            tag = Text("worker-q", style="green") if proc.pid in own else Text("foreign", style="yellow")
             style = "bold red" if proc.memory_gib >= 8 else ""
             table.add_row(
                 str(proc.pid),
@@ -228,7 +228,7 @@ class Dashboard:
         for job in finished:
             why = ""
             if job.state in (JobState.FAILED.value, JobState.LOST.value):
-                from gpuq.report import classify_failure
+                from workerq.report import classify_failure
 
                 why = classify_failure(self.service, job).label
             table.add_row(
@@ -246,7 +246,7 @@ class Dashboard:
     def footer(self) -> Text:
         stats = self.service.throughput(hours=24)
         return Text.assemble(
-            (f"gpuq {__version__}", "dim"),
+            (f"workerq {__version__}", "dim"),
             ("   24h: ", "dim"),
             (f"{stats['succeeded']} ok", "green"),
             " · ",

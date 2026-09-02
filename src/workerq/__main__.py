@@ -1,4 +1,4 @@
-"""Allow `python -m gpuq ...` to keep working after the rename to workerq."""
+"""Allow `python -m gpuq ...`."""
 
 from workerq.cli import main
 

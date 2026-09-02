@@ -1,4 +1,4 @@
-# GPUQ architecture
+# worker-q architecture
 
 ## The one invariant
 
@@ -13,11 +13,11 @@ utilisation for reliability, reliability won.
 
 ```text
 Claude A ─┐
-Claude B ─┼── gpuq CLI ──┐
+Claude B ─┼── workerq CLI ──┐
 Claude C ─┘              │
                          ▼
                  ┌──────────────────┐
-                 │  GPUQ Core API   │   config, SQLite metadata,
+                 │  Core API   │   config, SQLite metadata,
                  │  (GPUQService)   │   snapshots, validation
                  └────────┬─────────┘
                           │
@@ -34,7 +34,7 @@ Claude C ─┘              │
                           │
                           ▼
                  ┌──────────────────┐
-                 │  gpuq _run       │   runner wrapper: provenance,
+                 │  worker-q _run       │   runner wrapper: provenance,
                  │  (per job)       │   signals, exit code
                  └────────┬─────────┘
                           ▼
@@ -55,7 +55,7 @@ gate WSL processes, while the workloads that actually need gating here are
 Windows-native (`.venv\Scripts\python.exe` with `torch+cu129`). A queue that
 cannot see the jobs it is meant to serialise is not a safety mechanism.
 
-So GPUQ ships a dispatcher of equivalent *scope* — not an ambitious scheduler
+So worker-q ships a dispatcher of equivalent *scope* — not an ambitious scheduler
 — behind the `SchedulerBackend` protocol that the spec defines for exactly
 this purpose. It provides only what the backend contract requires:
 
@@ -125,25 +125,25 @@ transition is illegal.
 7. mark `QUEUED`.
 
 The user's command never runs before steps 1–7 succeed. If the backend is
-unreachable, submission fails non-zero and tells the user to run `gpuq doctor`
+unreachable, submission fails non-zero and tells the user to run `workerq doctor`
 — it never "helpfully" runs the command directly, which would be precisely the
 OOM the tool exists to prevent.
 
 A crash between 5 and 6 leaves a `PREPARING` row with no backend id. The
-backend label carries the gpuq job id, so `gpuq reconcile` re-attaches it. A
+backend label carries the worker-q job id, so `workerq reconcile` re-attaches it. A
 `PREPARING` row older than five minutes with no matching backend job becomes
 `LOST` — never `SUCCEEDED`.
 
 ### Why the runner takes only a job id
 
-The backend executes `gpuq _run <job_id>` — the user's argv is *not* on that
+The backend executes `workerq _run <job_id>` — the user's argv is *not* on that
 command line. The runner reads it back from the database as JSON.
 
 The spec requires that arguments containing spaces, quotes, globs, `=`,
 Unicode and shell metacharacters round-trip exactly. On Windows every
 `Popen(list)` is joined by `list2cmdline` and re-parsed by the child's C
 runtime; that round-trip has real edge cases. Passing the argv through JSON in
-SQLite has none. `gpuq _run <id> -- <argv...>` still works for direct testing.
+SQLite has none. `workerq _run <id> -- <argv...>` still works for direct testing.
 
 ## Snapshots
 
@@ -188,7 +188,7 @@ recycled PID belonging to unrelated work is never killed.
 
 ### Console hygiene
 
-gpuq's background processes are launched with **`pythonw.exe`**, not
+worker-q's background processes are launched with **`pythonw.exe`**, not
 `python.exe`, and this is load-bearing rather than cosmetic.
 
 A virtualenv's `python.exe` on Windows is a launcher that re-execs the real
@@ -216,25 +216,25 @@ paired with the process creation time from `GetProcessTimes`, and
 One consequence worth knowing: a virtualenv `python.exe` may be a *trampoline*
 that re-execs the real interpreter as a child. The PID the dispatcher launched
 and the PID the runner reports for itself are then both correct and different.
-`own_gpu_pids()` collects both, or `doctor` would report gpuq's own job as a
+`own_gpu_pids()` collects both, or `doctor` would report worker-q's own job as a
 foreign GPU process.
 
 ## Foreign workloads
 
 Broker-managed jobs are safe from each other at `max_concurrent_jobs = 1`.
-Work started *outside* gpuq is not something gpuq can control, and the tool
+Work started *outside* worker-q is not something worker-q can control, and the tool
 does not pretend otherwise. Two partial mitigations:
 
 - **Free-memory threshold.** A queued GPU job waits until a device is at least
   `gpu.free_memory_threshold_percent` free, so it will not pile onto a GPU
-  something else is already using. `gpuq status` shows what a job is waiting
+  something else is already using. `workerq status` shows what a job is waiting
   for rather than appearing mysteriously stuck.
-- **Agent policy.** `gpuq claude-policy install` writes behavioural guidance
+- **Agent policy.** `workerq claude-policy install` writes behavioural guidance
   into `~/.claude/CLAUDE.md`. Claude's documentation distinguishes CLAUDE.md
   from hooks and permissions, so this is guidance, not enforcement.
 
 On a desktop GPU the compositor and browsers hold a few GiB permanently, so a
-90% threshold can stall the queue outright. `gpuq init` and `gpuq doctor`
+90% threshold can stall the queue outright. `workerq init` and `workerq doctor`
 detect this and *recommend* a value; neither changes it silently.
 
 ## Files on disk
@@ -253,10 +253,10 @@ detect this and *recommend* a value; neither changes it silently.
     run/dispatcher.log                daemon log
 ```
 
-Two databases, deliberately. The core DB is gpuq's; the queue DB belongs to
+Two databases, deliberately. The core DB is worker-q's; the queue DB belongs to
 the backend. Keeping them apart is what makes the backend swappable — and the
 spec's reconciliation model already assumes the two can disagree after a
-crash, which is what `gpuq reconcile` repairs.
+crash, which is what `workerq reconcile` repairs.
 
 ## Concurrency and multiple GPUs
 

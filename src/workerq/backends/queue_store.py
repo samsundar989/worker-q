@@ -1,6 +1,6 @@
 """Durable queue state owned by the local dispatcher backend.
 
-Kept in its own SQLite database, separate from the GPUQ metadata DB, so the
+Kept in its own SQLite database, separate from the worker-q metadata DB, so the
 backend remains genuinely swappable: core code only ever sees `BackendJob`.
 Both the CLI (writer of intent) and the daemon (executor) reach the queue
 through this class, and WAL + IMMEDIATE transactions make that safe.
@@ -15,14 +15,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from gpuq.backends.base import (
+from workerq.backends.base import (
     BACKEND_FINISHED,
     BACKEND_QUEUED,
     BACKEND_REMOVED,
     BACKEND_RUNNING,
     BackendJob,
 )
-from gpuq.util import ensure_dir, utcnow_iso
+from workerq.util import ensure_dir, utcnow_iso
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS bjobs (

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from gpuq.config import (
+from workerq.config import (
     Config,
     ConfigError,
     CoreConfig,

@@ -1,4 +1,4 @@
-"""SQLite metadata store for GPUQ jobs.
+"""SQLite metadata store for worker-q jobs.
 
 One database, WAL journalling, a tiny schema-version table for migrations, and
 transactional state changes (spec sections 9 and 29).
@@ -13,14 +13,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from gpuq.models import (
+from workerq.models import (
     ACTIVE_STATES,
     InvalidTransition,
     Job,
     JobState,
     can_transition,
 )
-from gpuq.util import ensure_dir, restrict_permissions, utcnow_iso
+from workerq.util import ensure_dir, restrict_permissions, utcnow_iso
 
 SCHEMA_VERSION = 3
 

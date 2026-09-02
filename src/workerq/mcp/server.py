@@ -2,7 +2,7 @@
 
 Deliberately thin: every tool delegates to `GPUQService`, the same object the
 CLI uses. No scheduling, snapshotting or state logic is duplicated here, and it
-never shells out to `gpuq`.
+never shells out to `worker-q`.
 
 The SDK is an optional extra, so this module must not be imported at CLI start.
 """
@@ -11,9 +11,9 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from gpuq import __version__
-from gpuq.config import Config, load_config
-from gpuq.core import GPUQError, GPUQService, JobNotFound, SubmitRequest
+from workerq import __version__
+from workerq.config import Config, load_config
+from workerq.core import GPUQError, GPUQService, JobNotFound, SubmitRequest
 
 TOOL_NAMES = [
     "gpu_submit",
@@ -54,7 +54,7 @@ def _require_sdk() -> Any:
     except ImportError as exc:
         raise MCPUnavailable(
             "the MCP Python SDK is not installed, or its API is not recognised. "
-            "Install it with: uv tool install --force --from . --with 'mcp[cli]' gpuq"
+            "Install it with: uv tool install --force --from . --with 'mcp[cli]' worker-q"
         ) from exc
 
 
@@ -215,12 +215,12 @@ def tool_gpu_info(config: Config | None) -> dict[str, Any]:
 
 
 def build_server(config: Config | None = None) -> Any:
-    """Build a FastMCP server exposing the GPUQ tools."""
+    """Build a FastMCP server exposing the worker-q tools."""
     server_class = _require_sdk()
     config = config or load_config()
 
     server = server_class(
-        name="gpuq",
+        name="workerq",
         instructions=(
             "Broker for GPU-heavy workloads on this machine. Submit expensive work with "
             "gpu_submit instead of running it directly, then continue with other work; "
@@ -251,7 +251,7 @@ def build_server(config: Config | None = None) -> Any:
             env=env,
         )
 
-    @server.tool(description="List running, queued and recently finished GPUQ jobs.")
+    @server.tool(description="List running, queued and recently finished worker-q jobs.")
     def gpu_status(
         project: str | None = None,
         state: str | None = None,

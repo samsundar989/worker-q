@@ -17,14 +17,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from gpuq.util import atomic_write_text, ensure_dir, expand_path
+from workerq.util import atomic_write_text, ensure_dir, expand_path
 
 START_MARKER = "<!-- gpuq-policy:start -->"
 END_MARKER = "<!-- gpuq-policy:end -->"
 
 POLICY_BODY = """## Heavy Workload Policy (GPU, RAM and CPU)
 
-This machine uses `gpuq` to broker expensive workloads across concurrent agents.
+This machine uses `workerq` to broker expensive workloads across concurrent agents.
 It is not only for GPU work: host RAM exhaustion is the most common way this
 box falls over, so anything heavy in **VRAM, RAM or CPU** goes through the queue.
 
@@ -47,12 +47,12 @@ This includes, unless clearly tiny:
 
 Submit them instead:
 
-    gpuq submit --project <project> --priority normal -- <command> <args...>
+    workerq submit --project <project> --priority normal -- <command> <args...>
 
 **Declare what the job needs.** This is what lets gpuq run small jobs in
 parallel and serialise big ones, instead of guessing:
 
-    gpuq submit --project <project> --ram 24 --vram 12 --cpus 4 -- <command>
+    workerq submit --project <project> --ram 24 --vram 12 --cpus 4 -- <command>
 
 `--ram` and `--vram` are peak GiB. Estimate high rather than low; an undeclared
 job is charged a small default and may be admitted when it should have waited.
@@ -63,7 +63,7 @@ Use `--priority critical` only for work that is genuinely blocking urgent progre
 
 Some projects carry a standing priority set by the machine's owner, which your
 submissions inherit automatically - you do not need to pass `--priority` to get
-it. Do not run `gpuq priority` yourself; which project matters most is not an
+it. Do not run `workerq priority` yourself; which project matters most is not an
 agent's decision. Passing an explicit `--priority` overrides that policy for a
 single job, so only do it when this particular job really differs.
 
@@ -72,23 +72,23 @@ unless the result is required for the next action.
 
 Inspect work with:
 
-    gpuq status
-    gpuq top                      live dashboard: queue + machine pressure
-    gpuq show <job_id>
-    gpuq logs <job_id>
-    gpuq logs <job_id> --follow
-    gpuq report                   why recent jobs failed, and whose they were
-    gpuq resources                capacity, headroom and current limits
+    workerq status
+    workerq top                      live dashboard: queue + machine pressure
+    workerq show <job_id>
+    workerq logs <job_id>
+    workerq logs <job_id> --follow
+    workerq report                   why recent jobs failed, and whose they were
+    workerq resources                capacity, headroom and current limits
 
 Cancel with:
 
-    gpuq cancel <job_id>
+    workerq cancel <job_id>
 
-Do not bypass `gpuq` just because `nvidia-smi` currently looks idle. GPU memory
+Do not bypass `workerq` just because `nvidia-smi` currently looks idle. GPU memory
 is not the binding constraint most of the time - host RAM is - and the queue is
 the only thing that can see the whole picture.
 
-If a job is QUEUED and not starting, that is usually deliberate: `gpuq status`
+If a job is QUEUED and not starting, that is usually deliberate: `workerq status`
 prints the reason (waiting for RAM, VRAM or CPU). Do not work around it by
 running the command directly.
 
@@ -99,8 +99,10 @@ Notes for this machine:
   keep editing the repository immediately after submitting.
 - Jobs outlive the terminal that submitted them; closing a session does not
   cancel work.
-- `gpuq status --json`, `gpuq show <id> --json` and `gpuq list --json` are the
-  machine-readable forms to parse."""
+- `workerq status --json`, `workerq show <id> --json` and `gpuq list --json` are the
+  machine-readable forms to parse.
+- The command is `workerq`. `gpuq` is a working alias, so older project
+  instructions that say `gpuq ...` are still correct."""
 
 
 def policy_block() -> str:

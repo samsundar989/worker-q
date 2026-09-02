@@ -1,8 +1,11 @@
-# GPUQ — Agent GPU Workload Broker
+# worker-q — a resource broker for machines shared by AI coding agents
 
-One shared gate for GPU-heavy work, so several AI coding agents can run in
-parallel across projects without their training/eval jobs colliding and OOMing
-the GPU.
+One shared gate for heavy work - GPU, RAM and CPU - so several AI coding agents
+can run in parallel across projects without their jobs colliding and taking the
+machine down.
+
+> The CLI is `workerq`. `worker-q` is kept as a working alias, since that is what
+> earlier agent policies and queued jobs refer to.
 
 Submit expensive work in seconds, keep coding, and trust that the machine will
 not start another broker-managed heavy job until it is safe.
@@ -12,13 +15,13 @@ not start another broker-managed heavy job until it is safe.
 ## Start using this now
 
 ```bash
-gpuq doctor                                   # check the machine is healthy
+workerq doctor                                   # check the machine is healthy
 
-gpuq submit --project my-project -- \
+workerq submit --project my-project -- \
   python train.py --config configs/exp17.yaml # queue a job, return immediately
 
-gpuq status                                   # what is running / next
-gpuq logs 1 --follow                          # stream a job's output
+workerq status                                   # what is running / next
+workerq logs 1 --follow                          # stream a job's output
 ```
 
 That is the whole daily loop. Everything below is detail.
@@ -32,8 +35,8 @@ The four things worth knowing:
    keeps running and the logs stay readable from any new shell.
 3. **A queued job runs the source as it was at submission time.** Keep editing
    the repo the moment you have submitted; the job is unaffected.
-4. **gpuq never runs your command directly.** If the queue is unreachable,
-   submission fails loudly and tells you to run `gpuq doctor`.
+4. **worker-q never runs your command directly.** If the queue is unreachable,
+   submission fails loudly and tells you to run `workerq doctor`.
 
 ---
 
@@ -42,14 +45,14 @@ The four things worth knowing:
 ### Submit a training job
 
 ```bash
-gpuq submit --project arc-agi -- \
+workerq submit --project arc-agi -- \
   python train.py --config configs/exp17.yaml
 ```
 
 ### Urgent blocking evaluation
 
 ```bash
-gpuq submit --project arc-agi --priority critical -- \
+workerq submit --project arc-agi --priority critical -- \
   python evaluate.py --checkpoint latest
 ```
 
@@ -59,8 +62,8 @@ already running.
 ### See the queue
 
 ```bash
-gpuq status
-gpuq status --json          # for scripts and agents
+workerq status
+workerq status --json          # for scripts and agents
 ```
 
 ```text
@@ -76,21 +79,21 @@ Concurrency: 1   GPU free threshold: 85%   Dispatcher: running
 ### Follow logs
 
 ```bash
-gpuq logs 42 --follow
-gpuq logs 42 --tail 100
+workerq logs 42 --follow
+workerq logs 42 --tail 100
 ```
 
 ### Cancel
 
 ```bash
-gpuq cancel 42            # queued -> removed; running -> stopped
-gpuq cancel 42 --force    # skip the grace period, kill the process tree now
+workerq cancel 42            # queued -> removed; running -> stopped
+workerq cancel 42 --force    # skip the grace period, kill the process tree now
 ```
 
 ### Inspect source provenance
 
 ```bash
-gpuq show 42
+workerq show 42
 ```
 
 Tells you the snapshot commit, the exact directory the job ran in, the assigned
@@ -99,7 +102,7 @@ Tells you the snapshot commit, the exact directory the job ran in, the assigned
 ### Check system health
 
 ```bash
-gpuq doctor
+workerq doctor
 ```
 
 Exit code `0` healthy, `1` degraded but usable, `2` broken — do not submit.
@@ -109,18 +112,18 @@ Exit code `0` healthy, `1` degraded but usable, `2` broken — do not submit.
 
 ## Declaring what a job needs
 
-gpuq brokers **any** heavy workload, not just GPU work. Host RAM exhaustion is
+worker-q brokers **any** heavy workload, not just GPU work. Host RAM exhaustion is
 the most common way a dev box falls over, and a slot count cannot see it.
 
 ```bash
-gpuq submit --project biohub --ram 24 --vram 12 --cpus 4 --   C:/Users/you/Documents/biohub/.venv/Scripts/python.exe -m celltrack train
+workerq submit --project biohub --ram 24 --vram 12 --cpus 4 --   C:/Users/you/Documents/biohub/.venv/Scripts/python.exe -m celltrack train
 ```
 
 `--ram` and `--vram` are peak GiB. A job starts only when its declared
 footprint fits, judged two ways at once:
 
 * against **measured free memory** right now, which is the only thing that
-  accounts for workloads gpuq did not start;
+  accounts for workloads worker-q did not start;
 * against the **sum of what running jobs reserved**, because a job that started
   moments ago has not grown to full size yet.
 
@@ -143,10 +146,10 @@ To run more than one job at a time, raise the slot cap; admission control keeps
 it honest:
 
 ```bash
-gpuq concurrency 4 --yes
+workerq concurrency 4 --yes
 ```
 
-Tune the guard rails in `[resources]` (see `gpuq resources` for current values):
+Tune the guard rails in `[resources]` (see `workerq resources` for current values):
 
 ```toml
 [resources]
@@ -164,23 +167,23 @@ default_ram_gb = 4.0        # charged to jobs that declare nothing
 ## Watching the queue and diagnosing crashes
 
 ```bash
-gpuq top        # live dashboard: queue, machine pressure, who holds memory
-gpuq report     # why recent jobs failed, and whose workload it was
-gpuq resources  # capacity, headroom, and the limits being enforced
+workerq top        # live dashboard: queue, machine pressure, who holds memory
+workerq report     # why recent jobs failed, and whose workload it was
+workerq resources  # capacity, headroom, and the limits being enforced
 ```
 
-`gpuq top` refreshes in place and shows four things at once: VRAM / RAM /
+`workerq top` refreshes in place and shows four things at once: VRAM / RAM /
 commit-charge meters that turn amber then red under pressure, the live queue
 with a wait reason under anything that is blocked, the largest memory consumers
-tagged **gpuq** or **foreign**, and recently finished jobs with a one-line cause
+tagged **worker-q** or **foreign**, and recently finished jobs with a one-line cause
 for each failure. Ctrl-C exits. `--once` prints a single frame, which is what
 you want in a script.
 
 That `foreign` tag is usually the answer when the box falls over: it is a heavy
-workload running outside the queue, which gpuq can see but cannot schedule
+workload running outside the queue, which worker-q can see but cannot schedule
 around.
 
-`gpuq report` classifies every recent failure - CUDA OOM, host OOM, killed,
+`workerq report` classifies every recent failure - CUDA OOM, host OOM, killed,
 missing file, import error, application exception - and groups them by project
 and by the agent that submitted them. For failures caused by the machine rather
 than the code, it prints what memory looked like at that moment:
@@ -195,7 +198,7 @@ job raised an exception                4
   #51 biohub host out of memory (exit 1, claude-code)
       MemoryError: could not read frame 78 ... the host is out of memory
       at the time: host 6% free, commit 94%
-      -> declare --ram so gpuq holds the job until that much is actually free
+      -> declare --ram so worker-q holds the job until that much is actually free
 ```
 
 Add `--pressure` to also list what peaked in that window, and `--json` for
@@ -208,13 +211,13 @@ anything you want to parse.
 Requires Python 3.11+, git, and (for GPU gating) a working NVIDIA driver.
 
 ```bash
-uv tool install --from . gpuq        # from a clone
-gpuq init
-gpuq claude-policy install
-gpuq doctor
+uv tool install --from . worker-q        # from a clone
+workerq init
+workerq claude-policy install
+workerq doctor
 ```
 
-`gpuq init` is idempotent: it creates the state directories, the database and
+`workerq init` is idempotent: it creates the state directories, the database and
 the dispatcher, and re-applies your configured concurrency and GPU threshold.
 
 `scripts/bootstrap.sh` does all of the above in one step and finishes with a
@@ -238,7 +241,7 @@ non-destructive queue smoke test.
 ## Teaching your agents to use it
 
 ```bash
-gpuq claude-policy install
+workerq claude-policy install
 ```
 
 This writes a marker-delimited block into `~/.claude/CLAUDE.md`, the user-level
@@ -247,8 +250,8 @@ file up before the first change, preserves every other instruction, and can be
 removed cleanly:
 
 ```bash
-gpuq claude-policy status
-gpuq claude-policy remove
+workerq claude-policy status
+workerq claude-policy remove
 ```
 
 Claude's own documentation distinguishes `CLAUDE.md` guidance from enforceable
@@ -258,13 +261,13 @@ defence, not a hard boundary.
 An optional stronger measure exists and is **not** enabled by default:
 
 ```bash
-gpuq claude-safe-launcher install
+workerq claude-safe-launcher install
 ```
 
 It creates `claude-gpu-safe`, which starts Claude Code with
 `CUDA_VISIBLE_DEVICES=""` so a command the agent runs directly cannot reach the
 GPU. Trade-off: legitimate lightweight GPU probes run directly will also see no
-device. Queued gpuq jobs are unaffected — the dispatcher restores the real
+device. Queued worker-q jobs are unaffected — the dispatcher restores the real
 device list.
 
 ---
@@ -274,14 +277,14 @@ device list.
 The problem this solves: you submit job #42, then keep editing. Without
 snapshots, #42 would run whatever the code looks like when it finally starts.
 
-For a Git repository, `gpuq submit` freezes the working tree at submission time
+For a Git repository, `workerq submit` freezes the working tree at submission time
 — tracked content, staged changes, unstaged changes, and untracked non-ignored
 files — into an ephemeral commit built through a **temporary Git index**. Your
 real index, working tree, branch and HEAD are never touched. The job then runs
 in a detached worktree of that commit.
 
 ```bash
-gpuq show 42          # Snapshot commit: 9f613e2...
+workerq show 42          # Snapshot commit: 9f613e2...
 ```
 
 ### Ignored data your job still needs
@@ -298,7 +301,7 @@ passthrough = ["data", "datasets", "checkpoints"]
 or per submission:
 
 ```bash
-gpuq submit --passthrough data --passthrough checkpoints -- python train.py
+workerq submit --passthrough data --passthrough checkpoints -- python train.py
 ```
 
 Directories become junctions/symlinks back to the live path — no bulk copying.
@@ -308,8 +311,8 @@ absolute path may.
 ### Opting out
 
 ```bash
-gpuq submit --live-worktree -- python train.py   # run against the live tree
-gpuq submit --no-snapshot -- python train.py     # same, no snapshot at all
+workerq submit --live-worktree -- python train.py   # run against the live tree
+workerq submit --no-snapshot -- python train.py     # same, no snapshot at all
 ```
 
 A non-Git directory refuses snapshot mode with a clear message rather than
@@ -331,7 +334,7 @@ priority, then by arrival. **No priority ever preempts a running job**, and
 priority never relaxes a resource-safety rule.
 
 ```bash
-gpuq promote 42        # move a queued job to the front by hand
+workerq promote 42        # move a queued job to the front by hand
 ```
 
 ### Making a whole project more important
@@ -341,19 +344,19 @@ project. Every worker on it inherits the setting, and queued jobs are re-ranked
 immediately:
 
 ```bash
-gpuq priority arc-agi high --note "comp deadline Friday"
-gpuq priority                       # show all project policies
-gpuq priority arc-agi --clear       # back to the default
+workerq priority arc-agi high --note "comp deadline Friday"
+workerq priority                       # show all project policies
+workerq priority arc-agi --clear       # back to the default
 ```
 
 Precedence, most specific first:
 
 1. `--priority` on the submission (a worker asking for something specific wins)
-2. the project policy set by `gpuq priority`
+2. the project policy set by `workerq priority`
 3. `[project] priority` in that repo's `.gpuq.toml`
 4. `core.default_priority`
 
-Use `gpuq priority` for "this project matters *this week*" — it needs no repo
+Use `workerq priority` for "this project matters *this week*" — it needs no repo
 edits and no worker changes. Use `.gpuq.toml` for a project that is permanently
 more or less important than the rest.
 
@@ -367,17 +370,17 @@ more or less important than the rest.
 ## Concurrency and the GPU threshold
 
 ```bash
-gpuq concurrency               # show
-gpuq concurrency 2 --yes       # raise (warns; --yes required)
-gpuq gpu-threshold 85          # require 85% free VRAM before starting a GPU job
+workerq concurrency               # show
+workerq concurrency 2 --yes       # raise (warns; --yes required)
+workerq gpu-threshold 85          # require 85% free VRAM before starting a GPU job
 ```
 
 The GPU threshold is what protects you from *foreign* work — a job someone
-started outside gpuq, or a browser holding VRAM. A queued GPU job waits until a
-device is at least this free, and `gpuq status` shows what it is waiting for.
+started outside worker-q, or a browser holding VRAM. A queued GPU job waits until a
+device is at least this free, and `workerq status` shows what it is waiting for.
 
 On a desktop machine the compositor and browsers hold a few GiB permanently, so
-a 90% threshold can stall the queue. `gpuq init` and `gpuq doctor` detect this
+a 90% threshold can stall the queue. `workerq init` and `workerq doctor` detect this
 and suggest a value; they never change it silently.
 
 ---
@@ -385,9 +388,9 @@ and suggest a value; they never change it silently.
 ## Configuration
 
 ```bash
-gpuq config show
-gpuq config set core.max_concurrent_jobs 1
-gpuq config set gpu.free_memory_threshold_percent 85
+workerq config show
+workerq config set core.max_concurrent_jobs 1
+workerq config set gpu.free_memory_threshold_percent 85
 ```
 
 Precedence: **CLI flag > `GPUQ_*` environment variable > `config.toml` >
@@ -426,20 +429,20 @@ directory — that is how the test suite avoids touching your real queue.
 ## Maintenance
 
 ```bash
-gpuq reconcile              # repair metadata after a crash or reboot
-gpuq cleanup --dry-run      # see what retention would remove
-gpuq cleanup                # remove expired snapshots and orphan temp files
-gpuq uninstall --dry-run    # see exactly what removal would touch
+workerq reconcile              # repair metadata after a crash or reboot
+workerq cleanup --dry-run      # see what retention would remove
+workerq cleanup                # remove expired snapshots and orphan temp files
+workerq uninstall --dry-run    # see exactly what removal would touch
 ```
 
 Cleanup never deletes an active job's snapshot or logs, never touches anything
-outside the gpuq state directory, and keeps failed-job evidence for its own
+outside the worker-q state directory, and keeps failed-job evidence for its own
 longer retention window.
 
 After a reboot:
 
 ```bash
-gpuq init && gpuq reconcile && gpuq status
+workerq init && workerq reconcile && workerq status
 ```
 
 Jobs that were **running** when the machine went down are reported `LOST`, not
@@ -453,9 +456,9 @@ The CLI is the supported interface. An MCP adapter over the same core API is
 available if you prefer tool calls:
 
 ```bash
-uv tool install --from . --with 'mcp[cli]' gpuq
-gpuq mcp test          # build the server in-process, list its tools
-gpuq mcp command       # print the stdio command to register
+uv tool install --from . --with 'mcp[cli]' worker-q
+workerq mcp test          # build the server in-process, list its tools
+workerq mcp command       # print the stdio command to register
 ```
 
 Tools: `gpu_submit`, `gpu_status`, `gpu_job`, `gpu_logs`, `gpu_cancel`,
@@ -468,18 +471,18 @@ Tools: `gpu_submit`, `gpu_status`, `gpu_job`, `gpu_logs`, `gpu_cancel`,
 
 ```text
 Claude A ─┐
-Claude B ─┼── gpuq CLI ──► GPUQ Core ──► dispatcher daemon ──► your GPU job
+Claude B ─┼── workerq CLI ──► GPUQ Core ──► dispatcher daemon ──► your GPU job
 Claude C ─┘                (SQLite,       (one detached
                             snapshots)     process, N slots)
 ```
 
-`gpuq submit` validates, snapshots, records the job and enqueues it — then
+`workerq submit` validates, snapshots, records the job and enqueues it — then
 returns. A single detached dispatcher daemon owns execution: it is the only
 process that launches user work, which is what makes the one-job-at-a-time
 invariant hold across unrelated terminals.
 
 Backends sit behind a `SchedulerBackend` protocol
-(`src/gpuq/backends/base.py`). V1 ships `LocalDispatcherBackend`. On Linux the
+(`src/workerq/backends/base.py`). V1 ships `LocalDispatcherBackend`. On Linux the
 same protocol is the seam where GPU Task Spooler would slot in, and it is where
 a remote or Slurm backend goes later.
 
@@ -493,27 +496,27 @@ See [docs/architecture.md](docs/architecture.md),
 
 | Command | Purpose |
 | --- | --- |
-| `gpuq init` | Create state, database and dispatcher. Idempotent. |
-| `gpuq submit [--ram N --vram N --cpus N] -- CMD` | Queue a job and return immediately. |
-| `gpuq status` / `gpuq list` | Show the queue. `--json` for agents. |
-| `gpuq top` | Live dashboard: queue, pressure, memory owners. |
-| `gpuq report` | Why recent jobs failed, grouped by cause and project. |
-| `gpuq resources` | Capacity, headroom and enforced limits. |
-| `gpuq show ID` | Full detail and source provenance. |
-| `gpuq logs ID [--follow] [--tail N]` | Job output. |
-| `gpuq cancel ID [--force]` | Cancel queued or running work. |
-| `gpuq promote ID` | Move a queued job to the front. |
-| `gpuq priority [PROJECT LEVEL]` | Show/set a project's default priority. |
-| `gpuq doctor` | Health checks. Exit 0/1/2. |
-| `gpuq gpu` | GPU inventory and who holds VRAM. |
-| `gpuq reconcile` | Repair metadata after a crash. |
-| `gpuq cleanup` | Retention for snapshots and temp files. |
-| `gpuq concurrency [N]` | Show/set concurrent job limit. |
-| `gpuq gpu-threshold [N]` | Show/set required free VRAM percent. |
-| `gpuq config show/get/set` | Configuration. |
-| `gpuq claude-policy install/status/remove` | Agent policy block. |
-| `gpuq mcp command/test/serve` | Optional MCP adapter. |
-| `gpuq uninstall --dry-run` | Preview removal. |
+| `workerq init` | Create state, database and dispatcher. Idempotent. |
+| `workerq submit [--ram N --vram N --cpus N] -- CMD` | Queue a job and return immediately. |
+| `workerq status` / `workerq list` | Show the queue. `--json` for agents. |
+| `workerq top` | Live dashboard: queue, pressure, memory owners. |
+| `workerq report` | Why recent jobs failed, grouped by cause and project. |
+| `workerq resources` | Capacity, headroom and enforced limits. |
+| `workerq show ID` | Full detail and source provenance. |
+| `workerq logs ID [--follow] [--tail N]` | Job output. |
+| `workerq cancel ID [--force]` | Cancel queued or running work. |
+| `workerq promote ID` | Move a queued job to the front. |
+| `workerq priority [PROJECT LEVEL]` | Show/set a project's default priority. |
+| `workerq doctor` | Health checks. Exit 0/1/2. |
+| `workerq gpu` | GPU inventory and who holds VRAM. |
+| `workerq reconcile` | Repair metadata after a crash. |
+| `workerq cleanup` | Retention for snapshots and temp files. |
+| `workerq concurrency [N]` | Show/set concurrent job limit. |
+| `workerq gpu-threshold [N]` | Show/set required free VRAM percent. |
+| `workerq config show/get/set` | Configuration. |
+| `workerq claude-policy install/status/remove` | Agent policy block. |
+| `workerq mcp command/test/serve` | Optional MCP adapter. |
+| `workerq uninstall --dry-run` | Preview removal. |
 
 Every command that produces data supports `--json`, which writes only JSON to
 stdout. Errors always go to stderr.
@@ -521,7 +524,7 @@ stdout. Errors always go to stderr.
 
 ## Windows notes
 
-gpuq runs natively on Windows and gates Windows-native CUDA jobs (your project
+worker-q runs natively on Windows and gates Windows-native CUDA jobs (your project
 venv's `python.exe` with `torch+cuXXX`), which is where the OOM risk actually
 lives on this machine.
 
@@ -531,24 +534,24 @@ snapshot of your repository, and `.venv` is normally gitignored — so a relativ
 
 ```bash
 # good
-gpuq submit --project my-project -- \
+workerq submit --project my-project -- \
   C:/Users/you/Documents/my-project/.venv/Scripts/python.exe train.py
 
 # also fine
-gpuq submit --project my-project --passthrough .venv -- \
+workerq submit --project my-project --passthrough .venv -- \
   .venv/Scripts/python.exe train.py
 ```
 
-gpuq tells you this explicitly if a job fails that way.
+worker-q tells you this explicitly if a job fails that way.
 
-**No terminal windows.** gpuq's dispatcher and job wrappers run under
+**No terminal windows.** worker-q's dispatcher and job wrappers run under
 `pythonw.exe`, and every helper command it shells out to (`nvidia-smi`, `git`,
 `taskkill`) is launched with `CREATE_NO_WINDOW`. Both are necessary: a
 console-less parent that launches a console program makes Windows open a new
 *visible* console for it, and the dispatcher polls `nvidia-smi` regularly. The
 test suite asserts that no visible window ever appears.
 
-**Cancellation** uses Windows Job Objects, so `gpuq cancel` kills the whole
+**Cancellation** uses Windows Job Objects, so `workerq cancel` kills the whole
 process tree — including detached grandchildren such as dataloader workers or
 `torchrun` ranks. Windows cannot deliver a POSIX `SIGTERM` to a console-less
 child, so the polite stop is best-effort and the tree kill is the guarantee;

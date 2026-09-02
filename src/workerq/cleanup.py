@@ -1,6 +1,6 @@
 """Snapshot / log retention (spec section 11.10).
 
-Deletion is deliberately conservative. Nothing outside the GPUQ state directory
+Deletion is deliberately conservative. Nothing outside the worker-q state directory
 is ever touched, active jobs are never disturbed, and failed-job evidence
 survives its own longer retention window.
 """
@@ -12,15 +12,15 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from gpuq.core import GPUQService
-from gpuq.models import JobState
-from gpuq.snapshot import (
+from workerq.core import GPUQService
+from workerq.models import JobState
+from workerq.snapshot import (
     SnapshotError,
     is_reparse_point,
     remove_snapshot,
     unlink_reparse_points,
 )
-from gpuq.util import age_seconds, expand_path, is_within, parse_duration
+from workerq.util import age_seconds, expand_path, is_within, parse_duration
 
 
 @dataclass
@@ -224,14 +224,14 @@ def run_cleanup(
 
 def uninstall_inventory(service: GPUQService) -> dict[str, Any]:
     """What an uninstall would touch, grouped so each part is opt-in."""
-    from gpuq.claude_policy import policy_status, safe_launcher_status
+    from workerq.claude_policy import policy_status, safe_launcher_status
 
     config = service.config
     state_size = _dir_size(config.state_dir) if config.state_dir.exists() else 0
     return {
         "package": {
-            "name": "gpuq",
-            "hint": "uv tool uninstall gpuq   (or: pipx uninstall gpuq)",
+            "name": "worker-q",
+            "hint": "uv tool uninstall worker-q   (or: pipx uninstall worker-q)",
         },
         "state": {
             "path": str(config.state_dir),
@@ -250,6 +250,6 @@ def uninstall_inventory(service: GPUQService) -> dict[str, Any]:
         "safe_launcher": safe_launcher_status(),
         "never_touched": [
             "your source repositories",
-            "any path outside the gpuq state directory",
+            "any path outside the worker-q state directory",
         ],
     }

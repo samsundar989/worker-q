@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from gpuq.util import age_seconds, display_command
+from workerq.util import age_seconds, display_command
 
 
 class JobState(str, Enum):
@@ -108,7 +108,7 @@ class SnapshotMode(str, Enum):
 
 @dataclass
 class Job:
-    """One GPUQ job row."""
+    """One worker-q job row."""
 
     id: int
     backend: str

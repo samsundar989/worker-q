@@ -1,6 +1,6 @@
 """Execution backends."""
 
-from gpuq.backends.base import (
+from workerq.backends.base import (
     BACKEND_FINISHED,
     BACKEND_MISSING,
     BACKEND_QUEUED,
@@ -11,7 +11,7 @@ from gpuq.backends.base import (
     BackendUnavailable,
     SchedulerBackend,
 )
-from gpuq.backends.local_dispatcher import LocalDispatcherBackend, build_backend
+from workerq.backends.local_dispatcher import LocalDispatcherBackend, build_backend
 
 __all__ = [
     "BACKEND_FINISHED",

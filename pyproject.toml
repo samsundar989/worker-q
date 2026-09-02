@@ -3,33 +3,60 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "gpuq"
-version = "1.0.0"
-description = "Agent GPU workload broker - one gate for heavy GPU jobs across concurrent AI coding agents"
+name = "worker-q"
+version = "1.1.0"
+description = "Resource broker for machines shared by AI coding agents - one queue for GPU, RAM and CPU heavy work"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
-authors = [{ name = "samsundar989@gmail.com" }]
+authors = [{ name = "samsundar989" }]
+keywords = [
+    "gpu",
+    "queue",
+    "scheduler",
+    "job-queue",
+    "resource-management",
+    "ai-agents",
+    "workstation",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Distributed Computing",
+]
 dependencies = [
     "typer>=0.12",
     "rich>=13.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/samsundar989/worker-q"
+Repository = "https://github.com/samsundar989/worker-q"
 
 [project.optional-dependencies]
 mcp = ["mcp[cli]>=2,<3"]
 dev = ["pytest>=8.0", "pytest-timeout>=2.3"]
 
 [project.scripts]
-gpuq = "gpuq.cli:main"
+workerq = "workerq.cli:main"
+# Legacy alias. Agents on this machine are configured with `gpuq` through their
+# CLAUDE.md policy, and queued jobs may store `gpuq` in their runner argv, so
+# removing this would break work already in flight.
+gpuq = "workerq.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/gpuq"]
+packages = ["src/workerq", "src/gpuq"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
 timeout = 300
 markers = [
-    "integration: end-to-end tests that spawn a real gpuq dispatcher daemon",
+    "integration: end-to-end tests that spawn a real worker-q dispatcher daemon",
     "gpu: requires a working NVIDIA GPU",
 ]

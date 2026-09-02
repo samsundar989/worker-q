@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from gpuq.config import (
+from workerq.config import (
     BackendConfig,
     ClaudeConfig,
     Config,
@@ -22,7 +22,7 @@ from gpuq.config import (
     GpuConfig,
     ResourcesConfig,
 )
-from gpuq.core import GPUQService
+from workerq.core import GPUQService
 
 
 def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:

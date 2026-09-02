@@ -13,8 +13,8 @@ from pathlib import Path
 
 import pytest
 
-from gpuq.core import GPUQService, SubmitRequest
-from gpuq.models import JobState
+from workerq.core import GPUQService, SubmitRequest
+from workerq.models import JobState
 
 pytestmark = [pytest.mark.integration, pytest.mark.timeout(300)]
 
@@ -114,9 +114,19 @@ def test_manifest_and_result_are_written(live_service, git_repo, git_helper, wai
     _await_state(live_service, job_id, [JobState.SUCCEEDED], waiter)
 
     job_dir = live_service.config.job_dir(job_id)
-    manifest = json.loads((job_dir / "manifest.json").read_text(encoding="utf-8"))
+
+    def _manifest() -> dict:
+        return json.loads((job_dir / "manifest.json").read_text(encoding="utf-8"))
+
+    # The database is authoritative and flips to SUCCEEDED first; the manifest
+    # is derived provenance the runner rewrites a moment later. They converge,
+    # so wait rather than racing the runner's last write.
+    assert waiter(
+        lambda: _manifest()["state"] == JobState.SUCCEEDED.value, timeout=60
+    ), f"manifest never caught up (still {_manifest()['state']})"
+
+    manifest = _manifest()
     assert manifest["gpuq_job_id"] == job_id
-    assert manifest["state"] == JobState.SUCCEEDED.value
     assert manifest["snapshot_commit"]
 
     environment = json.loads((job_dir / "environment.json").read_text(encoding="utf-8"))
@@ -303,8 +313,8 @@ def test_job_survives_the_submitting_process_exiting(
     submitter = f"""
 import sys
 sys.path.insert(0, {str(Path(__file__).parents[2] / "src")!r})
-from gpuq.config import load_config
-from gpuq.core import GPUQService, SubmitRequest
+from workerq.config import load_config
+from workerq.core import GPUQService, SubmitRequest
 service = GPUQService(load_config())
 service.ensure_ready()
 result = service.submit(SubmitRequest(

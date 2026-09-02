@@ -8,9 +8,9 @@ from pathlib import Path
 
 import pytest
 
-from gpuq.db import SCHEMA_VERSION, Database, json_dumps
-from gpuq.models import InvalidTransition, JobState, can_transition
-from gpuq.util import utcnow_iso
+from workerq.db import SCHEMA_VERSION, Database, json_dumps
+from workerq.models import InvalidTransition, JobState, can_transition
+from workerq.util import utcnow_iso
 
 
 def _insert(db: Database, **overrides) -> int:
@@ -263,7 +263,7 @@ def test_resource_request_roundtrip(db: Database):
 
 def test_upgrade_from_v1_preserves_rows(tmp_path: Path):
     """A database written by the previous schema keeps its jobs on upgrade."""
-    from gpuq.db import _MIGRATIONS
+    from workerq.db import _MIGRATIONS
 
     path = tmp_path / "old.sqlite3"
     old = Database(path)

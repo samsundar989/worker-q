@@ -1,4 +1,4 @@
-"""`gpuq _run <job_id>` - the wrapper every queued command executes inside.
+"""`workerq _run <job_id>` - the wrapper every queued command executes inside.
 
 Internal, but directly testable (spec section 13). It owns the transition into
 RUNNING, captures provenance, runs the user command, forwards cancellation to
@@ -23,13 +23,13 @@ import time
 from pathlib import Path
 from typing import Any
 
-from gpuq import __version__
-from gpuq.config import Config, load_config
-from gpuq.db import Database
-from gpuq.gpu import query_gpus
-from gpuq.models import Job, JobState
-from gpuq.util import atomic_write_text, ensure_dir, hostname, utcnow_iso
-from gpuq.winproc import ProcessGroup, child_creationflags, posix_child_kwargs
+from workerq import __version__
+from workerq.config import Config, load_config
+from workerq.db import Database
+from workerq.gpu import query_gpus
+from workerq.models import Job, JobState
+from workerq.util import atomic_write_text, ensure_dir, hostname, utcnow_iso
+from workerq.winproc import ProcessGroup, child_creationflags, posix_child_kwargs
 
 _CANCEL_POLL_SECONDS = 0.5
 
@@ -79,7 +79,7 @@ def _cancel_requested(config: Config, job: Job) -> tuple[bool, bool]:
     if job.backend_job_id is None:
         return False, False
     try:
-        from gpuq.backends.queue_store import QueueStore
+        from workerq.backends.queue_store import QueueStore
 
         store = QueueStore(config.backend_dir / "queue.sqlite3")
         row = store.get(job.backend_job_id)
@@ -113,14 +113,14 @@ def run_job(
 
     job = db.get_job(job_id)
     if job is None:
-        print(f"gpuq runner: no such job {job_id}", file=sys.stderr, flush=True)
+        print(f"worker-q runner: no such job {job_id}", file=sys.stderr, flush=True)
         return 127
 
     # Ownership check: a runner must never take over a job that has already
     # finished or been cancelled.
     if job.is_terminal:
         print(
-            f"gpuq runner: job #{job_id} is already {job.state}; refusing to run",
+            f"worker-q runner: job #{job_id} is already {job.state}; refusing to run",
             file=sys.stderr,
             flush=True,
         )
@@ -132,14 +132,14 @@ def run_job(
         argv = _build_argv(job, argv_override)
     except RunnerError as exc:
         db.set_error(job_id, str(exc))
-        print(f"gpuq runner: {exc}", file=sys.stderr, flush=True)
+        print(f"worker-q runner: {exc}", file=sys.stderr, flush=True)
         return 127
 
     execution_cwd = Path(job.execution_cwd or job.submitted_cwd)
     if not execution_cwd.is_dir():
         message = f"execution directory is missing: {execution_cwd}"
         db.set_error(job_id, message)
-        print(f"gpuq runner: {message}", file=sys.stderr, flush=True)
+        print(f"worker-q runner: {message}", file=sys.stderr, flush=True)
         return 127
 
     # ---- 4. record RUNNING + provenance -------------------------------
@@ -154,7 +154,7 @@ def run_job(
     if updated is None:
         current = db.get_job(job_id)
         print(
-            f"gpuq runner: job #{job_id} is {current.state if current else 'unknown'}; "
+            f"worker-q runner: job #{job_id} is {current.state if current else 'unknown'}; "
             "not starting",
             file=sys.stderr,
             flush=True,
@@ -167,12 +167,12 @@ def run_job(
     )
 
     print(
-        f"gpuq: job #{job_id} starting at {started_at}\n"
-        f"gpuq: cwd={execution_cwd}\n"
-        f"gpuq: snapshot={job.snapshot_mode} {job.snapshot_commit or '-'}\n"
-        f"gpuq: CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '(unset)')}\n"
-        f"gpuq: command={argv}\n"
-        "gpuq: " + "-" * 60,
+        f"worker-q: job #{job_id} starting at {started_at}\n"
+        f"worker-q: cwd={execution_cwd}\n"
+        f"worker-q: snapshot={job.snapshot_mode} {job.snapshot_commit or '-'}\n"
+        f"worker-q: CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '(unset)')}\n"
+        f"worker-q: command={argv}\n"
+        "worker-q: " + "-" * 60,
         flush=True,
     )
 
@@ -217,16 +217,16 @@ def run_job(
         ):
             if not Path(executable).is_absolute() and job.snapshot_mode in ("git", "copy"):
                 message += (
-                    f"\ngpuq: {executable!r} was not found in the snapshot at "
+                    f"\nworker-q: {executable!r} was not found in the snapshot at "
                     f"{execution_cwd}.\n"
-                    "gpuq: A queued job runs a frozen copy of the repository, which "
+                    "worker-q: A queued job runs a frozen copy of the repository, which "
                     "excludes gitignored paths such as .venv.\n"
-                    "gpuq: Fix by using an absolute path to the interpreter, or "
+                    "worker-q: Fix by using an absolute path to the interpreter, or "
                     "re-submit with --passthrough .venv"
                 )
         db.set_error(job_id, message)
         _write_result(job_dir, job_id, None, JobState.FAILED, started_at, message)
-        print(f"gpuq: {message}", file=sys.stderr, flush=True)
+        print(f"worker-q: {message}", file=sys.stderr, flush=True)
         return 127
 
     group = ProcessGroup(f"gpuq-run-{job_id}")
@@ -250,7 +250,7 @@ def run_job(
             pass
 
     def _watch_cancel() -> None:
-        """Poll for `gpuq cancel`, then stop the child tree.
+        """Poll for `workerq cancel`, then stop the child tree.
 
         Windows cannot deliver a POSIX-style SIGTERM to a console-less child,
         so a polite CTRL_BREAK is attempted first and a hard tree kill is the
@@ -265,7 +265,7 @@ def run_job(
             cancelled.set()
             if signalled_at is None:
                 signalled_at = time.monotonic()
-                print("\ngpuq: cancellation requested; stopping job", flush=True)
+                print("\nworker-q: cancellation requested; stopping job", flush=True)
                 group.signal_break()
                 if not force:
                     continue
@@ -313,7 +313,7 @@ def run_job(
     # A failure here must not change the job's result, but it must be visible
     # rather than silently swallowed.
     try:
-        from gpuq.core import GPUQService
+        from workerq.core import GPUQService
 
         service = GPUQService(config)
         service.ensure_ready()
@@ -321,13 +321,13 @@ def run_job(
         service.close()
     except Exception as exc:  # pragma: no cover - diagnostics only
         print(
-            f"gpuq: warning: could not update manifest.json: {type(exc).__name__}: {exc}",
+            f"worker-q: warning: could not update manifest.json: {type(exc).__name__}: {exc}",
             file=sys.stderr,
             flush=True,
         )
 
     print(
-        f"gpuq: " + "-" * 60 + f"\ngpuq: job #{job_id} {final_state.value} "
+        f"worker-q: " + "-" * 60 + f"\nworker-q: job #{job_id} {final_state.value} "
         f"(exit code {exit_code}) at {finished_at}",
         flush=True,
     )

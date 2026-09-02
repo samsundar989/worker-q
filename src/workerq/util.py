@@ -183,7 +183,7 @@ def kill_process_tree(pid: int, *, force: bool = True) -> bool:
             args = ["taskkill", "/PID", str(pid), "/T"]
             if force:
                 args.append("/F")
-            from gpuq.winproc import no_window_kwargs
+            from workerq.winproc import no_window_kwargs
 
             subprocess.run(
                 args, capture_output=True, timeout=30, check=False, **no_window_kwargs()

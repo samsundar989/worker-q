@@ -10,10 +10,10 @@ from __future__ import annotations
 
 import pytest
 
-from gpuq import host
-from gpuq.config import Config, CoreConfig, ResourcesConfig
-from gpuq.gpu import GpuDevice, GpuInfo
-from gpuq.resources import (
+from workerq import host
+from workerq.config import Config, CoreConfig, ResourcesConfig
+from workerq.gpu import GpuDevice, GpuInfo
+from workerq.resources import (
     Decision,
     ResourceRequest,
     admit,

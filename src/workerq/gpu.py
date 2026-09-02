@@ -12,7 +12,7 @@ import subprocess
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from gpuq.winproc import no_window_kwargs
+from workerq.winproc import no_window_kwargs
 
 _QUERY_GPU_FIELDS = (
     "index",
@@ -242,7 +242,7 @@ def gpu_free_percent() -> float | None:
 
 
 def foreign_processes(info: GpuInfo, *, own_pids: set[int] | None = None) -> list[GpuProcess]:
-    """Compute processes on the GPU that GPUQ did not launch."""
+    """Compute processes on the GPU that worker-q did not launch."""
     own_pids = own_pids or set()
     out: list[GpuProcess] = []
     for device in info.devices:

@@ -1,7 +1,7 @@
 """`LocalDispatcherBackend` - the V1 execution backend.
 
 On Linux this role is filled by GPU Task Spooler (spec section 2). Windows has
-no equivalent, so GPUQ ships an equivalent-scope dispatcher of its own that
+no equivalent, so worker-q ships an equivalent-scope dispatcher of its own that
 provides exactly the backend contract in spec section 7: a persistent,
 terminal-independent queue with slot limits, GPU-free-memory gating, per-job
 logs, labels, reordering and process-group termination.
@@ -18,19 +18,19 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
-from gpuq import BACKEND_NAME, BACKEND_VERSION
-from gpuq.backends.base import (
+from workerq import BACKEND_NAME, BACKEND_VERSION
+from workerq.backends.base import (
     BACKEND_MISSING,
     BACKEND_QUEUED,
     BACKEND_RUNNING,
     BackendJob,
     BackendUnavailable,
 )
-from gpuq.backends import dispatcher as dispatcher_mod
-from gpuq.backends.queue_store import QueueStore, row_to_backend_job
-from gpuq.config import Config
-from gpuq.util import age_seconds, ensure_dir
-from gpuq.winproc import (
+from workerq.backends import dispatcher as dispatcher_mod
+from workerq.backends.queue_store import QueueStore, row_to_backend_job
+from workerq.config import Config
+from workerq.util import age_seconds, ensure_dir
+from workerq.winproc import (
     ExclusiveLock,
     detached_creationflags,
     is_locked,
@@ -113,14 +113,14 @@ class LocalDispatcherBackend:
         return self.daemon_running()
 
     def _spawn_daemon(self) -> None:
-        """Launch `gpuq _daemon` fully detached from the calling shell.
+        """Launch `workerq _daemon` fully detached from the calling shell.
 
         Nothing is inherited from the submitting terminal, so closing that
         terminal cannot take the queue - or a running job - down with it.
         """
         self.config.ensure_dirs()
         # pythonw.exe leaves no console behind; see winproc.windowless_python.
-        argv = [windowless_python(sys.executable), "-m", "gpuq", "_daemon"]
+        argv = [windowless_python(sys.executable), "-m", "workerq", "_daemon"]
         stdout_path = self.config.run_dir / "dispatcher.out"
         env = {}
         import os
@@ -157,7 +157,7 @@ class LocalDispatcherBackend:
                 kwargs["start_new_session"] = True
             subprocess.Popen(argv, **kwargs)
         except OSError as exc:  # pragma: no cover
-            raise BackendUnavailable(f"could not start the gpuq dispatcher: {exc}") from exc
+            raise BackendUnavailable(f"could not start the worker-q dispatcher: {exc}") from exc
         finally:
             if handle:
                 handle.close()
@@ -216,8 +216,8 @@ class LocalDispatcherBackend:
         if self.ensure_daemon():
             return
         raise BackendUnavailable(
-            "the gpuq dispatcher is not running and could not be started.\n"
-            "Run 'gpuq doctor' for diagnostics, then 'gpuq init' to repair."
+            "the worker-q dispatcher is not running and could not be started.\n"
+            "Run 'workerq doctor' for diagnostics, then 'workerq init' to repair."
         )
 
     # -- settings ---------------------------------------------------------

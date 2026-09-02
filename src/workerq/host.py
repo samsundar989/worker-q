@@ -17,7 +17,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from gpuq.winproc import no_window_kwargs
+from workerq.winproc import no_window_kwargs
 
 IS_WINDOWS = os.name == "nt"
 

@@ -1,4 +1,4 @@
-"""The `gpuq` command line - the only user- and agent-facing executable.
+"""The `worker-q` command line - the only user- and agent-facing executable.
 
 Human output is compact and scannable; `--json` emits machine-readable data on
 stdout with no decoration, and every error goes to stderr (spec section 28).
@@ -18,20 +18,20 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from gpuq import __version__
-from gpuq.config import (
+from workerq import __version__
+from workerq.config import (
     ConfigError,
     Config,
     get_dotted,
     load_config,
     set_dotted_and_save,
 )
-from gpuq.core import GPUQError, GPUQService, JobNotFound, SubmitRequest
-from gpuq.models import JobState
-from gpuq.util import human_duration, parse_env_assignment, truncate
+from workerq.core import GPUQError, GPUQService, JobNotFound, SubmitRequest
+from workerq.models import JobState
+from workerq.util import human_duration, parse_env_assignment, truncate
 
 app = typer.Typer(
-    name="gpuq",
+    name="workerq",
     help=(
         "Agent GPU workload broker. Submit heavy GPU work to one shared queue so "
         "concurrent agents cannot OOM each other."
@@ -129,7 +129,7 @@ def init(
         service.close()
         return
 
-    console.print(f"[bold green]gpuq initialized[/bold green] (v{__version__})")
+    console.print(f"[bold green]worker-q initialized[/bold green] (v{__version__})")
     console.print(f"  state dir : {info['state_dir']}")
     console.print(f"  config    : {info['config_path']}")
     console.print(f"  database  : schema v{info['schema_version']}")
@@ -143,10 +143,10 @@ def init(
         console.print(f"\n[yellow]note:[/yellow] {advisory}")
     console.print(
         "\nNext:\n"
-        "  gpuq doctor\n"
-        "  gpuq submit --project my-project -- python train.py\n"
-        "  gpuq status\n"
-        "  gpuq logs <id> --follow"
+        "  workerq doctor\n"
+        "  workerq submit --project my-project -- python train.py\n"
+        "  workerq status\n"
+        "  workerq logs <id> --follow"
     )
     service.close()
 
@@ -166,7 +166,7 @@ def _threshold_advisory(service: GPUQService) -> str | None:
     return (
         f"the GPU is currently {best:.0f}% free but the configured threshold is "
         f"{threshold}%, so GPU jobs would wait. If that baseline usage is normal for "
-        f"this desktop, run: gpuq gpu-threshold {suggested}"
+        f"this desktop, run: workerq gpu-threshold {suggested}"
     )
 
 
@@ -228,7 +228,7 @@ def submit(
     if not shell and not argv:
         fail(
             "no command given.\n"
-            "  Usage: gpuq submit --project NAME -- <command> [args...]\n"
+            "  Usage: workerq submit --project NAME -- <command> [args...]\n"
             "  Note the '--' separator before your command."
         )
 
@@ -276,7 +276,7 @@ def submit(
         service.close()
         return
 
-    console.print(f"[bold green]GPUQ job #{job.id} submitted[/bold green]")
+    console.print(f"[bold green]worker-q job #{job.id} submitted[/bold green]")
     console.print(f"Project:  {job.project}")
     console.print(
         f"Priority: [{PRIORITY_STYLES.get(job.priority, 'white')}]{job.priority}[/]"
@@ -302,7 +302,7 @@ def submit(
         footprint.append(f"{job.requested_gpu_count} GPU")
     if footprint:
         console.print("Requests: " + ", ".join(footprint))
-    console.print(f"Logs:     gpuq logs {job.id} --follow")
+    console.print(f"Logs:     workerq logs {job.id} --follow")
     service.close()
 
 
@@ -371,7 +371,7 @@ def _render_status(
 
     if not jobs:
         console.print("[dim]No jobs. Submit one with:[/dim]")
-        console.print("  gpuq submit --project my-project -- python train.py")
+        console.print("  workerq submit --project my-project -- python train.py")
         return
 
     table = Table(box=None, pad_edge=False, show_edge=False)
@@ -407,7 +407,7 @@ def _render_status(
 
     running = [j for j in jobs if j.state == JobState.RUNNING.value]
     if running:
-        console.print(f"\n[dim]Use: gpuq logs {running[0].id} --follow[/dim]")
+        console.print(f"\n[dim]Use: workerq logs {running[0].id} --follow[/dim]")
 
 
 @app.command()
@@ -461,7 +461,7 @@ def list_jobs(
 
 @app.command()
 def show(
-    job_id: int = typer.Argument(..., help="GPUQ job id."),
+    job_id: int = typer.Argument(..., help="worker-q job id."),
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Show everything known about a job, including source provenance."""
@@ -480,7 +480,7 @@ def show(
 
     state = detail["state"]
     console.print(
-        f"[bold]GPUQ job #{detail['id']}[/bold]  "
+        f"[bold]worker-q job #{detail['id']}[/bold]  "
         f"[{STATE_STYLES.get(state, 'white')}]{state}[/]"
     )
     rows = [
@@ -528,7 +528,7 @@ def show(
     for name, value in rows:
         table.add_row(name, str(value))
     console.print(table)
-    console.print(f"\n[dim]Logs: gpuq logs {detail['id']}[/dim]")
+    console.print(f"\n[dim]Logs: workerq logs {detail['id']}[/dim]")
     service.close()
 
 
@@ -556,7 +556,7 @@ def _fmt_position(position: int | None) -> str:
 
 @app.command()
 def logs(
-    job_id: int = typer.Argument(..., help="GPUQ job id."),
+    job_id: int = typer.Argument(..., help="worker-q job id."),
     follow: bool = typer.Option(False, "--follow", "-f", help="Stream new output."),
     tail: Optional[int] = typer.Option(None, "--tail", "-n", help="Show only the last N lines."),
 ) -> None:
@@ -672,7 +672,7 @@ def _follow(service: GPUQService, job_id: int, path: Path, tail: int | None) -> 
 
 @app.command()
 def cancel(
-    job_id: int = typer.Argument(..., help="GPUQ job id."),
+    job_id: int = typer.Argument(..., help="worker-q job id."),
     force: bool = typer.Option(
         False, "--force", help="Skip the grace period and kill the process tree immediately."
     ),
@@ -700,7 +700,7 @@ def cancel(
 
 @app.command()
 def promote(
-    job_id: int = typer.Argument(..., help="GPUQ job id."),
+    job_id: int = typer.Argument(..., help="worker-q job id."),
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Move a queued job to the front. Never preempts a running job."""
@@ -728,7 +728,7 @@ def doctor(
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Run health checks. Exit 0 healthy, 1 degraded, 2 broken."""
-    from gpuq.doctor import doctor_report, run_doctor
+    from workerq.doctor import doctor_report, run_doctor
 
     service = get_service()
     if json_output:
@@ -790,7 +790,7 @@ def cleanup(
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Remove expired snapshots and orphan temp files. Never touches active jobs."""
-    from gpuq.cleanup import run_cleanup
+    from workerq.cleanup import run_cleanup
 
     service = get_service()
     try:
@@ -874,7 +874,7 @@ def gpu(
                     if proc.used_memory_mib is not None
                     else "unknown"
                 )
-                tag = " [dim](gpuq)[/dim]" if proc.pid in own else ""
+                tag = " [dim](worker-q)[/dim]" if proc.pid in own else ""
                 console.print(
                     f"  {proc.pid} {os.path.basename(proc.process_name)} {memory}{tag}"
                 )
@@ -882,7 +882,7 @@ def gpu(
             console.print("Processes: none")
         console.print()
     console.print(
-        f"[dim]gpuq gates jobs at {service.config.gpu.free_memory_threshold_percent}% "
+        f"[dim]workerq gates jobs at {service.config.gpu.free_memory_threshold_percent}% "
         "free memory.[/dim]"
     )
     service.close()
@@ -899,7 +899,7 @@ def top(
     once: bool = typer.Option(False, "--once", help="Render a single frame and exit."),
 ) -> None:
     """Live dashboard: queue, machine pressure, and who is holding memory."""
-    from gpuq.dashboard import run_dashboard
+    from workerq.dashboard import run_dashboard
 
     service = get_service()
     try:
@@ -918,7 +918,7 @@ def report(
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Explain recent failures: what caused them, and whose workload it was."""
-    from gpuq.report import analyse, foreign_pressure_report
+    from workerq.report import analyse, foreign_pressure_report
 
     service = get_service()
     data = analyse(service, hours=hours, limit=limit)
@@ -1106,7 +1106,7 @@ def resources(
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Show capacity, headroom and the limits admission control enforces."""
-    from gpuq.resources import describe_capacity
+    from workerq.resources import describe_capacity
 
     service = get_service()
     data = describe_capacity(service.config)
@@ -1229,7 +1229,7 @@ def config_set(
             service.backend.set_gpu_free_percent(config.gpu.free_memory_threshold_percent)
             console.print("[dim]applied to the running dispatcher[/dim]")
         except Exception:
-            console.print("[yellow]run 'gpuq init' to apply this to the dispatcher[/yellow]")
+            console.print("[yellow]run 'workerq init' to apply this to the dispatcher[/yellow]")
         service.close()
 
 
@@ -1257,7 +1257,7 @@ def concurrency(
         service.close()
         err_console.print(
             "[bold yellow]WARNING: concurrent GPU jobs can cause VRAM OOM.[/bold yellow]\n"
-            "GPUQ V1 assumes exclusive heavy-job execution.\n"
+            "worker-q V1 assumes exclusive heavy-job execution.\n"
             f"Re-run with --yes to set concurrency to {count}."
         )
         raise typer.Exit(1)
@@ -1276,7 +1276,7 @@ def concurrency(
         if count > 1:
             console.print(
                 "[yellow]Heavy jobs may now overlap and exhaust VRAM. "
-                "Set it back with: gpuq concurrency 1[/yellow]"
+                "Set it back with: workerq concurrency 1[/yellow]"
             )
     service.close()
 
@@ -1334,8 +1334,8 @@ def claude_policy_install(
     force: bool = typer.Option(False, "--force", help="Rewrite even if already current."),
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
-    """Add or refresh the gpuq policy block. Idempotent; preserves other content."""
-    from gpuq.claude_policy import install_policy
+    """Add or refresh the worker-q policy block. Idempotent; preserves other content."""
+    from workerq.claude_policy import install_policy
 
     result = install_policy(Path(path) if path else None, force=force)
     if json_output:
@@ -1353,7 +1353,7 @@ def claude_policy_status(
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Report whether the policy block is installed and current."""
-    from gpuq.claude_policy import policy_status
+    from workerq.claude_policy import policy_status
 
     result = policy_status(Path(path) if path else None)
     if json_output:
@@ -1362,11 +1362,11 @@ def claude_policy_status(
     if not result["exists"]:
         console.print(f"[yellow]no file at {result['path']}[/yellow]")
     elif not result["installed"]:
-        console.print(f"[yellow]gpuq policy not installed[/yellow] in {result['path']}")
+        console.print(f"[yellow]worker-q policy not installed[/yellow] in {result['path']}")
     elif not result["current"]:
-        console.print(f"[yellow]gpuq policy is outdated[/yellow] in {result['path']}")
+        console.print(f"[yellow]worker-q policy is outdated[/yellow] in {result['path']}")
     else:
-        console.print(f"[green]gpuq policy installed and current[/green]: {result['path']}")
+        console.print(f"[green]worker-q policy installed and current[/green]: {result['path']}")
     if result.get("blocks", 0) > 1:
         console.print(f"[yellow]warning: {result['blocks']} policy blocks found[/yellow]")
 
@@ -1376,8 +1376,8 @@ def claude_policy_remove(
     path: Optional[str] = typer.Option(None, "--path", help="Override ~/.claude/CLAUDE.md."),
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
-    """Remove only the gpuq block, leaving other instructions untouched."""
-    from gpuq.claude_policy import remove_policy
+    """Remove only the worker-q block, leaving other instructions untouched."""
+    from workerq.claude_policy import remove_policy
 
     result = remove_policy(Path(path) if path else None)
     if json_output:
@@ -1401,7 +1401,7 @@ def safe_launcher_install(
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Create `claude-gpu-safe`. Not enabled globally; you invoke it explicitly."""
-    from gpuq.claude_policy import install_safe_launcher
+    from workerq.claude_policy import install_safe_launcher
 
     result = install_safe_launcher(Path(directory) if directory else None)
     if json_output:
@@ -1412,7 +1412,7 @@ def safe_launcher_install(
         console.print(f"  {path}")
     console.print(
         "\n[dim]Trade-off: commands Claude runs directly will see no CUDA device, "
-        "including legitimate lightweight probes. Queued gpuq jobs are unaffected.[/dim]"
+        "including legitimate lightweight probes. Queued worker-q jobs are unaffected.[/dim]"
     )
 
 
@@ -1422,7 +1422,7 @@ def safe_launcher_status_cmd(
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Report whether the safe launcher is installed."""
-    from gpuq.claude_policy import safe_launcher_status
+    from workerq.claude_policy import safe_launcher_status
 
     result = safe_launcher_status(Path(directory) if directory else None)
     if json_output:
@@ -1447,13 +1447,13 @@ def mcp_command(
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Print the stdio server command to register with Claude Code."""
-    argv = [sys.executable, "-m", "gpuq", "mcp", "serve"]
+    argv = [sys.executable, "-m", "workerq", "mcp", "serve"]
     payload = {
         "command": argv[0],
         "args": argv[1:],
         "transport": "stdio",
         "register": (
-            "claude mcp add gpuq --scope user -- "
+            "claude mcp add worker-q --scope user -- "
             + " ".join(_quote(a) for a in argv)
         ),
     }
@@ -1480,7 +1480,7 @@ def mcp_test(
 ) -> None:
     """Build the MCP server in-process and list its tools."""
     try:
-        from gpuq.mcp.server import self_test
+        from workerq.mcp.server import self_test
     except ImportError as exc:
         fail(f"MCP adapter unavailable: {exc}")
         return
@@ -1503,11 +1503,11 @@ def mcp_test(
 def mcp_serve() -> None:
     """Run the MCP stdio server (used by Claude Code, not by humans)."""
     try:
-        from gpuq.mcp.server import serve
+        from workerq.mcp.server import serve
     except ImportError as exc:
         err_console.print(
             f"error: MCP SDK not installed ({exc}).\n"
-            "Install with: uv tool install --with 'mcp[cli]' gpuq"
+            "Install with: uv tool install --with 'mcp[cli]' worker-q"
         )
         raise typer.Exit(2) from exc
     serve(load_config())
@@ -1524,8 +1524,8 @@ def uninstall(
     purge: bool = typer.Option(False, "--purge", help="Also delete logs, database, snapshots."),
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
-    """Show (or perform) removal of gpuq state, policy and dispatcher."""
-    from gpuq.cleanup import uninstall_inventory
+    """Show (or perform) removal of worker-q state, policy and dispatcher."""
+    from workerq.cleanup import uninstall_inventory
 
     service = get_service()
     inventory = uninstall_inventory(service)
@@ -1539,13 +1539,13 @@ def uninstall(
             actions.append("dispatcher stopped")
         except Exception as exc:
             actions.append(f"dispatcher stop failed: {exc}")
-        from gpuq.claude_policy import remove_policy
+        from workerq.claude_policy import remove_policy
 
         actions.append(remove_policy()["message"])
         if purge:
             import shutil
 
-            from gpuq.util import is_within
+            from workerq.util import is_within
 
             state_dir = service.config.state_dir
             service.close()
@@ -1557,7 +1557,7 @@ def uninstall(
     if json_output:
         emit_json(inventory)
     else:
-        console.print("[bold]gpuq uninstall[/bold]" + (" [dim](dry run)[/dim]" if dry_run else ""))
+        console.print("[bold]workerq uninstall[/bold]" + (" [dim](dry run)[/dim]" if dry_run else ""))
         console.print(f"  package     : {inventory['package']['hint']}")
         console.print(
             f"  state       : {inventory['state']['path']} "
@@ -1588,10 +1588,10 @@ def uninstall(
 @app.command("_run", hidden=True, context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 def internal_run(
     ctx: typer.Context,
-    job_id: int = typer.Argument(..., help="GPUQ job id."),
+    job_id: int = typer.Argument(..., help="worker-q job id."),
 ) -> None:
     """Internal: execute a queued job. Invoked by the dispatcher."""
-    from gpuq.runner import run_job
+    from workerq.runner import run_job
 
     override = list(ctx.args) or None
     code = run_job(job_id, override, config=load_config())
@@ -1601,7 +1601,7 @@ def internal_run(
 @app.command("_daemon", hidden=True)
 def internal_daemon() -> None:
     """Internal: run the dispatcher loop in the foreground."""
-    from gpuq.backends.dispatcher import run_daemon
+    from workerq.backends.dispatcher import run_daemon
 
     raise typer.Exit(run_daemon(load_config()))
 
@@ -1628,10 +1628,10 @@ def version(
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Print version information."""
-    from gpuq import BACKEND_NAME, BACKEND_VERSION
+    from workerq import BACKEND_NAME, BACKEND_VERSION
 
     payload = {
-        "gpuq": __version__,
+        "workerq": __version__,
         "backend": BACKEND_NAME,
         "backend_version": BACKEND_VERSION,
         "python": sys.version.split()[0],
@@ -1640,12 +1640,12 @@ def version(
     if json_output:
         emit_json(payload)
         return
-    console.print(f"gpuq {__version__} (backend {BACKEND_NAME} {BACKEND_VERSION})")
+    console.print(f"workerq {__version__} (backend {BACKEND_NAME} {BACKEND_VERSION})")
 
 
 def _version_callback(value: bool) -> None:
     if value:
-        console.print(f"gpuq {__version__}")
+        console.print(f"workerq {__version__}")
         raise typer.Exit(0)
 
 
@@ -1661,7 +1661,7 @@ def main_callback(
 def main() -> None:
     # Output is UTF-8: meters, box drawing and the ellipsis in truncated
     # commands are all non-ASCII, and on Windows a redirected stdout defaults
-    # to the locale codec, which turns `gpuq report | tee` into a crash.
+    # to the locale codec, which turns `workerq report | tee` into a crash.
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")

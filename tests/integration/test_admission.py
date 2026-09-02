@@ -10,10 +10,10 @@ import sys
 
 import pytest
 
-from gpuq import host
-from gpuq.config import ResourcesConfig
-from gpuq.core import GPUQError, GPUQService, SubmitRequest
-from gpuq.models import JobState
+from workerq import host
+from workerq.config import ResourcesConfig
+from workerq.core import GPUQError, GPUQService, SubmitRequest
+from workerq.models import JobState
 
 pytestmark = [pytest.mark.integration, pytest.mark.timeout(300)]
 
@@ -130,7 +130,7 @@ def test_declared_footprint_is_recorded_and_visible(live_service, git_repo, wait
 
 def test_telemetry_records_samples_while_running(live_service, git_repo, waiter):
     """`gpuq report` needs this history to explain a failure afterwards."""
-    from gpuq.telemetry import open_telemetry
+    from workerq.telemetry import open_telemetry
 
     job_id = _submit(
         live_service, git_repo, [sys.executable, "-c", "import time; time.sleep(2)"]

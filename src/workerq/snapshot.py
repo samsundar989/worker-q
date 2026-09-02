@@ -19,8 +19,8 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from gpuq.util import ensure_dir, expand_path, is_within, resolve_path
-from gpuq.winproc import no_window_kwargs
+from workerq.util import ensure_dir, expand_path, is_within, resolve_path
+from workerq.winproc import no_window_kwargs
 
 GIT_TIMEOUT = 300
 
@@ -368,7 +368,7 @@ def remove_snapshot(
 ) -> bool:
     """Delete a snapshot worktree.
 
-    Refuses any path outside the GPUQ state directory (spec section 30:
+    Refuses any path outside the worker-q state directory (spec section 30:
     resolve targets and verify descent before deleting).
     """
     snapshot_path = expand_path(snapshot_path)

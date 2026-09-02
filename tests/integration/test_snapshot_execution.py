@@ -16,8 +16,8 @@ from pathlib import Path
 
 import pytest
 
-from gpuq.core import SubmitRequest
-from gpuq.models import JobState
+from workerq.core import SubmitRequest
+from workerq.models import JobState
 
 pytestmark = [pytest.mark.integration, pytest.mark.timeout(300)]
 

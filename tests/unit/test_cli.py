@@ -12,10 +12,10 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from gpuq import cli as cli_module
-from gpuq.cli import app
-from gpuq.config import Config
-from gpuq.core import GPUQService
+from workerq import cli as cli_module
+from workerq.cli import app
+from workerq.config import Config
+from workerq.core import GPUQService
 
 
 @pytest.fixture
@@ -35,11 +35,11 @@ def cli_env(isolated_config: Config, monkeypatch):
 
     # Pretend the dispatcher is up; these tests never execute a job.
     monkeypatch.setattr(
-        "gpuq.backends.local_dispatcher.LocalDispatcherBackend.ensure_daemon",
+        "workerq.backends.local_dispatcher.LocalDispatcherBackend.ensure_daemon",
         lambda self, **kw: True,
     )
     monkeypatch.setattr(
-        "gpuq.backends.local_dispatcher.LocalDispatcherBackend.daemon_running",
+        "workerq.backends.local_dispatcher.LocalDispatcherBackend.daemon_running",
         lambda self: True,
     )
     service.initialize()
@@ -59,13 +59,13 @@ def invoke(runner: CliRunner, *args: str):
 def test_version(runner: CliRunner):
     result = invoke(runner, "version")
     assert result.exit_code == 0
-    assert "gpuq" in result.stdout
+    assert "workerq" in result.stdout
 
 
 def test_version_json(runner: CliRunner):
     result = invoke(runner, "version", "--json")
     payload = json.loads(result.stdout)
-    assert payload["gpuq"] and payload["backend"] == "local_dispatcher"
+    assert payload["workerq"] and payload["backend"] == "local_dispatcher"
 
 
 def test_help_lists_the_core_commands(runner: CliRunner):
@@ -181,8 +181,8 @@ def test_submit_human_output_shows_the_job_id(
 ):
     result = invoke(runner, "submit", "--cwd", str(git_repo), "--", "python", "-V")
     assert "submitted" in result.stdout
-    assert "GPUQ job #" in result.stdout
-    assert "gpuq logs" in result.stdout
+    assert "worker-q job #" in result.stdout
+    assert "workerq logs" in result.stdout
 
 
 # --------------------------------------------------------------------------
@@ -229,7 +229,7 @@ def test_status_rejects_an_invalid_state_filter(runner: CliRunner, cli_env: Conf
 def test_show_invalid_job_id(runner: CliRunner, cli_env: Config):
     result = invoke(runner, "show", "9999")
     assert result.exit_code != 0
-    assert "no such gpuq job" in result.output
+    assert "no such worker-q job" in result.output
 
 
 def test_show_reports_provenance(runner: CliRunner, cli_env: Config, git_repo: Path):
@@ -368,7 +368,7 @@ def test_doctor_human_output(runner: CliRunner, cli_env: Config):
 
 
 def test_doctor_exit_code_2_when_a_check_fails(runner: CliRunner, cli_env: Config, monkeypatch):
-    from gpuq.doctor import Check, Doctor
+    from workerq.doctor import Check, Doctor
 
     monkeypatch.setattr(
         Doctor, "check_sqlite", lambda self: self.add("SQLite", "FAIL", "simulated")
@@ -483,7 +483,7 @@ def test_uninstall_dry_run_is_default(runner: CliRunner, cli_env: Config):
 def test_mcp_command_prints_stdio_invocation(runner: CliRunner, cli_env: Config):
     payload = json.loads(invoke(runner, "mcp", "command", "--json").stdout)
     assert payload["transport"] == "stdio"
-    assert payload["args"][:2] == ["-m", "gpuq"]
+    assert payload["args"][:2] == ["-m", "workerq"]
 
 
 def test_claude_policy_roundtrip_via_cli(runner: CliRunner, cli_env: Config, tmp_path: Path):
@@ -514,7 +514,7 @@ def test_two_submissions_in_parallel_both_succeed(
     def submit(index: int) -> None:
         try:
             service = GPUQService(cli_env)
-            from gpuq.core import SubmitRequest
+            from workerq.core import SubmitRequest
 
             out = service.submit(
                 SubmitRequest(

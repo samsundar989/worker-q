@@ -7,7 +7,7 @@ worth building yourself.
 ## The seam
 
 Everything execution-related sits behind one protocol,
-`src/gpuq/backends/base.py`:
+`src/workerq/backends/base.py`:
 
 ```python
 class SchedulerBackend(Protocol):
@@ -27,7 +27,7 @@ class SchedulerBackend(Protocol):
 ```
 
 `GPUQService`, the CLI and the MCP adapter only ever see `BackendJob`. Backend
-states map to GPUQ states in exactly one function, `core.map_backend_state`.
+states map to worker-q states in exactly one function, `core.map_backend_state`.
 A new backend is a new module plus a branch in `build_backend`.
 
 The database already reserves columns for this work:
@@ -48,7 +48,7 @@ The dispatcher already allocates *distinct* devices per job and sets
 `CUDA_VISIBLE_DEVICES` accordingly, so on a multi-GPU host:
 
 ```bash
-gpuq concurrency 2 --yes
+workerq concurrency 2 --yes
 ```
 
 gives one job per GPU rather than two jobs fighting over one. It stays behind
@@ -67,7 +67,7 @@ What is still missing before this should be a default:
 ## Stage 2 — GPU Task Spooler on Linux
 
 On a Linux or WSL2 host the intended backend is the upstream GPU-aware Task
-Spooler fork, pinned in `gpuq/__init__.py` as `TASK_SPOOLER_PINNED_TAG`:
+Spooler fork, pinned in `workerq/__init__.py` as `TASK_SPOOLER_PINNED_TAG`:
 
 `https://github.com/justanhduc/task-spooler`
 
@@ -75,7 +75,7 @@ A `TaskSpoolerBackend` would map the protocol onto:
 
 | Protocol method | Task Spooler |
 | --- | --- |
-| `submit` | `ts -L <label> -G <n> -- gpuq _run <id>` |
+| `submit` | `ts -L <label> -G <n> -- workerq _run <id>` |
 | `list_jobs` / `get_job` | `ts -M json` |
 | `output_path` | `ts -o <id>` |
 | `remove_queued` | `ts -r <id>` |
@@ -87,7 +87,7 @@ A `TaskSpoolerBackend` would map the protocol onto:
 Requirements before trusting it: verify the installed binary advertises
 `-G/--gpus`, `--set_gpu_free_perc` and `-M/--serialize` — capability must be
 detected from `ts -h`, never inferred from a version string — and give it a
-dedicated socket (`TS_SOCKET`) under the GPUQ state directory so it cannot
+dedicated socket (`TS_SOCKET`) under the worker-q state directory so it cannot
 collide with a distro Task Spooler the user already runs.
 
 Parse only `-M json`. Never scrape the human table.
@@ -124,14 +124,14 @@ A `SlurmBackend` is a thin mapping:
 
 | Protocol method | Slurm |
 | --- | --- |
-| `submit` | `sbatch --gres=gpu:<n> --job-name=gpuq:<id> --wrap 'gpuq _run <id>'` |
+| `submit` | `sbatch --gres=gpu:<n> --job-name=gpuq:<id> --wrap 'workerq _run <id>'` |
 | `list_jobs` | `squeue --json` / `sacct --json` |
 | `get_state` | `sacct -j <id> --format=State,ExitCode --parsable2` |
 | `remove_queued` / `terminate_running` | `scancel <id>` |
 | `promote` | `scontrol update jobid=<id> priority=...` |
 | `set_slots` | partition/QoS configuration, not a runtime call |
 
-GPUQ keeps its own value on top: the ergonomic agent CLI, source snapshots,
+worker-q keeps its own value on top: the ergonomic agent CLI, source snapshots,
 provenance manifests, the Claude policy, and one command surface whether the
 job lands locally or on a cluster.
 
@@ -146,6 +146,6 @@ scheduling, MIG management, automatic checkpoint/preemption, an LLM deciding
 whether an allocation is safe, cloud workers, ETA prediction, experiment
 tracking, artifact stores, automatic git pushes.
 
-Most are separate products. The rest reintroduce the failure mode GPUQ exists
+Most are separate products. The rest reintroduce the failure mode worker-q exists
 to remove: something clever deciding it is probably fine to start a second
 heavy job.

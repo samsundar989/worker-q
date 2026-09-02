@@ -1,4 +1,4 @@
-"""`gpuq doctor` - health diagnostics (spec section 11.8).
+"""`workerq doctor` - health diagnostics (spec section 11.8).
 
 Exit codes: 0 healthy, 1 warnings/degraded but usable, 2 broken/unsafe.
 A failed check must never be silently downgraded (spec section 29.10).
@@ -14,11 +14,11 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from gpuq import __version__
-from gpuq.config import Config
-from gpuq.core import GPUQService
-from gpuq.gpu import cuda_toolkit_version, foreign_processes, nvidia_smi_path, query_gpus
-from gpuq.util import human_duration
+from workerq import __version__
+from workerq.config import Config
+from workerq.core import GPUQService
+from workerq.gpu import cuda_toolkit_version, foreign_processes, nvidia_smi_path, query_gpus
+from workerq.util import human_duration
 
 PASS = "PASS"
 WARN = "WARN"
@@ -76,7 +76,7 @@ class Doctor:
                 "Python >= 3.11",
                 FAIL,
                 detail,
-                "gpuq requires Python 3.11 or newer for tomllib and typing features",
+                "worker-q requires Python 3.11 or newer for tomllib and typing features",
             )
 
     def check_platform(self) -> None:
@@ -96,7 +96,7 @@ class Doctor:
                 "Config parse",
                 WARN,
                 f"{path} does not exist; built-in defaults in use",
-                "run 'gpuq init' to write a config file",
+                "run 'workerq init' to write a config file",
             )
             return
         try:
@@ -178,7 +178,7 @@ class Doctor:
                     "Dispatcher daemon",
                     FAIL,
                     "not running and could not be started",
-                    f"inspect {self.config.run_dir / 'dispatcher.out'} and run 'gpuq init'",
+                    f"inspect {self.config.run_dir / 'dispatcher.out'} and run 'workerq init'",
                 )
                 return
 
@@ -206,7 +206,7 @@ class Doctor:
                 "Queue concurrency",
                 WARN,
                 f"backend has {slots} slots, config says {configured}",
-                "run 'gpuq init' to re-apply the configured concurrency",
+                "run 'workerq init' to re-apply the configured concurrency",
             )
 
         threshold = health["gpu_free_percent_threshold"]
@@ -218,7 +218,7 @@ class Doctor:
                 WARN,
                 f"backend {threshold}%, config "
                 f"{self.config.gpu.free_memory_threshold_percent}%",
-                "run 'gpuq init' to re-apply",
+                "run 'workerq init' to re-apply",
             )
 
         log_dir = health.get("log_dir")
@@ -229,13 +229,13 @@ class Doctor:
                 "Log directory",
                 WARN,
                 f"backend reports {log_dir!r}, expected {self.config.logs_dir}",
-                "run 'gpuq init'",
+                "run 'workerq init'",
             )
 
     def check_stale_daemon(self) -> None:
         """A lock held with no fresh heartbeat means a wedged dispatcher."""
         backend = self.service.backend
-        from gpuq.winproc import is_locked
+        from workerq.winproc import is_locked
 
         locked = is_locked(backend.lock_path)
         stale = backend.heartbeat_stale()
@@ -244,7 +244,7 @@ class Doctor:
                 "No stale dispatcher",
                 FAIL,
                 f"lock held but heartbeat is {human_duration(backend.heartbeat_age())} old",
-                f"kill pid {backend.daemon_pid()} then run 'gpuq init'",
+                f"kill pid {backend.daemon_pid()} then run 'workerq init'",
             )
         else:
             self.add("No stale dispatcher", PASS, "no conflicting dispatcher detected")
@@ -286,7 +286,7 @@ class Doctor:
                 f"{free:.0f}% free" if free is not None else "memory unknown",
             )
 
-        # Would the configured threshold currently block dispatch? A gpuq job
+        # Would the configured threshold currently block dispatch? A worker-q job
         # that is legitimately using the GPU is not a problem to report - the
         # next job was going to wait for the slot regardless.
         threshold = self.config.gpu.free_memory_threshold_percent
@@ -302,7 +302,7 @@ class Doctor:
             self.add(
                 "GPU meets free-memory threshold",
                 PASS,
-                f"{best:.0f}% free; the GPU is in use by gpuq job "
+                f"{best:.0f}% free; the GPU is in use by worker-q job "
                 f"#{running[0].id} ({running[0].project})",
             )
         elif best + 1e-9 < threshold:
@@ -311,7 +311,7 @@ class Doctor:
                 WARN,
                 f"best GPU is {best:.0f}% free but the threshold is {threshold}%; "
                 "GPU jobs will wait",
-                f"lower it with 'gpuq gpu-threshold {max(0, int(best) - 5)}' "
+                f"lower it with 'workerq gpu-threshold {max(0, int(best) - 5)}' "
                 "if this baseline usage is normal for this desktop",
             )
         else:
@@ -326,7 +326,7 @@ class Doctor:
         # would make DEGRADED the normal state and teach the user to ignore
         # doctor. What is actually actionable is foreign work consuming enough
         # VRAM to block or endanger a job - so escalate on the memory, not on
-        # the mere existence of other processes. `gpuq gpu` always lists them.
+        # the mere existence of other processes. `workerq gpu` always lists them.
         try:
             own_pids = self.service.own_pids()
         except Exception:
@@ -343,16 +343,16 @@ class Doctor:
             self.add(
                 "Foreign GPU processes",
                 PASS,
-                f"{len(foreign)} other process(es) alongside gpuq job "
+                f"{len(foreign)} other process(es) alongside worker-q job "
                 f"#{running[0].id}",
             )
         elif best is not None and best + 1e-9 < threshold:
             self.add(
                 "Foreign GPU processes",
                 WARN,
-                f"{len(foreign)} process(es) gpuq did not launch are holding the GPU "
+                f"{len(foreign)} process(es) worker-q did not launch are holding the GPU "
                 f"({best:.0f}% free): {listed}",
-                "GPU jobs will wait until this frees up; 'gpuq gpu' lists every process",
+                "GPU jobs will wait until this frees up; 'workerq gpu' lists every process",
             )
         else:
             self.add(
@@ -360,13 +360,13 @@ class Doctor:
                 PASS,
                 f"{len(foreign)} other process(es) on the GPU, "
                 f"but {best:.0f}% is free" if best is not None else f"{len(foreign)} other process(es)",
-                "gpuq cannot control these; the free-memory threshold is the guard",
+                "worker-q cannot control these; the free-memory threshold is the guard",
             )
 
     def check_host_resources(self) -> None:
         """Host RAM and commit charge - the limits that actually crash a box."""
-        from gpuq import host
-        from gpuq.resources import capacity
+        from workerq import host
+        from workerq.resources import capacity
 
         mem = host.memory()
         if mem.error:
@@ -403,16 +403,16 @@ class Doctor:
         if commit is None:
             return
         if commit >= r.max_commit_percent:
-            # Degraded, not broken. gpuq is doing exactly its job by holding
+            # Degraded, not broken. worker-q is doing exactly its job by holding
             # work back, submitting is still safe (the job queues), and the
             # condition clears itself when the pressure does. Reserving FAIL
-            # for "gpuq is broken" keeps the signal worth reading.
+            # for "worker-q is broken" keeps the signal worth reading.
             self.add(
                 "Commit charge",
                 WARN,
                 f"{commit:.0f}% of the limit, at or above the {r.max_commit_percent}% "
                 "stop - new jobs will wait rather than start",
-                "run 'gpuq top' to see what is holding memory; jobs resume "
+                "run 'workerq top' to see what is holding memory; jobs resume "
                 "automatically once it frees up",
             )
         elif commit >= r.max_commit_percent - 8:
@@ -420,14 +420,14 @@ class Doctor:
                 "Commit charge",
                 WARN,
                 f"{commit:.0f}% of the limit, close to the {r.max_commit_percent}% stop",
-                "run 'gpuq top' to see what is holding memory",
+                "run 'workerq top' to see what is holding memory",
             )
         else:
             self.add("Commit charge", PASS, f"{commit:.0f}% of the limit")
 
     def check_unqueued_heavy_work(self) -> None:
-        """Large processes gpuq did not start are the usual cause of a crash."""
-        from gpuq import host
+        """Large processes worker-q did not start are the usual cause of a crash."""
+        from workerq import host
 
         try:
             own = self.service.own_pids()
@@ -445,8 +445,8 @@ class Doctor:
         self.add(
             "Unqueued heavy workloads",
             WARN,
-            f"{len(offenders)} process(es) gpuq did not start: {listed}",
-            "gpuq cannot schedule around these; submit that work through the "
+            f"{len(offenders)} process(es) worker-q did not start: {listed}",
+            "worker-q cannot schedule around these; submit that work through the "
             "queue so it is accounted for",
         )
 
@@ -464,7 +464,7 @@ class Doctor:
             self.add(
                 "CUDA toolkit (nvcc)",
                 PASS,
-                "not installed (not required - gpuq uses only the NVIDIA runtime)",
+                "not installed (not required - worker-q uses only the NVIDIA runtime)",
             )
 
     def check_git(self) -> None:
@@ -480,7 +480,7 @@ class Doctor:
         import subprocess
 
         try:
-            from gpuq.winproc import no_window_kwargs
+            from workerq.winproc import no_window_kwargs
 
             proc = subprocess.run(
                 [git, "--version"],
@@ -494,7 +494,7 @@ class Doctor:
             self.add("git (snapshot support)", WARN, f"{git}: {exc}")
 
     def check_claude_policy(self) -> None:
-        from gpuq.claude_policy import policy_status
+        from workerq.claude_policy import policy_status
 
         if not self.config.claude.install_user_policy:
             self.add("Claude policy", PASS, "disabled in config (claude.install_user_policy)")
@@ -506,15 +506,15 @@ class Doctor:
             self.add(
                 "Claude policy installed",
                 WARN,
-                f"{status['path']} contains an outdated gpuq block",
-                "run 'gpuq claude-policy install' to refresh it",
+                f"{status['path']} contains an outdated worker-q block",
+                "run 'workerq claude-policy install' to refresh it",
             )
         else:
             self.add(
                 "Claude policy installed",
                 WARN,
                 f"not present in {status['path']}",
-                "run 'gpuq claude-policy install'",
+                "run 'workerq claude-policy install'",
             )
 
     def check_reconcile(self) -> None:
@@ -529,7 +529,7 @@ class Doctor:
                 "Metadata consistent",
                 WARN,
                 f"{len(drift)} job(s) out of sync: " + "; ".join(drift[:3]),
-                "run 'gpuq reconcile' to repair",
+                "run 'workerq reconcile' to repair",
             )
         else:
             self.add("Metadata consistent", PASS, "database agrees with the queue")
@@ -542,11 +542,11 @@ class Doctor:
                 "MCP adapter (optional)",
                 PASS,
                 "SDK not installed; the CLI is the supported interface",
-                "install with: uv tool install --with 'mcp[cli]' gpuq",
+                "install with: uv tool install --with 'mcp[cli]' worker-q",
             )
             return
         try:
-            from gpuq.mcp.server import build_server
+            from workerq.mcp.server import build_server
 
             build_server(self.service.config)
             self.add("MCP adapter (optional)", PASS, "server imports and builds")

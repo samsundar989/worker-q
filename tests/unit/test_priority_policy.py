@@ -11,8 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from gpuq.core import GPUQError, GPUQService, SubmitRequest
-from gpuq.models import JobState, Priority
+from workerq.core import GPUQError, GPUQService, SubmitRequest
+from workerq.models import JobState, Priority
 
 
 @pytest.fixture

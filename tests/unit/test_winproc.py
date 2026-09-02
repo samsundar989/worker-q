@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from gpuq.winproc import (
+from workerq.winproc import (
     ExclusiveLock,
     detached_creationflags,
     is_locked,
@@ -216,7 +216,7 @@ def test_background_process_leaves_no_console():
 @pytest.mark.timeout(240)
 def test_dispatcher_daemon_leaves_no_console(isolated_config):
     """The same guarantee, exercised through the real backend."""
-    from gpuq.backends.local_dispatcher import LocalDispatcherBackend
+    from workerq.backends.local_dispatcher import LocalDispatcherBackend
 
     backend = LocalDispatcherBackend(isolated_config)
     try:
@@ -234,7 +234,7 @@ def test_dispatcher_daemon_leaves_no_console(isolated_config):
 @pytest.mark.timeout(240)
 def test_dispatcher_shutdown_leaves_no_process_behind(isolated_config):
     """A stopped dispatcher must actually exit, not linger holding a console."""
-    from gpuq.backends.local_dispatcher import LocalDispatcherBackend
+    from workerq.backends.local_dispatcher import LocalDispatcherBackend
 
     backend = LocalDispatcherBackend(isolated_config)
     assert backend.ensure_daemon(timeout=60.0)
@@ -290,7 +290,7 @@ def _visible_windows_in_tree(pid: int) -> int:
 _HELPER_PROBE = r"""
 import os, subprocess, sys
 sys.path.insert(0, {src!r})
-from gpuq.winproc import no_window_kwargs
+from workerq.winproc import no_window_kwargs
 open(sys.argv[1], "w").write(str(os.getpid()))
 subprocess.run(["ping", "-n", "9", "127.0.0.1"], capture_output=True, **no_window_kwargs())
 """
@@ -343,7 +343,7 @@ def test_helper_subprocess_opens_no_visible_window(tmp_path: Path):
 
 @windows_only
 def test_no_window_kwargs_sets_the_flag():
-    from gpuq.winproc import CREATE_NO_WINDOW, no_window_kwargs
+    from workerq.winproc import CREATE_NO_WINDOW, no_window_kwargs
 
     assert no_window_kwargs()["creationflags"] & CREATE_NO_WINDOW
 

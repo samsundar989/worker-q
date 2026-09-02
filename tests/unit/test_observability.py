@@ -12,13 +12,13 @@ from pathlib import Path
 
 import pytest
 
-from gpuq import host
-from gpuq.core import GPUQService
-from gpuq.db import json_dumps
-from gpuq.models import JobState
-from gpuq.report import CAUSES, analyse, classify_failure
-from gpuq.telemetry import EVENT_BLOCKED, EVENT_STARTED, Telemetry, open_telemetry
-from gpuq.util import utcnow, utcnow_iso
+from workerq import host
+from workerq.core import GPUQService
+from workerq.db import json_dumps
+from workerq.models import JobState
+from workerq.report import CAUSES, analyse, classify_failure
+from workerq.telemetry import EVENT_BLOCKED, EVENT_STARTED, Telemetry, open_telemetry
+from workerq.util import utcnow, utcnow_iso
 
 IS_WINDOWS = os.name == "nt"
 

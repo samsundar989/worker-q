@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from gpuq.backends.base import (
+from workerq.backends.base import (
     BACKEND_FINISHED,
     BACKEND_MISSING,
     BACKEND_QUEUED,
@@ -22,11 +22,11 @@ from gpuq.backends.base import (
     BackendUnavailable,
     SchedulerBackend,
 )
-from gpuq.backends.local_dispatcher import LocalDispatcherBackend, build_backend
-from gpuq.backends.queue_store import QueueStore, row_to_backend_job
-from gpuq.config import Config, CoreConfig
-from gpuq.core import map_backend_state
-from gpuq.models import JobState
+from workerq.backends.local_dispatcher import LocalDispatcherBackend, build_backend
+from workerq.backends.queue_store import QueueStore, row_to_backend_job
+from workerq.config import Config, CoreConfig
+from workerq.core import map_backend_state
+from workerq.models import JobState
 
 
 @pytest.fixture
@@ -145,7 +145,7 @@ def test_submit_error_mentions_doctor(backend: LocalDispatcherBackend, monkeypat
     monkeypatch.setattr(backend, "ensure_daemon", lambda **kw: False)
     with pytest.raises(BackendUnavailable) as exc:
         backend.submit(["python"], label="x", gpu_count=0)
-    assert "gpuq doctor" in str(exc.value)
+    assert "workerq doctor" in str(exc.value)
 
 
 # --------------------------------------------------------------------------

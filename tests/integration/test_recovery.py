@@ -7,9 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from gpuq.core import GPUQService, SubmitRequest
-from gpuq.db import json_dumps
-from gpuq.models import JobState
+from workerq.core import GPUQService, SubmitRequest
+from workerq.db import json_dumps
+from workerq.models import JobState
 
 pytestmark = [pytest.mark.integration, pytest.mark.timeout(300)]
 
@@ -72,7 +72,7 @@ def test_dispatcher_restart_adopts_a_running_job(live_service, git_repo, git_hel
     # echoed in that banner, which makes counting program output misleading.
     log = live_service.resolve_log_path(job)
     text = log.read_text(encoding="utf-8", errors="replace")
-    assert text.count(f"gpuq: job #{job_id} starting") == 1, (
+    assert text.count(f"worker-q: job #{job_id} starting") == 1, (
         f"job appears to have run more than once:\n{text}"
     )
     assert "still here" in text
@@ -161,7 +161,7 @@ def test_finished_jobs_are_immutable_under_reconcile(
 
 def test_stale_preparing_row_becomes_lost_not_successful(live_service, git_repo):
     """A submission that died during preparation must never look complete."""
-    from gpuq.util import utcnow_iso
+    from workerq.util import utcnow_iso
     from datetime import datetime, timedelta, timezone
 
     old = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(timespec="microseconds")

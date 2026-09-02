@@ -1,4 +1,4 @@
-"""`gpuq report` - why jobs are failing, and who is responsible.
+"""`workerq report` - why jobs are failing, and who is responsible.
 
 Turns a pile of failed jobs into an answer. Each failure is classified from its
 exit code and log, attributed to a project and the agent that submitted it, and
@@ -13,10 +13,10 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
-from gpuq.core import GPUQService
-from gpuq.models import Job, JobState
-from gpuq.telemetry import open_telemetry
-from gpuq.util import age_seconds, parse_iso
+from workerq.core import GPUQService
+from workerq.models import Job, JobState
+from workerq.telemetry import open_telemetry
+from workerq.util import age_seconds, parse_iso
 
 _LOG_TAIL_BYTES = 20_000
 
@@ -35,13 +35,13 @@ CAUSES = {
         "cuda_oom",
         "CUDA out of memory",
         resource=True,
-        advice="declare the job's VRAM with --vram so gpuq stops overlapping it",
+        advice="declare the job's VRAM with --vram so worker-q stops overlapping it",
     ),
     "host_oom": Cause(
         "host_oom",
         "host out of memory",
         resource=True,
-        advice="declare --ram so gpuq holds the job until that much is actually free",
+        advice="declare --ram so worker-q holds the job until that much is actually free",
     ),
     "killed": Cause(
         "killed",
@@ -145,7 +145,7 @@ def classify_failure(service: GPUQService, job: Job, log: str | None = None) -> 
 def _excerpt(text: str, cause: Cause) -> str:
     """The most informative line or two, not the whole log."""
     lines = [line.rstrip() for line in text.splitlines() if line.strip()]
-    lines = [line for line in lines if not line.startswith("gpuq: ")]
+    lines = [line for line in lines if not line.startswith("worker-q: ")]
     if not lines:
         return ""
     for key, pattern in _PATTERNS:
@@ -253,19 +253,19 @@ def _verdict(failures: list[Failure], resource_caused: list[Failure]) -> str:
     return (
         f"{len(resource_caused)} of {len(failures)} failure(s) were caused by the machine "
         f"running out of memory, worst in '{worst[0]}' ({worst[1]}). "
-        "Declare --ram/--vram on those jobs so gpuq can hold them until it is safe, "
+        "Declare --ram/--vram on those jobs so worker-q can hold them until it is safe, "
         "and make sure every heavy workload is submitted rather than run directly."
     )
 
 
 def foreign_pressure_report(service: GPUQService, *, hours: float = 6.0) -> dict[str, Any]:
-    """Processes holding memory that gpuq did not start.
+    """Processes holding memory that worker-q did not start.
 
     This is the direct answer to "who is crashing my box": work that bypassed
     the queue is invisible to slot counting but very visible in the samples.
     """
     telemetry = open_telemetry(service.config.state_dir)
-    from gpuq.util import utcnow, utcnow_iso
+    from workerq.util import utcnow, utcnow_iso
     from datetime import timedelta
 
     start = (utcnow() - timedelta(hours=hours)).isoformat(timespec="microseconds")

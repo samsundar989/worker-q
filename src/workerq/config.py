@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
-from gpuq.util import atomic_write_text, ensure_dir, expand_path
+from workerq.util import atomic_write_text, ensure_dir, expand_path
 
 VALID_PRIORITIES = ("critical", "high", "normal", "low")
 VALID_SNAPSHOT_MODES = ("git", "none", "copy")
@@ -253,7 +253,7 @@ class Config:
 
     def to_toml(self) -> str:
         lines: list[str] = [
-            "# GPUQ configuration",
+            "# worker-q configuration",
             "# Precedence: CLI flag > GPUQ_* env var > this file > built-in default",
             "",
         ]

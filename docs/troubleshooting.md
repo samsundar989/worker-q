@@ -3,7 +3,7 @@
 Start here:
 
 ```bash
-gpuq doctor
+workerq doctor
 ```
 
 Exit code `0` healthy, `1` degraded but usable, `2` broken — do not submit.
@@ -13,7 +13,7 @@ Every check prints a `->` hint when it is not `PASS`.
 
 ## A job is stuck in QUEUED and nothing is running
 
-`gpuq status` shows the reason under the job. The usual causes:
+`workerq status` shows the reason under the job. The usual causes:
 
 ### "waiting for GPU memory: GPU0 85% free < 90% required"
 
@@ -21,19 +21,19 @@ The free-VRAM gate is doing its job — but on a desktop the compositor and
 browsers permanently hold a few GiB, so the default 90% can never be met.
 
 ```bash
-gpuq gpu                    # see who actually holds VRAM
-gpuq gpu-threshold 80       # pick a threshold above your idle baseline
+workerq gpu                    # see who actually holds VRAM
+workerq gpu-threshold 80       # pick a threshold above your idle baseline
 ```
 
 Choose a value a little below your true idle free percentage. Too low and a
-gpuq job will start on top of a foreign CUDA process; too high and the queue
-stalls. `gpuq doctor` warns whenever the current threshold would block.
+worker-q job will start on top of a foreign CUDA process; too high and the queue
+stalls. `workerq doctor` warns whenever the current threshold would block.
 
 ### Dispatcher not running
 
 ```bash
-gpuq status     # "Dispatcher: NOT RUNNING"
-gpuq init       # starts it; idempotent
+workerq status     # "Dispatcher: NOT RUNNING"
+workerq init       # starts it; idempotent
 ```
 
 If it will not start, read the daemon's own output:
@@ -45,9 +45,9 @@ cat ~/.local/state/gpuq/run/dispatcher.log    # per-tick activity
 
 ### Another job is genuinely running
 
-That is the design. `gpuq status` shows the running job. Use
-`gpuq promote <id>` to move a queued job to the front — it will still wait for
-the current job to finish, because gpuq never preempts.
+That is the design. `workerq status` shows the running job. Use
+`workerq promote <id>` to move a queued job to the front — it will still wait for
+the current job to finish, because worker-q never preempts.
 
 ---
 
@@ -65,13 +65,13 @@ changing it, open a new terminal — existing shells keep the old PATH.
 
 ---
 
-## "the gpuq dispatcher is not running and could not be started"
+## "the worker-q dispatcher is not running and could not be started"
 
 Submission refuses rather than running your command directly, on purpose.
 
 ```bash
-gpuq doctor
-gpuq init
+workerq doctor
+workerq init
 ```
 
 If `doctor` reports **"No stale dispatcher: FAIL — lock held but heartbeat is
@@ -80,7 +80,7 @@ Nm old"**, a wedged daemon is holding the lock. It names the PID:
 ```bash
 taskkill /PID <pid> /F      # Windows
 kill <pid>                  # POSIX
-gpuq init
+workerq init
 ```
 
 ---
@@ -88,7 +88,7 @@ gpuq init
 ## A job failed immediately
 
 ```bash
-gpuq logs <id>
+workerq logs <id>
 ```
 
 The runner prints a banner with the execution directory, snapshot commit and
@@ -101,7 +101,7 @@ The job runs in the **snapshot**, not your live directory. Files that are
 gitignored are not in the snapshot. Link them in:
 
 ```bash
-gpuq submit --passthrough data --passthrough checkpoints -- python train.py
+workerq submit --passthrough data --passthrough checkpoints -- python train.py
 ```
 
 or permanently, in your repo's `.gpuq.toml`:
@@ -114,19 +114,19 @@ passthrough = ["data", "datasets", "checkpoints"]
 Check what a job actually saw:
 
 ```bash
-gpuq show <id>          # Execution cwd, Snapshot commit, Passthrough
+workerq show <id>          # Execution cwd, Snapshot commit, Passthrough
 ```
 
 ### The wrong version of my code ran
 
 That is snapshot semantics working correctly: a queued job runs the source as
-it was **at submission time**. `gpuq show <id>` prints the snapshot commit, and
+it was **at submission time**. `workerq show <id>` prints the snapshot commit, and
 the tree is still on disk at the printed snapshot path.
 
 If you want the live tree, opt out explicitly:
 
 ```bash
-gpuq submit --live-worktree -- python train.py
+workerq submit --live-worktree -- python train.py
 ```
 
 ### `ModuleNotFoundError` for a package that is installed
@@ -135,8 +135,8 @@ The job inherits the dispatcher's environment, not your current shell's. If
 your project uses a virtualenv, name its interpreter explicitly:
 
 ```bash
-gpuq submit -- .venv/Scripts/python.exe train.py     # Windows
-gpuq submit -- .venv/bin/python train.py             # POSIX
+workerq submit -- .venv/Scripts/python.exe train.py     # Windows
+workerq submit -- .venv/bin/python train.py             # POSIX
 ```
 
 This is the recommended form regardless — it makes the manifest unambiguous
@@ -146,25 +146,25 @@ about which interpreter produced a result.
 
 ## `UnicodeEncodeError` in a job
 
-gpuq sets `PYTHONIOENCODING=utf-8` for jobs because logs are written and read
+worker-q sets `PYTHONIOENCODING=utf-8` for jobs because logs are written and read
 as UTF-8. If your program needs a different encoding, override it:
 
 ```bash
-gpuq submit --env PYTHONIOENCODING=cp1252 -- python legacy.py
+workerq submit --env PYTHONIOENCODING=cp1252 -- python legacy.py
 ```
 
 ---
 
 ## Stray terminal windows
 
-gpuq launches its dispatcher and job wrappers with `pythonw.exe`, which creates
-no console at all, so gpuq itself should contribute **zero** terminal windows.
+worker-q launches its dispatcher and job wrappers with `pythonw.exe`, which creates
+no console at all, so worker-q itself should contribute **zero** terminal windows.
 
-Check what is actually gpuq's:
+Check what is actually worker-q's:
 
 ```powershell
 Get-CimInstance Win32_Process |
-  Where-Object { $_.CommandLine -like '*gpuq*' } |
+  Where-Object { $_.CommandLine -like '*worker-q*' } |
   Select-Object ProcessId, Name, CommandLine
 ```
 
@@ -172,15 +172,15 @@ You should see at most two entries per active profile (a launcher plus the real
 interpreter), both `pythonw.exe`. Anything else on the machine opening consoles
 is not gpuq.
 
-To count console hosts belonging to gpuq specifically, look for `conhost.exe`
+To count console hosts belonging to worker-q specifically, look for `conhost.exe`
 whose parent is one of those PIDs — there should be none.
 
 Stop a dispatcher cleanly (never `taskkill` it; running jobs are tracked
 through it):
 
 ```bash
-gpuq _stop-daemon                      # current profile
-GPUQ_PROFILE=smoke gpuq _stop-daemon   # a named profile
+workerq _stop-daemon                      # current profile
+GPUQ_PROFILE=smoke workerq _stop-daemon   # a named profile
 ```
 
 A dispatcher left over from an old profile is harmless but pointless; stopping
@@ -195,44 +195,44 @@ away when the job ends.
 Start here:
 
 ```bash
-gpuq report --pressure     # what failed, why, and what held memory
-gpuq top                   # live view while it is happening
+workerq report --pressure     # what failed, why, and what held memory
+workerq top                   # live view while it is happening
 ```
 
-`gpuq report` separates failures caused by **the machine** (CUDA OOM, host OOM,
+`workerq report` separates failures caused by **the machine** (CUDA OOM, host OOM,
 killed) from failures caused by **the job's own code**, and groups them by
 project and submitting agent. If the verdict blames resource exhaustion, the
 usual cause is one of these two.
 
 ### Something heavy is running outside the queue
 
-This is the common one. A slot count cannot see work gpuq did not start, so a
-single unqueued job can exhaust the box while gpuq believes it is idle.
+This is the common one. A slot count cannot see work worker-q did not start, so a
+single unqueued job can exhaust the box while worker-q believes it is idle.
 
-`gpuq top` tags every large process **gpuq** or **foreign**, and `gpuq doctor`
+`workerq top` tags every large process **worker-q** or **foreign**, and `workerq doctor`
 raises "Unqueued heavy workloads". Fix it by submitting that work:
 
 ```bash
-gpuq submit --project the-other-project --ram 20 -- <its command>
+workerq submit --project the-other-project --ram 20 -- <its command>
 ```
 
 ### Jobs are not declaring what they need
 
-An undeclared job is charged only a small default, so gpuq may admit it when it
+An undeclared job is charged only a small default, so worker-q may admit it when it
 should have waited. Declare real numbers:
 
 ```bash
-gpuq submit --project biohub --ram 24 --cpus 4 -- python -m celltrack train
+workerq submit --project biohub --ram 24 --cpus 4 -- python -m celltrack train
 ```
 
-`gpuq show <id>` prints what a job actually requested.
+`workerq show <id>` prints what a job actually requested.
 
 ---
 
-## A job is QUEUED and gpuq says it is waiting for RAM
+## A job is QUEUED and worker-q says it is waiting for RAM
 
 That is admission control, and it is preventing a crash rather than causing a
-problem. `gpuq status` prints the reason:
+problem. `workerq status` prints the reason:
 
 ```text
  60  QUEUED  normal  biohub  4m wait
@@ -240,21 +240,21 @@ problem. `gpuq status` prints the reason:
 ```
 
 It starts on its own once the memory frees up. Check what is holding it with
-`gpuq top`. If the request was simply too pessimistic, cancel and resubmit with
+`workerq top`. If the request was simply too pessimistic, cancel and resubmit with
 a smaller `--ram`.
 
 Current limits and headroom:
 
 ```bash
-gpuq resources
+workerq resources
 ```
 
-If the machine is genuinely bigger than gpuq thinks it can use, adjust the
+If the machine is genuinely bigger than worker-q thinks it can use, adjust the
 guard rails rather than disabling them:
 
 ```bash
-gpuq config set resources.reserve_ram_gb 6
-gpuq config set resources.max_commit_percent 90
+workerq config set resources.reserve_ram_gb 6
+workerq config set resources.max_commit_percent 90
 ```
 
 Turning enforcement off entirely (`resources.enforce = false`) restores the old
@@ -265,11 +265,11 @@ behaviour where only the slot count limits jobs - and with it the crashes.
 ## "Commit charge 91% of the limit" in doctor
 
 Windows fails allocations as the system commit charge approaches its limit,
-even while physical RAM still looks free, so gpuq stops starting jobs before
+even while physical RAM still looks free, so worker-q stops starting jobs before
 that point. This is reported as **degraded**, not broken: submitting still
 works, jobs simply wait, and they resume by themselves.
 
-If it stays high, something large is resident. `gpuq top` names it. Growing the
+If it stays high, something large is resident. `workerq top` names it. Growing the
 page file raises the limit if that is genuinely what you want.
 
 ---
@@ -277,16 +277,16 @@ page file raises the limit if that is genuinely what you want.
 ## Cancel did not stop everything
 
 ```bash
-gpuq cancel <id> --force
+workerq cancel <id> --force
 ```
 
-Without `--force`, gpuq attempts a polite stop first and waits
+Without `--force`, worker-q attempts a polite stop first and waits
 `core.cancel_grace_seconds` (default 15) before killing the tree. On Windows a
 console-less child cannot receive a polite signal at all, so the grace period
 usually just elapses — `--force` skips it.
 
-If a process survived, gpuq refused to kill it because it could not prove the
-PID was still that job's process. `gpuq show <id>` reports the PID it recorded.
+If a process survived, worker-q refused to kill it because it could not prove the
+PID was still that job's process. `workerq show <id>` reports the PID it recorded.
 
 ---
 
@@ -295,7 +295,7 @@ PID was still that job's process. `gpuq show <id>` reports the PID it recorded.
 Task queues do not survive a reboot on their own:
 
 ```bash
-gpuq init && gpuq reconcile && gpuq status
+workerq init && workerq reconcile && workerq status
 ```
 
 - Jobs that were **queued** are recovered and will run.
@@ -303,15 +303,15 @@ gpuq init && gpuq reconcile && gpuq status
   They are never silently reported as complete.
 
 There is no automatic restart-on-login service in V1. Add one yourself if you
-want it (a user systemd unit, or a Task Scheduler entry running `gpuq init`).
+want it (a user systemd unit, or a Task Scheduler entry running `workerq init`).
 
 ---
 
-## `gpuq status` disagrees with reality
+## `workerq status` disagrees with reality
 
 ```bash
-gpuq reconcile --dry-run     # what it would change
-gpuq reconcile               # repair
+workerq reconcile --dry-run     # what it would change
+workerq reconcile               # repair
 ```
 
 Reconciliation compares the metadata database with the dispatcher's queue and
@@ -324,27 +324,27 @@ alters a job that already finished.
 
 Yes, and that is deliberate:
 
-- `gpuq.sqlite3` — gpuq's job metadata.
+- `gpuq.sqlite3` — worker-q's job metadata.
 - `backend/queue.sqlite3` — the dispatcher's own queue state.
 
 Keeping them separate is what makes the execution backend swappable.
-`gpuq reconcile` is the sanctioned way to make them agree.
+`workerq reconcile` is the sanctioned way to make them agree.
 
 ---
 
 ## Disk filling up
 
 ```bash
-gpuq cleanup --dry-run
-gpuq cleanup
-gpuq cleanup --older-than 3d
+workerq cleanup --dry-run
+workerq cleanup
+workerq cleanup --older-than 3d
 ```
 
 Snapshots are Git worktrees and cost roughly one working tree each. Retention
 defaults to 7 days for successful jobs and 14 for failed ones, so failure
 evidence outlives success.
 
-Cleanup never touches an active job's snapshot, anything outside the gpuq
+Cleanup never touches an active job's snapshot, anything outside the worker-q
 state directory, or the live data behind a passthrough link.
 
 ---
@@ -352,9 +352,9 @@ state directory, or the live data behind a passthrough link.
 ## Starting over
 
 ```bash
-gpuq uninstall --dry-run     # exactly what would be removed
-gpuq uninstall --execute     # stops the dispatcher, removes the policy block
-gpuq uninstall --execute --purge   # also deletes the state directory
+workerq uninstall --dry-run     # exactly what would be removed
+workerq uninstall --execute     # stops the dispatcher, removes the policy block
+workerq uninstall --execute --purge   # also deletes the state directory
 ```
 
 Source repositories are never touched.
@@ -364,8 +364,8 @@ Source repositories are never touched.
 ## Isolating an experiment from your real queue
 
 ```bash
-GPUQ_PROFILE=scratch gpuq init
-GPUQ_PROFILE=scratch gpuq submit --project test -- python x.py
+GPUQ_PROFILE=scratch workerq init
+GPUQ_PROFILE=scratch workerq submit --project test -- python x.py
 ```
 
 A profile gets its own state directory, database, config and dispatcher. This

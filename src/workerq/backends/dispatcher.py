@@ -1,6 +1,6 @@
-"""The GPUQ dispatcher daemon.
+"""The worker-q dispatcher daemon.
 
-A single detached process per GPUQ profile. It is the only component that
+A single detached process per worker-q profile. It is the only component that
 launches user work, which is what makes the "one heavy job at a time"
 invariant hold across unrelated terminals and agents.
 
@@ -27,20 +27,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TextIO
 
-from gpuq.backends.base import BACKEND_QUEUED, BACKEND_RUNNING
-from gpuq.backends.queue_store import QueueStore
-from gpuq.config import Config
-from gpuq import host, resources as res
-from gpuq.gpu import query_gpus
-from gpuq.telemetry import (
+from workerq.backends.base import BACKEND_QUEUED, BACKEND_RUNNING
+from workerq.backends.queue_store import QueueStore
+from workerq.config import Config
+from workerq import host, resources as res
+from workerq.gpu import query_gpus
+from workerq.telemetry import (
     EVENT_BLOCKED,
     EVENT_DAEMON,
     EVENT_FINISHED,
     EVENT_STARTED,
     open_telemetry,
 )
-from gpuq.util import ensure_dir, utcnow_iso
-from gpuq.winproc import (
+from workerq.util import ensure_dir, utcnow_iso
+from workerq.winproc import (
     ProcessGroup,
     ExclusiveLock,
     child_creationflags,
@@ -319,14 +319,14 @@ class Dispatcher:
         except OSError as exc:
             self.log(f"job {backend_id}: failed to start: {exc}")
             if handle:
-                handle.write(f"gpuq: failed to start job: {exc}\n")
+                handle.write(f"worker-q: failed to start job: {exc}\n")
                 handle.close()
             self.store.finish(backend_id, exit_code=127)
             return False
 
         # Record the PID before anything else. If the dispatcher died in this
         # window the job would be running with no recorded owner - unkillable
-        # by `gpuq cancel` and invisible to orphan recovery.
+        # by `workerq cancel` and invisible to orphan recovery.
         self.store.update(
             backend_id,
             pid=proc.pid,
@@ -429,7 +429,7 @@ class Dispatcher:
                 continue
             del self.adopted[backend_id]
             # The exit code is unknown here; the runner records the real
-            # outcome in the GPUQ database, and a terminal state there is
+            # outcome in the worker-q database, and a terminal state there is
             # immutable, so reconciliation will not overwrite it.
             self.store.finish(backend_id, exit_code=None)
             self.log(f"job {backend_id}: adopted process {pid} exited")
@@ -489,7 +489,7 @@ class Dispatcher:
 
     # -- main loop --------------------------------------------------------
     def run(self) -> int:
-        from gpuq import BACKEND_VERSION
+        from workerq import BACKEND_VERSION
 
         self.store.initialize()
         pid = os.getpid()
@@ -576,7 +576,7 @@ class Dispatcher:
 
 
 def run_daemon(config: Config) -> int:
-    """Entry point for `gpuq _daemon`. Exits quietly if one already runs."""
+    """Entry point for `workerq _daemon`. Exits quietly if one already runs."""
     config.ensure_dirs()
     lock = ExclusiveLock(config.run_dir / "dispatcher.lock")
     if not lock.acquire():

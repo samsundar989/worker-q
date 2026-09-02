@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from gpuq.snapshot import (
+from workerq.snapshot import (
     Snapshot,
     SnapshotError,
     apply_passthrough,

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from gpuq.claude_policy import (
+from workerq.claude_policy import (
     END_MARKER,
     POLICY_BODY,
     START_MARKER,
@@ -42,7 +42,7 @@ def test_append_to_new_file(tmp_path: Path):
 
     text = target.read_text(encoding="utf-8")
     assert START_MARKER in text and END_MARKER in text
-    assert "gpuq submit --project" in text
+    assert "workerq submit --project" in text
 
 
 def test_creates_parent_directory(tmp_path: Path):
@@ -102,7 +102,7 @@ def test_updates_an_outdated_block(tmp_path: Path):
 
     assert result["changed"] is True
     assert "OLD POLICY TEXT" not in text
-    assert "gpuq submit --project" in text
+    assert "workerq submit --project" in text
     assert "# Mine" in text
     assert "keep me" in text
     assert count_blocks(text) == 1
@@ -210,16 +210,16 @@ def test_policy_text_matches_the_spec():
     for required in (
         "## Heavy Workload Policy (GPU, RAM and CPU)",
         "NEVER directly launch a command",
-        "gpuq submit --project <project> --priority normal -- <command> <args...>",
-        "gpuq status",
-        "gpuq cancel <job_id>",
-        "Do not bypass `gpuq`",
+        "workerq submit --project <project> --priority normal -- <command> <args...>",
+        "workerq status",
+        "workerq cancel <job_id>",
+        "Do not bypass `workerq`",
         "Small CPU-only commands",
         # The policy must teach declaring a footprint, or admission control is
         # guessing and jobs get admitted that should have waited.
         "--ram 24 --vram 12 --cpus 4",
-        "gpuq top",
-        "gpuq report",
+        "workerq top",
+        "workerq report",
     ):
         assert required in body
 

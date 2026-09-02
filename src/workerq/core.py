@@ -13,8 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from gpuq import BACKEND_NAME, __version__
-from gpuq.backends.base import (
+from workerq import BACKEND_NAME, __version__
+from workerq.backends.base import (
     BACKEND_FINISHED,
     BACKEND_MISSING,
     BACKEND_QUEUED,
@@ -23,11 +23,11 @@ from gpuq.backends.base import (
     BackendJob,
     BackendUnavailable,
 )
-from gpuq.backends.local_dispatcher import LocalDispatcherBackend, build_backend
-from gpuq.config import Config, load_config
-from gpuq.db import Database, json_dumps
-from gpuq.gpu import GpuInfo, query_gpus
-from gpuq.models import (
+from workerq.backends.local_dispatcher import LocalDispatcherBackend, build_backend
+from workerq.config import Config, load_config
+from workerq.db import Database, json_dumps
+from workerq.gpu import GpuInfo, query_gpus
+from workerq.models import (
     ACTIVE_STATES,
     Job,
     JobState,
@@ -35,7 +35,7 @@ from gpuq.models import (
     SnapshotMode,
     priority_rank,
 )
-from gpuq.snapshot import (
+from workerq.snapshot import (
     Snapshot,
     SnapshotError,
     create_copy_snapshot,
@@ -45,7 +45,7 @@ from gpuq.snapshot import (
     load_project_passthrough,
     remove_snapshot,
 )
-from gpuq.util import (
+from workerq.util import (
     atomic_write_text,
     ensure_dir,
     expand_path,
@@ -64,7 +64,7 @@ class JobNotFound(GPUQError):
     pass
 
 
-#: Backend state -> GPUQ state. The single mapping point (spec section 9.2).
+#: Backend state -> worker-q state. The single mapping point (spec section 9.2).
 def map_backend_state(backend_state: str, exit_code: int | None) -> JobState | None:
     if backend_state == BACKEND_QUEUED:
         return JobState.QUEUED
@@ -150,7 +150,7 @@ class GPUQService:
             self._db_ready = True
 
     def initialize(self) -> dict[str, Any]:
-        """`gpuq init`. Idempotent."""
+        """`workerq init`. Idempotent."""
         self.config.ensure_dirs()
         if self.config.source_path and not self.config.source_path.exists():
             self.config.save()
@@ -193,7 +193,7 @@ class GPUQService:
             if not command:
                 raise GPUQError(
                     "no command given.\n"
-                    "Usage: gpuq submit --project NAME -- <command> [args...]"
+                    "Usage: workerq submit --project NAME -- <command> [args...]"
                 )
 
         if request.priority is not None:
@@ -250,7 +250,7 @@ class GPUQService:
             mode = SnapshotMode.COPY
         else:
             raise GPUQError(
-                f"{submitted_cwd} is not inside a git repository, so gpuq cannot freeze "
+                f"{submitted_cwd} is not inside a git repository, so worker-q cannot freeze "
                 "the source for a queued job.\n"
                 "Re-run with --live-worktree to accept running against the live "
                 "directory (it may change before the job starts), or run 'git init'."
@@ -365,7 +365,7 @@ class GPUQService:
             if isinstance(exc, BackendUnavailable):
                 raise GPUQError(
                     f"job not submitted: {exc}\n"
-                    "gpuq will not run the command directly - the queue is the only "
+                    "worker-q will not run the command directly - the queue is the only "
                     "safe path for heavy GPU work."
                 ) from exc
             if isinstance(exc, (SnapshotError, GPUQError)):
@@ -383,7 +383,7 @@ class GPUQService:
         Precedence, most specific first:
 
         1. `--priority` on the submission
-        2. the project's policy (`gpuq priority <project> high`) - set once,
+        2. the project's policy (`workerq priority <project> high`) - set once,
            machine-wide, so every worker on that project inherits it without
            editing anything
         3. `[project] priority` in the repo's `.gpuq.toml`
@@ -468,7 +468,7 @@ class GPUQService:
         self, ram_mib: float | None, vram_mib: float | None, cpus: int | None
     ) -> None:
         """Fail fast on a request no amount of waiting could ever satisfy."""
-        from gpuq import resources as res
+        from workerq import resources as res
 
         if not self.config.resources.enforce:
             return
@@ -540,15 +540,15 @@ class GPUQService:
         guarantee than re-quoting user arguments through a Windows command
         line, which is what spec section 8.4 is protecting against.
         """
-        from gpuq.winproc import windowless_python
+        from workerq.winproc import windowless_python
 
-        return [windowless_python(sys.executable), "-m", "gpuq", "_run", str(job_id)]
+        return [windowless_python(sys.executable), "-m", "workerq", "_run", str(job_id)]
 
     @staticmethod
     def backend_label(job_id: int, project: str, priority: str) -> str:
         """Unique marker used to recover a backend id after a crash (spec 9.3)."""
         safe_project = project.replace(":", "_")
-        return f"gpuq:{job_id}:{safe_project}:{priority}"
+        return f"worker-q:{job_id}:{safe_project}:{priority}"
 
     @staticmethod
     def _infer_project(repo_root: Path | None, cwd: Path) -> str:
@@ -623,7 +623,7 @@ class GPUQService:
         self.ensure_ready()
         job = self.db.get_job(job_id)
         if job is None:
-            raise JobNotFound(f"no such gpuq job: {job_id}")
+            raise JobNotFound(f"no such worker-q job: {job_id}")
         if refresh and not job.is_terminal:
             self.reconcile_job(job)
             job = self.db.get_job(job_id) or job
@@ -676,7 +676,7 @@ class GPUQService:
         return sorted(jobs, key=key)
 
     def _queue_order(self) -> dict[int, int]:
-        """Map gpuq job id -> position the dispatcher will actually run it in."""
+        """Map worker-q job id -> position the dispatcher will actually run it in."""
         try:
             backend_jobs = self.backend.list_jobs()
         except Exception:
@@ -816,7 +816,7 @@ class GPUQService:
         if job.state_enum is not JobState.QUEUED:
             raise GPUQError(
                 f"job #{job.id} is {job.state}; only QUEUED jobs can be promoted "
-                "(gpuq never preempts a running job)"
+                "(worker-q never preempts a running job)"
             )
         if job.backend_job_id is None:
             raise GPUQError(f"job #{job.id} has no backend job to promote")
@@ -831,7 +831,7 @@ class GPUQService:
     def set_concurrency(self, count: int) -> dict[str, Any]:
         if count < 1:
             raise GPUQError("concurrency must be >= 1")
-        from gpuq.config import set_dotted_and_save
+        from workerq.config import set_dotted_and_save
 
         self.config = set_dotted_and_save(self.config, "core.max_concurrent_jobs", count)
         self.backend.config = self.config
@@ -847,7 +847,7 @@ class GPUQService:
     def set_gpu_threshold(self, percent: int) -> dict[str, Any]:
         if not 0 <= percent <= 100:
             raise GPUQError("gpu threshold must be between 0 and 100")
-        from gpuq.config import set_dotted_and_save
+        from workerq.config import set_dotted_and_save
 
         self.config = set_dotted_and_save(
             self.config, "gpu.free_memory_threshold_percent", percent
@@ -968,13 +968,13 @@ class GPUQService:
         return query_gpus()
 
     def own_gpu_pids(self) -> set[int]:
-        """PIDs belonging to jobs gpuq launched, for foreign-process detection.
+        """PIDs belonging to jobs worker-q launched, for foreign-process detection.
 
         Two PIDs are collected per job. On Windows a virtualenv `python.exe`
         can be a trampoline that re-execs the real interpreter as a child, so
         the PID the dispatcher launched and the PID the runner reports are
         both legitimate and frequently differ. Missing either would make
-        `doctor` report gpuq's own job as a foreign GPU process.
+        `doctor` report worker-q's own job as a foreign GPU process.
         """
         pids: set[int] = set()
         for job in self.db.list_jobs(states=[JobState.RUNNING.value]):
@@ -990,20 +990,20 @@ class GPUQService:
         return pids
 
     def own_pids(self) -> set[int]:
-        """Every process belonging to a running gpuq job, including children.
+        """Every process belonging to a running worker-q job, including children.
 
-        `own_gpu_pids` only knows the wrapper PIDs gpuq launched; the real
+        `own_gpu_pids` only knows the wrapper PIDs worker-q launched; the real
         workload is typically a descendant (an interpreter re-exec, a
         dataloader pool), so memory attribution must walk the process tree or
-        gpuq reports its own job as somebody else's.
+        worker-q reports its own job as somebody else's.
         """
-        from gpuq import host as _host
+        from workerq import host as _host
 
         return _host.descendants_of(self.own_gpu_pids())
 
     def throughput(self, *, hours: float = 24.0) -> dict[str, Any]:
         """Queue performance over a window: outcomes, waits and utilisation."""
-        from gpuq.util import age_seconds as _age
+        from workerq.util import age_seconds as _age
 
         cutoff = hours * 3600.0
         succeeded = failed = cancelled = lost = 0
@@ -1061,7 +1061,7 @@ class GPUQService:
         }
 
     def status_summary(self) -> dict[str, Any]:
-        from gpuq import host as _host
+        from workerq import host as _host
 
         counts = self.db.count_by_state()
         memory = _host.memory()
@@ -1083,7 +1083,7 @@ class GPUQService:
 
 
 def _job_id_from_label(label: str | None) -> int | None:
-    if not label or not label.startswith("gpuq:"):
+    if not label or not label.startswith("worker-q:"):
         return None
     parts = label.split(":")
     if len(parts) < 2:
@@ -1095,14 +1095,14 @@ def _job_id_from_label(label: str | None) -> int | None:
 
 
 def _sort_ts(value: str | None) -> float:
-    from gpuq.util import parse_iso
+    from workerq.util import parse_iso
 
     dt = parse_iso(value)
     return dt.timestamp() if dt else 0.0
 
 
 def _age_or_zero(value: str | None) -> float:
-    from gpuq.util import age_seconds
+    from workerq.util import age_seconds
 
     return age_seconds(value) or 0.0
 

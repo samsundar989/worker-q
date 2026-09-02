@@ -1,14 +1,14 @@
 """Admission control: decide whether a job can safely start *right now*.
 
-This is what turns gpuq from a GPU queue into a broker for any heavy workload.
+This is what turns worker-q from a GPU queue into a broker for any heavy workload.
 A job declares what it needs (RAM, VRAM, CPUs) and is admitted only when that
 request fits, judged against two independent limits:
 
 * **Measured headroom** - what the OS says is free this instant. This is the
-  only thing that accounts for work gpuq did not start (another agent's
+  only thing that accounts for work worker-q did not start (another agent's
   training run, a browser, a WSL VM), and it is what a pure slot-count queue
   is blind to.
-* **Reserved headroom** - the sum of what already-running gpuq jobs asked for.
+* **Reserved headroom** - the sum of what already-running worker-q jobs asked for.
   A job that started ten seconds ago may not have allocated its peak yet, so
   measured free memory alone would happily admit a second job that cannot
   possibly fit once both reach full size.
@@ -23,9 +23,9 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
-from gpuq import host
-from gpuq.config import Config
-from gpuq.gpu import GpuInfo
+from workerq import host
+from workerq.config import Config
+from workerq.gpu import GpuInfo
 
 _GIB_MIB = 1024.0
 
@@ -94,7 +94,7 @@ class Decision:
 
     admit: bool
     reason: str | None = None
-    #: Machine-readable detail, recorded in telemetry so `gpuq report` can
+    #: Machine-readable detail, recorded in telemetry so `workerq report` can
     #: explain later why a job sat blocked.
     detail: dict[str, Any] = field(default_factory=dict)
 
@@ -155,7 +155,7 @@ def admit(
     """Can this request start right now?
 
     Returns a `Decision` whose `reason` is written verbatim into the job's
-    wait reason, so `gpuq status` always explains why something is not running
+    wait reason, so `workerq status` always explains why something is not running
     instead of appearing mysteriously stuck.
     """
     r = config.resources
@@ -260,8 +260,8 @@ def admit(
 
 
 def describe_capacity(config: Config) -> dict[str, Any]:
-    """Human/machine summary for `gpuq resources` and the dashboard."""
-    from gpuq.gpu import query_gpus
+    """Human/machine summary for `workerq resources` and the dashboard."""
+    from workerq.gpu import query_gpus
 
     mem = host.memory()
     gpu = query_gpus(include_processes=False)
