@@ -22,7 +22,7 @@ from workerq.models import (
 )
 from workerq.util import ensure_dir, restrict_permissions, utcnow_iso
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _MIGRATIONS: list[tuple[int, str]] = [
     (
@@ -142,6 +142,17 @@ _MIGRATIONS: list[tuple[int, str]] = [
             ON jobs(project, command_signature, state);
         """,
     ),
+    (
+        6,
+        """
+        -- What the job actually used, as opposed to what it declared. NULL
+        -- means never measured, which is not the same as measured zero: jobs
+        -- that ran before this column existed must not be read as free.
+        ALTER TABLE jobs ADD COLUMN peak_ram_mib REAL;
+        ALTER TABLE jobs ADD COLUMN peak_vram_mib REAL;
+        ALTER TABLE jobs ADD COLUMN usage_samples INTEGER NOT NULL DEFAULT 0;
+        """,
+    ),
 ]
 
 _JOB_COLUMNS = (
@@ -153,7 +164,7 @@ _JOB_COLUMNS = (
     "requested_vram_mib, requested_cpus, preemptible, preemption_count, "
     "preempted_at, preempted_by, preempted_reason, description, blocks, "
     "eta_seconds, command_signature, progress_fraction, progress_note, "
-    "progress_updated_at"
+    "progress_updated_at, peak_ram_mib, peak_vram_mib, usage_samples"
 )
 
 #: Columns callers are allowed to update through `update_job`.
@@ -191,6 +202,9 @@ _UPDATABLE = frozenset(
         "progress_fraction",
         "progress_note",
         "progress_updated_at",
+        "peak_ram_mib",
+        "peak_vram_mib",
+        "usage_samples",
     }
 )
 

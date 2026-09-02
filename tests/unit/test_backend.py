@@ -362,3 +362,74 @@ def test_initialize_is_idempotent(isolated_config: Config, monkeypatch):
     be.initialize()
     assert be.get_slots() == isolated_config.core.max_concurrent_jobs
     be.close()
+
+
+# --------------------------------------------------------------------------
+# Live reserve
+# --------------------------------------------------------------------------
+
+
+def test_reserve_roundtrips_through_the_meta_table(isolated_config):
+    """The reserve lives in the queue store so it applies without a restart."""
+    from workerq.backends.dispatcher import clear_reserve, read_reserve
+    from workerq.backends.local_dispatcher import LocalDispatcherBackend
+    from workerq.resources import Reserve
+
+    backend = LocalDispatcherBackend(isolated_config)
+    backend._ensure_store()
+    try:
+        configured = read_reserve(backend.store, isolated_config)
+        assert configured.ram_mib == isolated_config.resources.reserve_ram_gb * 1024.0
+        assert configured.label is None
+
+        backend.set_reserve(
+            Reserve(ram_mib=24 * 1024.0, vram_mib=22 * 1024.0, cpus=8, label="gaming")
+        )
+        live = read_reserve(backend.store, isolated_config)
+        assert (live.ram_mib, live.vram_mib, live.cpus, live.label) == (
+            24 * 1024.0,
+            22 * 1024.0,
+            8,
+            "gaming",
+        )
+
+        clear_reserve(backend.store)
+        assert read_reserve(backend.store, isolated_config).ram_mib == configured.ram_mib
+    finally:
+        backend.close()
+
+
+def test_unset_reserve_fields_fall_back_to_config(isolated_config):
+    """Reclaiming RAM must not silently hand out the CPUs as well."""
+    from workerq.backends.dispatcher import read_reserve
+    from workerq.backends.local_dispatcher import LocalDispatcherBackend
+    from workerq.resources import Reserve
+
+    backend = LocalDispatcherBackend(isolated_config)
+    backend._ensure_store()
+    try:
+        base = Reserve.from_config(isolated_config)
+        backend.set_reserve(
+            Reserve(ram_mib=24 * 1024.0, vram_mib=base.vram_mib, cpus=base.cpus)
+        )
+        live = read_reserve(backend.store, isolated_config)
+        assert live.ram_mib == 24 * 1024.0
+        assert live.cpus == base.cpus
+        assert live.vram_mib == base.vram_mib
+    finally:
+        backend.close()
+
+
+def test_a_corrupt_reserve_value_falls_back_rather_than_raising(isolated_config):
+    """A hand-edited meta row must not take the dispatcher down."""
+    from workerq.backends.dispatcher import META_RESERVE_RAM, read_reserve
+    from workerq.backends.local_dispatcher import LocalDispatcherBackend
+
+    backend = LocalDispatcherBackend(isolated_config)
+    backend._ensure_store()
+    try:
+        backend.store.set_meta(META_RESERVE_RAM, "not-a-number")
+        live = read_reserve(backend.store, isolated_config)
+        assert live.ram_mib == isolated_config.resources.reserve_ram_gb * 1024.0
+    finally:
+        backend.close()

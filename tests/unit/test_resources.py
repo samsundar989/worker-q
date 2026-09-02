@@ -15,6 +15,7 @@ from workerq.config import Config, CoreConfig, ResourcesConfig
 from workerq.gpu import GpuDevice, GpuInfo
 from workerq.resources import (
     Decision,
+    Reserve,
     ResourceRequest,
     admit,
     capacity,
@@ -300,3 +301,78 @@ def test_describe_capacity_shape(tmp_path):
 def test_decision_is_falsey_when_refused(tmp_path):
     decision = Decision(False, "nope")
     assert not decision
+
+
+# --------------------------------------------------------------------------
+# The live reserve: reclaiming the machine without stopping the queue
+# --------------------------------------------------------------------------
+
+
+def test_reserve_defaults_to_the_configured_value(tmp_path):
+    config = make_config(tmp_path, reserve_ram_gb=8.0, reserve_vram_gb=1.0, reserve_cpus=2)
+    reserve = Reserve.from_config(config)
+    assert reserve.ram_mib == 8.0 * GIB
+    assert reserve.vram_mib == 1.0 * GIB
+    assert reserve.cpus == 2
+    assert reserve.label is None
+
+
+def test_a_bigger_reserve_shrinks_what_jobs_may_use(tmp_path):
+    config = make_config(tmp_path)
+    gaming = Reserve(ram_mib=24 * GIB, vram_mib=22 * GIB, cpus=8, label="gaming")
+    default_cap = capacity(config, gpu=gpu(), mem=mem())
+    gaming_cap = capacity(config, gpu=gpu(), mem=mem(), reserve=gaming)
+    assert gaming_cap.usable_ram_mib < default_cap.usable_ram_mib
+    assert gaming_cap.usable_vram_mib < default_cap.usable_vram_mib
+    assert gaming_cap.usable_cpus < default_cap.usable_cpus
+    # Totals are a property of the machine and must not move.
+    assert gaming_cap.total_ram_mib == default_cap.total_ram_mib
+
+
+def test_reserving_vram_blocks_a_gpu_job_that_previously_fitted(tmp_path):
+    """The point of the feature: claim the GPU back and heavy work waits."""
+    config = make_config(tmp_path)
+    request = ResourceRequest(ram_mib=8 * GIB, vram_mib=20 * GIB, cpus=2)
+    assert admit(config, request, [], gpu=gpu(), mem=mem()).admit
+    gaming = Reserve(ram_mib=24 * GIB, vram_mib=22 * GIB, cpus=8, label="gaming")
+    decision = admit(config, request, [], gpu=gpu(), mem=mem(), reserve=gaming)
+    assert not decision.admit
+
+
+def test_a_blocked_job_says_the_reserve_is_why(tmp_path):
+    """Otherwise the only symptom is "nothing starts" with no way to find out."""
+    config = make_config(tmp_path)
+    gaming = Reserve(ram_mib=24 * GIB, vram_mib=22 * GIB, cpus=8, label="gaming")
+    request = ResourceRequest(ram_mib=8 * GIB, vram_mib=20 * GIB, cpus=2)
+    decision = admit(config, request, [], gpu=gpu(), mem=mem(), reserve=gaming)
+    assert decision.reason is not None
+    assert "gaming" in decision.reason
+    assert decision.detail["reserve"]["label"] == "gaming"
+
+
+def test_small_work_still_runs_while_the_reserve_is_held(tmp_path):
+    """Reclaiming the machine throttles the queue; it must not stop it."""
+    config = make_config(tmp_path)
+    gaming = Reserve(ram_mib=24 * GIB, vram_mib=22 * GIB, cpus=8, label="gaming")
+    small = ResourceRequest(ram_mib=4 * GIB, vram_mib=0.0, cpus=2)
+    assert admit(config, small, [], gpu=gpu(), mem=mem(), reserve=gaming).admit
+
+
+def test_an_unlabelled_reserve_adds_no_note(tmp_path):
+    config = make_config(tmp_path)
+    quiet = Reserve(ram_mib=60 * GIB, vram_mib=1 * GIB, cpus=2)
+    decision = admit(
+        config, ResourceRequest(ram_mib=8 * GIB), [], gpu=gpu(), mem=mem(), reserve=quiet
+    )
+    assert not decision.admit
+    assert "held back by reserve" not in (decision.reason or "")
+
+
+def test_expiry_is_only_reached_once_the_deadline_passes():
+    from datetime import datetime, timedelta, timezone
+
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    assert not Reserve(ram_mib=0, vram_mib=0, cpus=0).is_expired
+    assert not Reserve(ram_mib=0, vram_mib=0, cpus=0, expires_at=future).is_expired
+    assert Reserve(ram_mib=0, vram_mib=0, cpus=0, expires_at=past).is_expired

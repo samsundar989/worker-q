@@ -37,6 +37,7 @@ from workerq.telemetry import (
     EVENT_DAEMON,
     EVENT_FINISHED,
     EVENT_PREEMPTED,
+    EVENT_RESERVE,
     EVENT_STARTED,
     open_telemetry,
 )
@@ -53,6 +54,13 @@ from workerq.winproc import (
 # meta keys
 META_SLOTS = "slots"
 META_GPU_FREE_PERC = "gpu_free_perc"
+#: Live reserve. Set through `workerq reserve` and re-read every tick, so the
+#: owner can reclaim the machine without restarting the daemon.
+META_RESERVE_RAM = "reserve_ram_mib"
+META_RESERVE_VRAM = "reserve_vram_mib"
+META_RESERVE_CPUS = "reserve_cpus"
+META_RESERVE_LABEL = "reserve_label"
+META_RESERVE_EXPIRES = "reserve_expires_at"
 META_LOGDIR = "logdir"
 META_DAEMON_PID = "daemon_pid"
 META_DAEMON_PID_CREATION = "daemon_pid_creation"
@@ -61,6 +69,41 @@ META_STARTED_AT = "daemon_started_at"
 META_SHUTDOWN = "shutdown_requested"
 META_VERSION = "daemon_version"
 META_INTERPRETER = "interpreter"
+
+def read_reserve(store: Any, config: Config) -> res.Reserve:
+    """The live reserve, falling back to config for anything unset."""
+    base = res.Reserve.from_config(config)
+
+    def _num(key: str, fallback: float) -> float:
+        raw = store.get_meta(key, "")
+        if raw in (None, ""):
+            return fallback
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return fallback
+
+    label = store.get_meta(META_RESERVE_LABEL, "") or None
+    expires = store.get_meta(META_RESERVE_EXPIRES, "") or None
+    return res.Reserve(
+        ram_mib=_num(META_RESERVE_RAM, base.ram_mib),
+        vram_mib=_num(META_RESERVE_VRAM, base.vram_mib),
+        cpus=int(_num(META_RESERVE_CPUS, base.cpus)),
+        label=label,
+        expires_at=expires,
+    )
+
+
+def clear_reserve(store: Any) -> None:
+    for key in (
+        META_RESERVE_RAM,
+        META_RESERVE_VRAM,
+        META_RESERVE_CPUS,
+        META_RESERVE_LABEL,
+        META_RESERVE_EXPIRES,
+    ):
+        store.set_meta(key, "")
+
 
 _GPU_CACHE_SECONDS = 3.0
 _SAMPLE_INTERVAL_SECONDS = 10.0
@@ -207,6 +250,24 @@ class Dispatcher:
             gpu_count=int(row.get("gpu_count") or 0),
         )
 
+    def _reserve(self) -> res.Reserve:
+        """The reserve in force this tick.
+
+        Read fresh every time rather than cached at startup: the whole point
+        is that `workerq reserve` takes effect while the daemon keeps running.
+        An expired reserve is cleared here, so a temporary claim can never
+        become a permanent one nobody remembers making.
+        """
+        reserve = read_reserve(self.store, self.config)
+        if reserve.expires_at and reserve.is_expired:
+            self.log(f"reserve '{reserve.label or 'custom'}' expired; restoring configured value")
+            clear_reserve(self.store)
+            self.telemetry.event(
+                EVENT_RESERVE, detail=f"reserve '{reserve.label or 'custom'}' expired"
+            )
+            return res.Reserve.from_config(self.config)
+        return reserve
+
     def _running_requests(self) -> list[res.ResourceRequest]:
         """Reservations held by everything currently executing."""
         requests: list[res.ResourceRequest] = []
@@ -223,6 +284,7 @@ class Dispatcher:
             self._running_requests(),
             gpu=self._gpu_info(),
             mem=host.memory(),
+            reserve=self._reserve(),
         )
 
     def _note_blocked(self, backend_id: int, reason: str) -> None:
@@ -312,7 +374,12 @@ class Dispatcher:
             ]
             frees_a_slot = (in_flight - len(chosen)) < slots
             fits = res.admit(
-                self.config, want, remaining, gpu=self._gpu_info(), mem=host.memory()
+                self.config,
+                want,
+                remaining,
+                gpu=self._gpu_info(),
+                mem=host.memory(),
+                reserve=self._reserve(),
             ).admit
             if frees_a_slot and fits:
                 break

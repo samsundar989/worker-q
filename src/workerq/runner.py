@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from workerq import __version__
+from workerq import host
 from workerq.config import Config, load_config
 from workerq.db import Database
 from workerq.gpu import query_gpus
@@ -33,6 +34,10 @@ from workerq.winproc import ProcessGroup, child_creationflags, posix_child_kwarg
 
 _CANCEL_POLL_SECONDS = 0.5
 _PROGRESS_POLL_SECONDS = 3.0
+#: Usage sampling shells out to tasklist/nvidia-smi, so it is deliberately
+#: slower than progress polling. Peaks over minutes-to-hours jobs do not need
+#: fine resolution; not perturbing the job does.
+_USAGE_POLL_SECONDS = 15.0
 
 
 class RunnerError(RuntimeError):
@@ -334,12 +339,61 @@ def run_job(
                 group.terminate()
                 return
 
+    def _watch_usage() -> None:
+        """Record what the job actually uses, so declarations can be checked.
+
+        Admission control is only as good as the numbers jobs declare, and
+        nothing until now measured whether those were remotely right. Peaks
+        are attributed over the whole process tree, because the real work is
+        usually a grandchild of the process launched here.
+
+        Like the progress watcher this is a nicety: it uses its own sqlite
+        connection and must never disturb the job it is measuring.
+        """
+        from workerq import gpu as gpu_mod
+
+        roots = {os.getpid(), proc.pid}
+        on_gpu = bool(os.environ.get("CUDA_VISIBLE_DEVICES"))
+        usage_db = Database(config.db_path)
+        peak_ram: float | None = None
+        peak_vram: float | None = None
+        samples = 0
+        try:
+            while not stop_watch.wait(_USAGE_POLL_SECONDS):
+                try:
+                    pids = host.descendants_of(roots)
+                    ram = host.tree_memory_mib(roots)
+                    vram = None
+                    if on_gpu:
+                        vram = gpu_mod.tree_vram_mib(gpu_mod.query_gpus(), pids)
+                    if ram is None and vram is None:
+                        continue
+                    if ram is not None:
+                        peak_ram = ram if peak_ram is None else max(peak_ram, ram)
+                    if vram is not None:
+                        peak_vram = vram if peak_vram is None else max(peak_vram, vram)
+                    samples += 1
+                    usage_db.update_job(
+                        job_id,
+                        peak_ram_mib=peak_ram,
+                        peak_vram_mib=peak_vram,
+                        usage_samples=samples,
+                    )
+                except Exception:
+                    pass  # never let measurement take the job down
+        finally:
+            usage_db.close()
+
     watcher = threading.Thread(target=_watch_cancel, name="workerq-stop-watch", daemon=True)
     watcher.start()
     progress_watcher = threading.Thread(
         target=_watch_progress, name="workerq-progress-watch", daemon=True
     )
     progress_watcher.start()
+    usage_watcher = threading.Thread(
+        target=_watch_usage, name="workerq-usage-watch", daemon=True
+    )
+    usage_watcher.start()
 
     try:
         exit_code = proc.wait()
@@ -351,6 +405,7 @@ def run_job(
         stop_watch.set()
         watcher.join(timeout=2.0)
         progress_watcher.join(timeout=2.0)
+        usage_watcher.join(timeout=2.0)
         group.close()
 
     finished_at = utcnow_iso()

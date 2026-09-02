@@ -308,3 +308,62 @@ def foreign_pressure_report(service: GPUQService, *, hours: float = 6.0) -> dict
             {"name": name, "peak_gib": round(mib / 1024, 2)} for name, mib in ranked
         ],
     }
+
+
+def declared_vs_observed(service: GPUQService, *, limit: int = 200) -> dict[str, Any]:
+    """How close each job's declared footprint was to what it actually used.
+
+    Admission control hands out capacity against declarations, so a queue full
+    of jobs that ask for four times what they need packs four times worse than
+    it could. This is the evidence for correcting them - and for trusting the
+    ledger enough to run jobs in parallel at all.
+
+    Jobs sampled before observed-usage recording existed are skipped rather
+    than counted as zero.
+    """
+    rows: list[dict[str, Any]] = []
+    for job in service.db.list_jobs(limit=limit):
+        if not job.usage_samples:
+            continue
+        declared_ram = job.requested_ram_mib
+        declared_vram = job.requested_vram_mib
+        rows.append(
+            {
+                "id": job.id,
+                "project": job.project,
+                "command_signature": job.command_signature,
+                "declared_ram_mib": declared_ram,
+                "peak_ram_mib": job.peak_ram_mib,
+                "ram_ratio": (
+                    job.peak_ram_mib / declared_ram
+                    if declared_ram and job.peak_ram_mib is not None
+                    else None
+                ),
+                "declared_vram_mib": declared_vram,
+                "peak_vram_mib": job.peak_vram_mib,
+                "vram_ratio": (
+                    job.peak_vram_mib / declared_vram
+                    if declared_vram and job.peak_vram_mib is not None
+                    else None
+                ),
+                "samples": job.usage_samples,
+            }
+        )
+
+    ratios = [r["ram_ratio"] for r in rows if r["ram_ratio"] is not None]
+    ratios.sort()
+    median = ratios[len(ratios) // 2] if ratios else None
+    # Reclaimable headroom is what the ledger is holding back for RAM that the
+    # jobs demonstrably never touched.
+    waste = [
+        r["declared_ram_mib"] - r["peak_ram_mib"]
+        for r in rows
+        if r["declared_ram_mib"] and r["peak_ram_mib"] is not None
+    ]
+    return {
+        "jobs": rows,
+        "measured": len(rows),
+        "median_ram_ratio": median,
+        "mean_overdeclared_ram_mib": (sum(waste) / len(waste)) if waste else None,
+        "vram_measurable": any(r["peak_vram_mib"] is not None for r in rows),
+    }

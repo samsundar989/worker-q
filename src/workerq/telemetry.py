@@ -66,6 +66,7 @@ EVENT_BLOCKED = "job_blocked"
 EVENT_CANCEL = "job_cancel"
 EVENT_PREEMPTED = "job_preempted"
 EVENT_DAEMON = "daemon"
+EVENT_RESERVE = "reserve"
 EVENT_PRESSURE = "resource_pressure"
 
 _SAMPLE_COLUMNS = (

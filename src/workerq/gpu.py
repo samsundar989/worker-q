@@ -252,6 +252,27 @@ def foreign_processes(info: GpuInfo, *, own_pids: set[int] | None = None) -> lis
     return out
 
 
+def tree_vram_mib(info: GpuInfo, pids: set[int]) -> float | None:
+    """VRAM held across all devices by any of `pids`.
+
+    Returns None when no per-process figure was usable, which must not be
+    recorded as a measured zero. That is the common case on consumer cards in
+    WDDM mode: Windows owns VRAM allocation there, so `nvidia-smi` reports
+    `[N/A]` for every process and per-job VRAM simply cannot be attributed.
+    Callers must treat None as "unknown", never as "used nothing".
+    """
+    if not info.available or not pids:
+        return None
+    measured = False
+    total = 0.0
+    for device in info.devices:
+        for proc in device.processes:
+            if proc.pid in pids and proc.used_memory_mib is not None:
+                measured = True
+                total += proc.used_memory_mib
+    return total if measured else None
+
+
 def cuda_toolkit_version() -> str | None:
     """Version reported by `nvcc`, if a CUDA toolkit is installed."""
     exe = shutil.which("nvcc")

@@ -102,24 +102,79 @@ class Decision:
         return self.admit
 
 
+@dataclass(frozen=True)
+class Reserve:
+    """Headroom worker-q promises never to hand out.
+
+    Config supplies the standing value, but the machine's owner has to be able
+    to reclaim RAM, VRAM or CPU *now* - to play a game, join a call, or just
+    get the desktop back - without stopping the queue or restarting the
+    daemon. So the live value is kept in the dispatcher's meta table and read
+    every tick, the same way the slot count and GPU threshold already are.
+    """
+
+    ram_mib: float
+    vram_mib: float
+    cpus: int
+    #: Name of the preset that set this, for explaining a wait reason.
+    label: str | None = None
+    #: ISO timestamp after which the reserve reverts, or None to hold it.
+    expires_at: str | None = None
+
+    @classmethod
+    def from_config(cls, config: Config) -> Reserve:
+        r = config.resources
+        return cls(
+            ram_mib=r.reserve_ram_gb * _GIB_MIB,
+            vram_mib=r.reserve_vram_gb * _GIB_MIB,
+            cpus=r.reserve_cpus,
+        )
+
+    @property
+    def is_expired(self) -> bool:
+        if not self.expires_at:
+            return False
+        # Compared as instants, not via age_seconds(), which clamps at zero -
+        # that would report a deadline an hour away as already reached and
+        # release every timed reserve on the next tick.
+        from workerq.util import parse_iso, utcnow
+
+        deadline = parse_iso(self.expires_at)
+        return deadline is not None and utcnow() >= deadline
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ram_mib": self.ram_mib,
+            "vram_mib": self.vram_mib,
+            "cpus": self.cpus,
+            "label": self.label,
+            "expires_at": self.expires_at,
+        }
+
+
 def cpu_count() -> int:
     return os.cpu_count() or 1
 
 
-def capacity(config: Config, gpu: GpuInfo | None = None, mem: host.HostMemory | None = None) -> Capacity:
+def capacity(
+    config: Config,
+    gpu: GpuInfo | None = None,
+    mem: host.HostMemory | None = None,
+    reserve: Reserve | None = None,
+) -> Capacity:
     mem = mem or host.memory()
-    r = config.resources
+    reserve = reserve or Reserve.from_config(config)
 
     total_ram = mem.total_mib or 0.0
-    usable_ram = max(0.0, total_ram - r.reserve_ram_gb * _GIB_MIB)
+    usable_ram = max(0.0, total_ram - reserve.ram_mib)
 
     total_cpus = cpu_count()
-    usable_cpus = max(1, total_cpus - r.reserve_cpus)
+    usable_cpus = max(1, total_cpus - reserve.cpus)
 
     total_vram = 0.0
     if gpu is not None and gpu.available:
         total_vram = sum(d.memory_total_mib or 0.0 for d in gpu.devices)
-    usable_vram = max(0.0, total_vram - r.reserve_vram_gb * _GIB_MIB)
+    usable_vram = max(0.0, total_vram - reserve.vram_mib)
 
     return Capacity(
         total_ram_mib=total_ram,
@@ -151,6 +206,7 @@ def admit(
     *,
     gpu: GpuInfo | None = None,
     mem: host.HostMemory | None = None,
+    reserve: Reserve | None = None,
 ) -> Decision:
     """Can this request start right now?
 
@@ -163,8 +219,13 @@ def admit(
         return Decision(True, detail={"enforced": False})
 
     mem = mem or host.memory()
-    cap = capacity(config, gpu=gpu, mem=mem)
+    reserve = reserve or Reserve.from_config(config)
+    cap = capacity(config, gpu=gpu, mem=mem, reserve=reserve)
     reserved = sum_reservations(running)
+    # A non-default reserve is the owner reclaiming the machine. When that is
+    # why a job cannot start, the wait reason has to say so - otherwise the
+    # only symptom is "nothing is starting" with no way to find out why.
+    held = f" (held back by reserve '{reserve.label}')" if reserve.label else ""
 
     detail: dict[str, Any] = {
         "request": request.to_dict(),
@@ -174,6 +235,7 @@ def admit(
         "host_free_percent": mem.free_percent,
         "commit_percent": mem.commit_percent,
         "running_jobs": len(running),
+        "reserve": reserve.to_dict(),
     }
 
     # ---- hard stops -----------------------------------------------------
@@ -216,7 +278,8 @@ def admit(
             return Decision(
                 False,
                 f"needs {_gib(request.ram_mib)} RAM; {len(running)} running job(s) "
-                f"already reserve {_gib(reserved.ram_mib)} of {_gib(cap.usable_ram_mib)} usable",
+                f"already reserve {_gib(reserved.ram_mib)} of "
+                f"{_gib(cap.usable_ram_mib)} usable{held}",
                 detail,
             )
 
@@ -225,7 +288,7 @@ def admit(
         return Decision(
             False,
             f"needs {request.cpus} CPU(s); {reserved.cpus} of {cap.usable_cpus} "
-            f"usable are already reserved",
+            f"usable are already reserved{held}",
             detail,
         )
 
@@ -252,28 +315,36 @@ def admit(
             return Decision(
                 False,
                 f"needs {_gib(request.vram_mib)} VRAM; running job(s) reserve "
-                f"{_gib(reserved.vram_mib)} of {_gib(cap.usable_vram_mib)} usable",
+                f"{_gib(reserved.vram_mib)} of {_gib(cap.usable_vram_mib)} usable{held}",
                 detail,
             )
 
     return Decision(True, None, detail)
 
 
-def describe_capacity(config: Config) -> dict[str, Any]:
-    """Human/machine summary for `workerq resources` and the dashboard."""
+def describe_capacity(config: Config, reserve: Reserve | None = None) -> dict[str, Any]:
+    """Human/machine summary for `workerq resources` and the dashboard.
+
+    Pass the live reserve so this reflects what is actually enforced; without
+    it the report shows the configured value while the dispatcher is using
+    something else.
+    """
     from workerq.gpu import query_gpus
 
     mem = host.memory()
+    reserve = reserve or Reserve.from_config(config)
     gpu = query_gpus(include_processes=False)
-    cap = capacity(config, gpu=gpu, mem=mem)
+    cap = capacity(config, gpu=gpu, mem=mem, reserve=reserve)
     return {
         "enforced": config.resources.enforce,
         "capacity": cap.to_dict(),
         "host": mem.to_dict(),
         "reserve": {
-            "ram_gb": config.resources.reserve_ram_gb,
-            "vram_gb": config.resources.reserve_vram_gb,
-            "cpus": config.resources.reserve_cpus,
+            "ram_gb": reserve.ram_mib / _GIB_MIB,
+            "vram_gb": reserve.vram_mib / _GIB_MIB,
+            "cpus": reserve.cpus,
+            "label": reserve.label,
+            "expires_at": reserve.expires_at,
         },
         "limits": {
             "max_commit_percent": config.resources.max_commit_percent,

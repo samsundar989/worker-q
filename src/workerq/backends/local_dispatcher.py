@@ -19,6 +19,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from workerq import BACKEND_NAME, BACKEND_VERSION
+from workerq import resources as res
 from workerq.backends.base import (
     BACKEND_MISSING,
     BACKEND_QUEUED,
@@ -232,6 +233,30 @@ class LocalDispatcherBackend:
         return self.store.get_meta_int(
             dispatcher_mod.META_SLOTS, self.config.core.max_concurrent_jobs
         )
+
+    def set_reserve(self, reserve: "res.Reserve | None") -> None:
+        """Set or clear the live reserve. None restores the configured value."""
+        self._ensure_store()
+        if reserve is None:
+            for key in (
+                dispatcher_mod.META_RESERVE_RAM,
+                dispatcher_mod.META_RESERVE_VRAM,
+                dispatcher_mod.META_RESERVE_CPUS,
+                dispatcher_mod.META_RESERVE_LABEL,
+                dispatcher_mod.META_RESERVE_EXPIRES,
+            ):
+                self.store.set_meta(key, "")
+            return
+        self.store.set_meta(dispatcher_mod.META_RESERVE_RAM, reserve.ram_mib)
+        self.store.set_meta(dispatcher_mod.META_RESERVE_VRAM, reserve.vram_mib)
+        self.store.set_meta(dispatcher_mod.META_RESERVE_CPUS, int(reserve.cpus))
+        self.store.set_meta(dispatcher_mod.META_RESERVE_LABEL, reserve.label or "")
+        self.store.set_meta(dispatcher_mod.META_RESERVE_EXPIRES, reserve.expires_at or "")
+
+    def get_reserve(self) -> "res.Reserve":
+        """The reserve in force right now, falling back to config."""
+        self._ensure_store()
+        return dispatcher_mod.read_reserve(self.store, self.config)
 
     def set_gpu_free_percent(self, percent: int) -> None:
         if not 0 <= percent <= 100:

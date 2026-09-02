@@ -1330,14 +1330,220 @@ def priority(
 
 
 @app.command()
+def reserve(
+    ram: float = typer.Option(None, "--ram", help="GiB of RAM to hold back for you."),
+    vram: float = typer.Option(None, "--vram", help="GiB of VRAM to hold back for you."),
+    cpus: int = typer.Option(None, "--cpus", help="CPU cores to hold back for you."),
+    label: str = typer.Option(None, "--label", help="Name this claim, e.g. 'gaming'."),
+    for_: str = typer.Option(
+        None, "--for", help="Release automatically after this long, e.g. 2h."
+    ),
+    clear: bool = typer.Option(False, "--clear", help="Give the headroom back to the queue."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Hold RAM, VRAM or CPU back from the queue, effective immediately.
+
+    For when you want the machine back - to play a game, join a call - without
+    stopping the queue or restarting the dispatcher. Jobs already running are
+    not touched; the new limit applies to what starts next.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from workerq.util import parse_duration
+
+    service = get_service()
+    service.ensure_ready()
+
+    if clear:
+        if any(v is not None for v in (ram, vram, cpus)):
+            service.close()
+            fail("--clear takes no other values; it restores the configured reserve")
+            return
+        data = service.clear_reserve()
+        if json_output:
+            emit_json(data)
+        else:
+            cap = data["capacity"]
+            console.print(
+                "Reserve cleared. Jobs may now use "
+                f"{cap['usable_ram_mib'] / 1024:.1f} GiB RAM / "
+                f"{cap['usable_vram_mib'] / 1024:.1f} GiB VRAM / {cap['usable_cpus']} CPU."
+            )
+        service.close()
+        return
+
+    if all(v is None for v in (ram, vram, cpus)):
+        data = service.get_reserve()
+        if json_output:
+            emit_json(data)
+            service.close()
+            return
+        res_data, cap = data["reserve"], data["capacity"]
+        origin = "configured default" if data["is_default"] else "set by you"
+        name = f" '{res_data['label']}'" if res_data.get("label") else ""
+        console.print(f"[bold]Held back for you{name}:[/bold] ({origin})")
+        console.print(
+            f"  RAM {res_data['ram_mib'] / 1024:.1f} GiB   "
+            f"VRAM {res_data['vram_mib'] / 1024:.1f} GiB   CPU {res_data['cpus']}"
+        )
+        if res_data.get("expires_at"):
+            console.print(f"  releases at {res_data['expires_at']}")
+        console.print("\n[bold]Left for jobs:[/bold]")
+        console.print(
+            f"  RAM {cap['usable_ram_mib'] / 1024:.1f} GiB   "
+            f"VRAM {cap['usable_vram_mib'] / 1024:.1f} GiB   CPU {cap['usable_cpus']}"
+        )
+        console.print(
+            f"\n[dim]A GPU job also needs the device {data['gpu_free_threshold_percent']}% free; "
+            f"reserving VRAM alone does not change that threshold.[/dim]"
+        )
+        console.print("[dim]Claim: workerq reserve --ram 24 --vram 22 --cpus 8[/dim]")
+        service.close()
+        return
+
+    expires_at = None
+    if for_:
+        try:
+            delta: timedelta = parse_duration(for_)
+        except ValueError as exc:
+            service.close()
+            fail(str(exc))
+            return
+        expires_at = (datetime.now(timezone.utc) + delta).isoformat()
+
+    try:
+        data = service.set_reserve(
+            ram_gb=ram, vram_gb=vram, cpus=cpus, label=label, expires_at=expires_at
+        )
+    except GPUQError as exc:
+        service.close()
+        fail(str(exc))
+        return
+
+    if json_output:
+        emit_json(data)
+        service.close()
+        return
+
+    res_data, cap = data["reserve"], data["capacity"]
+    name = f" ({res_data['label']})" if res_data.get("label") else ""
+    console.print(
+        f"[bold]Reserved{name}:[/bold] {res_data['ram_mib'] / 1024:.1f} GiB RAM / "
+        f"{res_data['vram_mib'] / 1024:.1f} GiB VRAM / {res_data['cpus']} CPU"
+    )
+    if expires_at:
+        console.print(f"Releases automatically after {for_}.")
+    console.print(
+        f"Jobs may now use {cap['usable_ram_mib'] / 1024:.1f} GiB RAM / "
+        f"{cap['usable_vram_mib'] / 1024:.1f} GiB VRAM / {cap['usable_cpus']} CPU."
+    )
+
+    # Running work is not displaced; say so rather than let it be discovered.
+    if data["running"]:
+        console.print(
+            f"\n[yellow]{len(data['running'])} job(s) already running will finish first:[/yellow]"
+        )
+        for job in data["running"]:
+            tag = "preemptible" if job["preemptible"] else "not preemptible"
+            console.print(
+                f"  #{job['id']} {job['project']}  "
+                f"{(job['ram_mib'] or 0) / 1024:.1f} GiB RAM  [dim]{tag}[/dim]"
+            )
+    if data["stranded"]:
+        console.print(
+            f"\n[red]{len(data['stranded'])} queued job(s) can no longer ever start:[/red]"
+        )
+        for job in data["stranded"]:
+            console.print(f"  #{job['id']} {job['project']}  {job['why']}")
+        console.print("[dim]Give the headroom back with: workerq reserve --clear[/dim]")
+    service.close()
+
+
+def _render_usage_accuracy(service: GPUQService, *, json_output: bool) -> None:
+    """`workerq resources --verify` - declared footprint versus measured peak."""
+    from workerq.report import declared_vs_observed
+
+    service.ensure_ready()
+    data = declared_vs_observed(service)
+    if json_output:
+        emit_json(data)
+        return
+
+    if not data["measured"]:
+        console.print(
+            "No job has been measured yet. Usage is sampled while a job runs, so "
+            "this fills in as jobs complete."
+        )
+        return
+
+    table = Table(box=None, pad_edge=False)
+    table.add_column("ID", justify="right")
+    table.add_column("PROJECT")
+    table.add_column("RAM DECL", justify="right")
+    table.add_column("RAM PEAK", justify="right")
+    table.add_column("USED", justify="right")
+    table.add_column("VRAM DECL", justify="right")
+    table.add_column("VRAM PEAK", justify="right")
+
+    def _gib(value: float | None) -> str:
+        return f"{value / 1024:.1f}" if value is not None else "-"
+
+    for row in data["jobs"][:40]:
+        ratio = row["ram_ratio"]
+        if ratio is None:
+            used = "-"
+        else:
+            # Under-declaring is the dangerous direction: the ledger hands out
+            # capacity the job then exceeds.
+            style = "red" if ratio > 1.0 else ("yellow" if ratio < 0.4 else "green")
+            used = f"[{style}]{ratio:.0%}[/{style}]"
+        table.add_row(
+            str(row["id"]),
+            row["project"],
+            _gib(row["declared_ram_mib"]),
+            _gib(row["peak_ram_mib"]),
+            used,
+            _gib(row["declared_vram_mib"]),
+            _gib(row["peak_vram_mib"]),
+        )
+
+    console.print(table)
+    median = data["median_ram_ratio"]
+    if median is not None:
+        console.print(
+            f"\nMedian job uses [bold]{median:.0%}[/bold] of the RAM it declares "
+            f"across {data['measured']} measured job(s)."
+        )
+    waste = data["mean_overdeclared_ram_mib"]
+    if waste and waste > 0:
+        console.print(
+            f"[dim]On average {waste / 1024:.1f} GiB per job is reserved but never "
+            f"touched. That headroom is what stops other jobs starting.[/dim]"
+        )
+    if not data["vram_measurable"]:
+        console.print(
+            "[dim]Per-process VRAM is not reportable on this GPU (consumer cards in "
+            "WDDM mode report N/A), so VRAM peaks stay blank and declared VRAM "
+            "cannot be checked automatically.[/dim]"
+        )
+
+
+@app.command()
 def resources(
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+    verify: bool = typer.Option(
+        False, "--verify", help="Compare what jobs declared against what they used."
+    ),
 ) -> None:
     """Show capacity, headroom and the limits admission control enforces."""
     from workerq.resources import describe_capacity
 
     service = get_service()
-    data = describe_capacity(service.config)
+    if verify:
+        _render_usage_accuracy(service, json_output=json_output)
+        service.close()
+        return
+    data = describe_capacity(service.config, service.backend.get_reserve())
     if json_output:
         emit_json(data)
         service.close()
@@ -1363,11 +1569,17 @@ def resources(
         f"(hard stop at {data['limits']['max_commit_percent']}%)"
     )
     console.print()
+    label = data["reserve"].get("label")
+    who = f"Held back by you as '{label}'" if label else "Reserved for the OS and your editors"
     console.print(
-        f"[dim]Reserved for the OS and your editors: "
+        f"[dim]{who}: "
         f"{data['reserve']['ram_gb']:.0f} GiB RAM, {data['reserve']['cpus']} CPU, "
-        f"{data['reserve']['vram_gb']:.0f} GiB VRAM[/dim]"
+        f"{data['reserve']['vram_gb']:.0f} GiB VRAM"
+        + (f" (until {data['reserve']['expires_at']})" if data["reserve"].get("expires_at") else "")
+        + "[/dim]"
     )
+    if label:
+        console.print("[dim]Give it back with: workerq reserve --clear[/dim]")
     console.print(
         f"[dim]Jobs that declare nothing are charged "
         f"{data['defaults']['ram_gb']:.0f} GiB RAM / {data['defaults']['cpus']} CPU. "

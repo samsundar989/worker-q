@@ -147,9 +147,31 @@ def top_processes(limit: int = 8, *, ttl: float = _TOP_TTL) -> list[ProcessMemor
     Uses a subprocess, so results are cached briefly - a 1 Hz dashboard must
     not shell out on every frame.
     """
+    return all_processes(ttl=ttl)[:limit]
+
+
+def tree_memory_mib(roots: set[int], *, ttl: float = _TOP_TTL) -> float | None:
+    """Host memory held by `roots` and everything descended from them.
+
+    This is how a job's real footprint is attributed: the work is usually a
+    grandchild of the process worker-q launched, so summing the tree is the
+    only honest measure. Returns None when the process table could not be
+    read, which must not be confused with a tree that uses nothing.
+    """
+    processes = all_processes(ttl=ttl)
+    if not processes:
+        return None
+    pids = descendants_of(roots)
+    if not pids:
+        return None
+    return sum(p.memory_mib for p in processes if p.pid in pids)
+
+
+def all_processes(*, ttl: float = _TOP_TTL) -> list[ProcessMemory]:
+    """Every process with its host memory, largest first. Cached briefly."""
     now = time.monotonic()
     if _TOP_CACHE.value and now - _TOP_CACHE.at < ttl:
-        return _TOP_CACHE.value[:limit]
+        return _TOP_CACHE.value
 
     processes: list[ProcessMemory] = []
     if IS_WINDOWS:
@@ -182,7 +204,7 @@ def top_processes(limit: int = 8, *, ttl: float = _TOP_TTL) -> list[ProcessMemor
                         )
                     )
         except Exception:
-            return _TOP_CACHE.value[:limit]
+            return _TOP_CACHE.value
     else:  # pragma: no cover - POSIX
         try:
             proc = subprocess.run(
@@ -204,12 +226,12 @@ def top_processes(limit: int = 8, *, ttl: float = _TOP_TTL) -> list[ProcessMemor
                     )
                 )
         except Exception:
-            return _TOP_CACHE.value[:limit]
+            return _TOP_CACHE.value
 
     processes.sort(key=lambda p: p.memory_mib, reverse=True)
     _TOP_CACHE.at = now
     _TOP_CACHE.value = processes
-    return processes[:limit]
+    return processes
 
 
 _TREE_CACHE = _Cache()

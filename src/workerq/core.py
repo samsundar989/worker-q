@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from workerq import BACKEND_NAME, __version__
+from workerq import host
 from workerq.backends.base import (
     BACKEND_FINISHED,
     BACKEND_MISSING,
@@ -999,6 +1000,119 @@ class GPUQService:
             "queue_position": self._queue_position(job.id),
             "message": f"job #{job.id} moved to the front of the queue",
         }
+
+    def get_reserve(self) -> dict[str, Any]:
+        """The reserve in force, plus what it leaves for jobs."""
+        from workerq.gpu import query_gpus
+        from workerq.resources import Reserve, capacity
+
+        reserve = self.backend.get_reserve()
+        configured = Reserve.from_config(self.config)
+        gpu = query_gpus(include_processes=False)
+        cap = capacity(self.config, gpu=gpu, mem=host.memory(), reserve=reserve)
+        return {
+            "reserve": reserve.to_dict(),
+            "configured": configured.to_dict(),
+            "is_default": (
+                reserve.ram_mib == configured.ram_mib
+                and reserve.vram_mib == configured.vram_mib
+                and reserve.cpus == configured.cpus
+            ),
+            "capacity": cap.to_dict(),
+            "gpu_free_threshold_percent": self.backend.get_gpu_free_percent(),
+        }
+
+    def set_reserve(
+        self,
+        *,
+        ram_gb: float | None = None,
+        vram_gb: float | None = None,
+        cpus: int | None = None,
+        label: str | None = None,
+        expires_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Claim headroom back from the queue, effective on the next tick.
+
+        Anything not named keeps its configured value, so reclaiming RAM does
+        not silently hand out the CPUs as well.
+        """
+        from workerq.gpu import query_gpus
+        from workerq.resources import Reserve, capacity, cpu_count
+
+        base = Reserve.from_config(self.config)
+        gib = 1024.0
+        reserve = Reserve(
+            ram_mib=base.ram_mib if ram_gb is None else float(ram_gb) * gib,
+            vram_mib=base.vram_mib if vram_gb is None else float(vram_gb) * gib,
+            cpus=base.cpus if cpus is None else int(cpus),
+            label=label,
+            expires_at=expires_at,
+        )
+
+        # A reserve at or beyond the machine's size stops the queue forever.
+        # Refuse it rather than clamp it: silently doing something other than
+        # what was asked is worse than saying no.
+        mem = host.memory()
+        total_ram = mem.total_mib or 0.0
+        gpu = query_gpus(include_processes=False)
+        total_vram = sum(d.memory_total_mib or 0.0 for d in gpu.devices) if gpu.available else 0.0
+        total_cpus = cpu_count()
+        if total_ram and reserve.ram_mib >= total_ram:
+            raise GPUQError(
+                f"reserving {reserve.ram_mib / gib:.1f} GiB RAM leaves nothing of the "
+                f"machine's {total_ram / gib:.1f} GiB; nothing would ever start"
+            )
+        if total_vram and reserve.vram_mib >= total_vram:
+            raise GPUQError(
+                f"reserving {reserve.vram_mib / gib:.1f} GiB VRAM leaves nothing of the "
+                f"machine's {total_vram / gib:.1f} GiB; no GPU job would ever start"
+            )
+        if reserve.cpus >= total_cpus:
+            raise GPUQError(
+                f"reserving {reserve.cpus} CPUs leaves nothing of the machine's "
+                f"{total_cpus}; nothing would ever start"
+            )
+
+        self.backend.set_reserve(reserve)
+        cap = capacity(self.config, gpu=gpu, mem=mem, reserve=reserve)
+
+        # Report honestly: running work is not touched, and a tighter reserve
+        # can make queued jobs impossible. Both are things the caller has to
+        # be told rather than discover.
+        holding: list[dict[str, Any]] = []
+        for job in self.db.list_jobs(states=[JobState.RUNNING.value]):
+            holding.append(
+                {
+                    "id": job.id,
+                    "project": job.project,
+                    "ram_mib": job.requested_ram_mib,
+                    "vram_mib": job.requested_vram_mib,
+                    "preemptible": bool(job.preemptible),
+                }
+            )
+        stranded: list[dict[str, Any]] = []
+        for job in self.db.list_jobs(states=[JobState.QUEUED.value]):
+            reasons = []
+            if (job.requested_ram_mib or 0) > cap.usable_ram_mib:
+                reasons.append(f"needs {(job.requested_ram_mib or 0) / gib:.1f} GiB RAM")
+            if (job.requested_vram_mib or 0) > cap.usable_vram_mib:
+                reasons.append(f"needs {(job.requested_vram_mib or 0) / gib:.1f} GiB VRAM")
+            if (job.requested_cpus or 0) > cap.usable_cpus:
+                reasons.append(f"needs {job.requested_cpus} CPUs")
+            if reasons:
+                stranded.append({"id": job.id, "project": job.project, "why": "; ".join(reasons)})
+
+        return {
+            "reserve": reserve.to_dict(),
+            "capacity": cap.to_dict(),
+            "running": holding,
+            "stranded": stranded,
+        }
+
+    def clear_reserve(self) -> dict[str, Any]:
+        """Give the queue back the headroom, restoring the configured reserve."""
+        self.backend.set_reserve(None)
+        return self.get_reserve()
 
     def set_concurrency(self, count: int) -> dict[str, Any]:
         if count < 1:

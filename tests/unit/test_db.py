@@ -282,3 +282,29 @@ def test_upgrade_from_v1_preserves_rows(tmp_path: Path):
     job = upgraded.get_job(job_id)
     assert job is not None and job.requested_ram_mib is None
     upgraded.close()
+
+
+def test_migration_adds_usage_columns(db: Database):
+    """v6 adds observed-usage columns alongside the declared ones."""
+    columns = {row["name"] for row in db.conn.execute("PRAGMA table_info(jobs)")}
+    assert {"peak_ram_mib", "peak_vram_mib", "usage_samples"} <= columns
+
+
+def test_unmeasured_usage_is_null_not_zero(db: Database):
+    """A job that was never sampled must not read as having used nothing."""
+    job = db.get_job(_insert(db))
+    assert job.peak_ram_mib is None
+    assert job.peak_vram_mib is None
+    assert job.usage_samples == 0
+
+
+def test_observed_usage_roundtrip(db: Database):
+    job_id = _insert(db, requested_ram_mib=16384.0)
+    db.update_job(job_id, peak_ram_mib=5120.0, peak_vram_mib=2048.0, usage_samples=7)
+    job = db.get_job(job_id)
+    assert job.peak_ram_mib == 5120.0
+    assert job.peak_vram_mib == 2048.0
+    assert job.usage_samples == 7
+    # The declaration is kept untouched next to it, which is the whole point:
+    # the pair is what makes over-declaration visible.
+    assert job.requested_ram_mib == 16384.0

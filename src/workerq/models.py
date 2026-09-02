@@ -176,6 +176,11 @@ class Job:
     progress_fraction: float | None = None
     progress_note: str | None = None
     progress_updated_at: str | None = None
+    #: Observed peaks, sampled while the job ran. None means never measured,
+    #: which must not be read as "used nothing".
+    peak_ram_mib: float | None = None
+    peak_vram_mib: float | None = None
+    usage_samples: int = 0
     passthrough_json: str | None = None
     env_json: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
@@ -263,6 +268,9 @@ class Job:
             "progress_fraction": self.progress_fraction,
             "progress_note": self.progress_note,
             "progress_updated_at": self.progress_updated_at,
+            "peak_ram_mib": self.peak_ram_mib,
+            "peak_vram_mib": self.peak_vram_mib,
+            "usage_samples": self.usage_samples,
             "gpu_mode": self.gpu_mode,
             "snapshot_mode": self.snapshot_mode,
             "snapshot_commit": self.snapshot_commit,
