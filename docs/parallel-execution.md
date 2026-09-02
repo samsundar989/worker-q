@@ -449,7 +449,7 @@ the next tick with no restart; `config.resources` changes do not.
 | `dashboard.py:239-255` | pressure panel cannot map a PID back to a job |
 | `dashboard.py:150` | commit red-line hardcoded to 88, ignores config |
 | `eta.py:256` | forecast uses *config* slots while status shows *backend* slots |
-| `eta.py:285-318` | forecast ignores admission entirely — can show "starts ~0s" next to a wait reason explaining it cannot start |
+| `eta.py:285-318` | ~~forecast ignores admission~~ — fixed: a job with a recorded wait reason reports an unknown start rather than "starts ~0s" |
 | `cli.py:411-419` | no RAM/VRAM/CPU or assigned-device column anywhere in `status` |
 
 **Docs.** README lines 10-11, 31-33, 60-61, 71, 391-393, 494-495, 513, 523,

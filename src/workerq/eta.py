@@ -245,6 +245,19 @@ def estimate_job(service: GPUQService, job: Job) -> Estimate:
     return UNKNOWN
 
 
+def _is_blocked(service: GPUQService, job: Job) -> bool:
+    """Has the dispatcher recorded a reason this job cannot start?
+
+    A wait reason is only written when admission or placement actually refused
+    the job, so its presence means "tried and could not", not "has not been
+    looked at yet".
+    """
+    try:
+        return bool(service.queue_wait_reason(job))
+    except Exception:
+        return False
+
+
 def forecast_queue(service: GPUQService, jobs: list[Job]) -> dict[int, dict[str, Any]]:
     """Estimated start and finish for everything not yet finished.
 
@@ -300,6 +313,13 @@ def forecast_queue(service: GPUQService, jobs: list[Job]) -> dict[int, dict[str,
             index, starts_in = min(known, key=lambda pair: pair[1])
         else:
             index, starts_in = 0, None
+
+        # A free slot is not the same as an admissible job. When the dispatcher
+        # has recorded why this one cannot start, the honest answer is that we
+        # do not know when it will - reporting "starts ~0s" beside a reason
+        # saying it cannot start is worse than saying nothing.
+        if starts_in is not None and starts_in <= 0 and _is_blocked(service, job):
+            starts_in = None
 
         finish_in = (
             None

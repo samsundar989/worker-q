@@ -394,3 +394,29 @@ def test_migration_backfills_signatures_for_existing_jobs(service: GPUQService):
         "SELECT command_signature FROM jobs WHERE id = ?", (job.id,)
     ).fetchone()["command_signature"]
     assert stored == command_signature(argv)
+
+
+def test_a_blocked_job_does_not_claim_it_starts_immediately(service: GPUQService):
+    """"starts ~0s" beside "cannot start" is worse than admitting we cannot say.
+
+    A free slot is not the same as an admissible job: the slot count says
+    nothing about whether the machine has the RAM or VRAM the job declared.
+    """
+    from unittest.mock import patch
+
+    service.ensure_ready()
+    service.config.core.max_concurrent_jobs = 4
+    queued = _job(service, eta_seconds=60.0)
+
+    with patch.object(service, "queue_wait_reason", return_value=None):
+        free = forecast_queue(service, [queued])
+    assert free[queued.id]["starts_in_seconds"] == pytest.approx(0, abs=1)
+
+    with patch.object(
+        service,
+        "queue_wait_reason",
+        return_value="needs 24.0 GiB RAM but only 2.0 GiB is free",
+    ):
+        blocked = forecast_queue(service, [queued])
+    assert blocked[queued.id]["starts_in_seconds"] is None
+    assert blocked[queued.id]["start_at"] is None
