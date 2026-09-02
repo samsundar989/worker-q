@@ -26,6 +26,7 @@ from workerq.backends.base import (
 from workerq.backends.local_dispatcher import LocalDispatcherBackend, build_backend
 from workerq.config import Config, load_config
 from workerq.db import Database, json_dumps
+from workerq.eta import command_signature
 from workerq.gpu import GpuInfo, query_gpus
 from workerq.models import (
     ACTIVE_STATES,
@@ -102,6 +103,12 @@ class SubmitRequest:
     cpus: int | None = None
     #: Safe to stop and re-run, so a higher-priority job may displace it.
     preemptible: bool | None = None
+    #: What this job is doing, and what is waiting on it. Supplied by the
+    #: worker: worker-q cannot infer intent from a command line.
+    describe: str | None = None
+    blocks: str | None = None
+    #: Expected wall time in seconds, if the worker knows it.
+    eta_seconds: float | None = None
 
 
 @dataclass
@@ -285,6 +292,10 @@ class GPUQService:
             requested_vram_mib=vram_mib,
             requested_cpus=cpus,
             preemptible=1 if preemptible else 0,
+            description=(request.describe or None),
+            blocks=(request.blocks or None),
+            eta_seconds=request.eta_seconds,
+            command_signature=command_signature(command, shell_mode),
             log_path=str(self.config.log_path(0)),  # placeholder, fixed below
         )
 
@@ -528,6 +539,55 @@ class GPUQService:
                 )
             ),
         }
+
+    def annotate_job(
+        self,
+        job_id: int,
+        *,
+        description: str | None = None,
+        blocks: str | None = None,
+        eta_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        """Update what a job says about itself, while it is queued or running.
+
+        Jobs often only learn their own duration after a few epochs, so a
+        declared ETA must be correctable at runtime rather than fixed at submit.
+        """
+        job = self.get_job(job_id)
+        if job.is_terminal:
+            raise GPUQError(
+                f"job #{job_id} already finished in state {job.state}; nothing to annotate"
+            )
+        updates: dict[str, Any] = {}
+        if description is not None:
+            updates["description"] = description.strip() or None
+        if blocks is not None:
+            updates["blocks"] = blocks.strip() or None
+        if eta_seconds is not None:
+            if eta_seconds < 0:
+                raise GPUQError("eta must be >= 0")
+            updates["eta_seconds"] = float(eta_seconds)
+        if not updates:
+            raise GPUQError("nothing to update; pass a description, --blocks or an eta")
+
+        self.db.update_job(job_id, **updates)
+        self._write_manifest(job_id)
+        return {"job_id": job_id, **updates}
+
+    def estimate(self, job: Job) -> dict[str, Any]:
+        """Duration estimate for one job, with its provenance."""
+        from workerq.eta import estimate_job
+
+        return estimate_job(self, job).to_dict()
+
+    def forecast(self, jobs: list[Job] | None = None) -> dict[int, dict[str, Any]]:
+        """Projected start/finish for everything not yet finished."""
+        from workerq.eta import forecast_queue
+
+        self.ensure_ready()
+        if jobs is None:
+            jobs = self.sort_for_display(self.db.active_jobs())
+        return forecast_queue(self, jobs)
 
     def preemption_report(self, job_id: int) -> dict[str, Any]:
         """Why a job stopped and where it now sits, for the worker that owns it."""
@@ -824,6 +884,12 @@ class GPUQService:
             except Exception:
                 backend_state = "UNKNOWN"
         data["backend_state"] = backend_state
+        forecast = self.forecast()
+        entry = forecast.get(job_id, {})
+        data["estimate"] = entry.get("estimate") or self.estimate(job)
+        data["eta_source"] = entry.get("eta_source") or data["estimate"].get("source")
+        data["start_at_estimate"] = entry.get("start_at")
+        data["finish_at_estimate"] = entry.get("finish_at")
         data["wait_reason"] = wait_reason
         data["queue_position"] = self._queue_position(job_id)
         data["manifest_path"] = str(self.config.job_dir(job_id) / "manifest.json")

@@ -59,6 +59,29 @@ displace it instead of waiting:
 
     workerq submit --project <project> --ram 24 --preemptible -- <command>
 
+**Say what the job is and how long it takes.** worker-q cannot infer either from
+a command line, and without them the queue view cannot tell anyone what is
+happening or when it will end:
+
+    workerq submit --project <project> --ram 24       --describe "120-epoch celltrack train, holdout_44b6"       --blocks "slice 067 promotion gate"       --eta 90m -- <command>
+
+`--describe` is a few words on what it does; `--blocks` is what is waiting on it.
+`--eta` is your best guess at wall time. If you learn better once it is running,
+correct it - do not leave a wrong estimate standing:
+
+    workerq eta <job_id> 45m
+    workerq describe <job_id> "revised: 40 epochs, early-stopped"
+
+If you do not know the duration, omit `--eta`. worker-q will estimate from this
+command's own history once it has run a couple of times, and shows "unknown"
+until then. An honest blank is better than a wrong number.
+
+**Best of all, report progress.** worker-q gives every job a file path in
+`$WORKERQ_PROGRESS`; write a completion fraction to it and the ETA becomes
+measured rather than guessed. One line is enough:
+
+    open(os.environ["WORKERQ_PROGRESS"], "w").write(str(epoch / total))
+
 `--ram` and `--vram` are peak GiB. Estimate high rather than low; an undeclared
 job is charged a small default and may be admitted when it should have waited.
 A job that asks for more than the machine has is rejected immediately rather

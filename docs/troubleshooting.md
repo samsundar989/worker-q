@@ -316,6 +316,37 @@ Running jobs then always finish, and urgent work waits for a free slot.
 
 ---
 
+## The ETA says "unknown", or is obviously wrong
+
+`unknown` is deliberate, not a failure. worker-q shows an estimate only when it
+has a defensible source, and it never guesses from a command line alone. Check
+which source a job has:
+
+```bash
+workerq show <id> --json | python -c "import json,sys; print(json.load(sys.stdin)['estimate'])"
+```
+
+* **`unknown`** — nobody passed `--eta`, the job reports no progress, and this
+  command has fewer than two successful runs in this project in the last 30
+  days. Pass `--eta`, or have the job write `$WORKERQ_PROGRESS`.
+* **`learned` but wrong** — the median comes from past runs of the same command
+  *shape*. If `--epochs 5` and `--epochs 500` are the same shape, they are
+  pooled, because flag values are deliberately stripped from the signature.
+  Declare `--eta` on the outliers; a declared estimate always beats a learned one.
+* **`declared` but wrong** — someone's guess has gone stale. Correct it in place
+  with `workerq eta <id> <duration>`; there is no penalty for revising.
+* **`progress` but jumpy** — the job's reported fraction is not linear in time
+  (a slow first epoch, a long final checkpoint). The estimate is honest about
+  what the job said; smooth the reported fraction if it matters.
+
+A queued job showing `starts: unknown` is usually behind a job whose own
+duration is unknown. That is intentional: an unknown duration poisons everything
+behind it in the projection rather than producing a confident wrong start time.
+
+Progress written but not showing? The job must write to the path in
+`$WORKERQ_PROGRESS`, not a path of its own choosing, and worker-q polls it every
+few seconds — a job shorter than one poll may finish before it is read.
+
 ---
 
 ## Cancel did not stop everything

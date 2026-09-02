@@ -169,6 +169,13 @@ class Job:
     preempted_at: str | None = None
     preempted_by: int | None = None
     preempted_reason: str | None = None
+    description: str | None = None
+    blocks: str | None = None
+    eta_seconds: float | None = None
+    command_signature: str | None = None
+    progress_fraction: float | None = None
+    progress_note: str | None = None
+    progress_updated_at: str | None = None
     passthrough_json: str | None = None
     env_json: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
@@ -249,6 +256,13 @@ class Job:
             "preempted_at": self.preempted_at,
             "preempted_by": self.preempted_by,
             "preempted_reason": self.preempted_reason,
+            "description": self.description,
+            "blocks": self.blocks,
+            "eta_seconds": self.eta_seconds,
+            "command_signature": self.command_signature,
+            "progress_fraction": self.progress_fraction,
+            "progress_note": self.progress_note,
+            "progress_updated_at": self.progress_updated_at,
             "gpu_mode": self.gpu_mode,
             "snapshot_mode": self.snapshot_mode,
             "snapshot_commit": self.snapshot_commit,

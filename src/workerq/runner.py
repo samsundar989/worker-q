@@ -32,6 +32,7 @@ from workerq.util import atomic_write_text, ensure_dir, hostname, utcnow_iso
 from workerq.winproc import ProcessGroup, child_creationflags, posix_child_kwargs
 
 _CANCEL_POLL_SECONDS = 0.5
+_PROGRESS_POLL_SECONDS = 3.0
 
 
 class RunnerError(RuntimeError):
@@ -187,7 +188,13 @@ def run_job(
     child_env = dict(os.environ)
     for key, value in job.env.items():
         child_env[key] = value
+    progress_path = job_dir / "progress"
     child_env["GPUQ_JOB_ID"] = str(job_id)
+    child_env["WORKERQ_JOB_ID"] = str(job_id)
+    # A job can report how far along it is by writing a fraction here.
+    # Nothing is required to; it simply makes the ETA far better than a
+    # guess from history.
+    child_env["WORKERQ_PROGRESS"] = str(progress_path)
     child_env["GPUQ_PROJECT"] = job.project
     child_env["GPUQ_STATE_DIR"] = str(config.state_dir)
 
@@ -259,6 +266,35 @@ def run_job(
         except (ValueError, OSError):  # pragma: no cover - non-main thread
             pass
 
+    def _watch_progress() -> None:
+        """Copy the job's self-reported progress into the database.
+
+        Uses its own connection: a sqlite3 connection belongs to the thread
+        that opened it, so sharing the runner's would raise on every write -
+        and, since progress must never disturb the job, fail silently.
+        """
+        from workerq.eta import read_progress
+
+        watcher_db = Database(config.db_path)
+        last: tuple[float | None, str | None] = (None, None)
+        try:
+            while not stop_watch.wait(_PROGRESS_POLL_SECONDS):
+                fraction, note = read_progress(str(progress_path))
+                if fraction is None or (fraction, note) == last:
+                    continue
+                last = (fraction, note)
+                try:
+                    watcher_db.update_job(
+                        job_id,
+                        progress_fraction=fraction,
+                        progress_note=note,
+                        progress_updated_at=utcnow_iso(),
+                    )
+                except Exception:
+                    pass  # a nicety; never let it take the job down
+        finally:
+            watcher_db.close()
+
     def _watch_cancel() -> None:
         """Poll for `workerq cancel`, then stop the child tree.
 
@@ -298,8 +334,12 @@ def run_job(
                 group.terminate()
                 return
 
-    watcher = threading.Thread(target=_watch_cancel, name="gpuq-cancel-watch", daemon=True)
+    watcher = threading.Thread(target=_watch_cancel, name="workerq-stop-watch", daemon=True)
     watcher.start()
+    progress_watcher = threading.Thread(
+        target=_watch_progress, name="workerq-progress-watch", daemon=True
+    )
+    progress_watcher.start()
 
     try:
         exit_code = proc.wait()
@@ -310,6 +350,7 @@ def run_job(
     finally:
         stop_watch.set()
         watcher.join(timeout=2.0)
+        progress_watcher.join(timeout=2.0)
         group.close()
 
     finished_at = utcnow_iso()

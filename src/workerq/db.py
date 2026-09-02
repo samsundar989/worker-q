@@ -22,7 +22,7 @@ from workerq.models import (
 )
 from workerq.util import ensure_dir, restrict_permissions, utcnow_iso
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _MIGRATIONS: list[tuple[int, str]] = [
     (
@@ -124,6 +124,24 @@ _MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE jobs ADD COLUMN preempted_reason TEXT;
         """,
     ),
+    (
+        5,
+        """
+        -- What the job is doing and how long it should take. Descriptions come
+        -- from the worker that submitted it; a duration may be declared, learned
+        -- from this command's own history, or reported by the job as it runs.
+        ALTER TABLE jobs ADD COLUMN description TEXT;
+        ALTER TABLE jobs ADD COLUMN blocks TEXT;
+        ALTER TABLE jobs ADD COLUMN eta_seconds REAL;
+        ALTER TABLE jobs ADD COLUMN command_signature TEXT;
+        ALTER TABLE jobs ADD COLUMN progress_fraction REAL;
+        ALTER TABLE jobs ADD COLUMN progress_note TEXT;
+        ALTER TABLE jobs ADD COLUMN progress_updated_at TEXT;
+
+        CREATE INDEX IF NOT EXISTS idx_jobs_signature
+            ON jobs(project, command_signature, state);
+        """,
+    ),
 ]
 
 _JOB_COLUMNS = (
@@ -133,7 +151,9 @@ _JOB_COLUMNS = (
     "runner_pid, queued_at, started_at, finished_at, error, created_at, updated_at, log_path, "
     "cuda_visible_devices, passthrough_json, env_json, requested_ram_mib, "
     "requested_vram_mib, requested_cpus, preemptible, preemption_count, "
-    "preempted_at, preempted_by, preempted_reason"
+    "preempted_at, preempted_by, preempted_reason, description, blocks, "
+    "eta_seconds, command_signature, progress_fraction, progress_note, "
+    "progress_updated_at"
 )
 
 #: Columns callers are allowed to update through `update_job`.
@@ -164,6 +184,13 @@ _UPDATABLE = frozenset(
         "preempted_at",
         "preempted_by",
         "preempted_reason",
+        "description",
+        "blocks",
+        "eta_seconds",
+        "command_signature",
+        "progress_fraction",
+        "progress_note",
+        "progress_updated_at",
     }
 )
 
@@ -239,7 +266,36 @@ class Database:
                 (version, utcnow_iso()),
             )
             current = version
+        self._backfill_signatures()
         return current
+
+    def _backfill_signatures(self) -> None:
+        """Give pre-existing jobs a command signature.
+
+        Duration learning reads finished jobs, so without this an upgrade would
+        throw away every run already on disk and start estimating from zero.
+        Signatures are computed in Python, which a SQL migration cannot do, so
+        it happens here. Idempotent: after one pass nothing is left to fill.
+        """
+        from workerq.eta import command_signature
+
+        try:
+            rows = self.conn.execute(
+                "SELECT id, command_json, shell_mode FROM jobs "
+                "WHERE command_signature IS NULL"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return  # the column does not exist yet: nothing to backfill
+
+        for row in rows:
+            try:
+                command = json.loads(row["command_json"])
+            except (TypeError, ValueError):
+                command = []
+            self.conn.execute(
+                "UPDATE jobs SET command_signature = ? WHERE id = ?",
+                (command_signature(command, bool(row["shell_mode"])), row["id"]),
+            )
 
     def schema_version(self) -> int:
         try:

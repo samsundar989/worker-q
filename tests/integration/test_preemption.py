@@ -63,15 +63,11 @@ def test_higher_priority_displaces_a_preemptible_job(live_service, git_repo, wai
     victim = _submit(live_service, git_repo, _long(), preemptible=True, priority="low")
     _start(live_service, waiter, victim)
 
-    urgent = _submit(
-        live_service, git_repo, [sys.executable, "-c", "print('URGENT RAN')"],
-        priority="critical",
-    )
-
-    assert waiter(
-        lambda: live_service.get_job(urgent).state == JobState.SUCCEEDED.value,
-        timeout=180,
-    ), "the urgent job never ran"
+    # The urgent job keeps running while we look at the victim. Letting it
+    # finish here would free the slot, the dispatcher would start the victim
+    # again, and the check below would race against its own success.
+    urgent = _submit(live_service, git_repo, _long(), priority="critical")
+    _start(live_service, waiter, urgent)
 
     displaced = live_service.get_job(victim)
     assert displaced.state == JobState.QUEUED.value, (
@@ -86,6 +82,7 @@ def test_higher_priority_displaces_a_preemptible_job(live_service, git_repo, wai
     )
     assert "PREEMPTED" in log, "the worker must be able to read why it stopped"
 
+    live_service.cancel(urgent, force=True)
     live_service.cancel(victim, force=True)
 
 

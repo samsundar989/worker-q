@@ -28,7 +28,12 @@ from workerq.config import (
 )
 from workerq.core import GPUQError, GPUQService, JobNotFound, SubmitRequest
 from workerq.models import JobState
-from workerq.util import human_duration, parse_env_assignment, truncate
+from workerq.util import (
+    human_duration,
+    parse_duration,
+    parse_env_assignment,
+    truncate,
+)
 
 app = typer.Typer(
     name="workerq",
@@ -204,6 +209,15 @@ def submit(
         "Only safe if the command is resumable or cheap to repeat.",
     ),
     label: Optional[str] = typer.Option(None, "--label", help="Free-text label."),
+    describe: Optional[str] = typer.Option(
+        None, "--describe", help="What this job is doing, in a few words."
+    ),
+    blocks: Optional[str] = typer.Option(
+        None, "--blocks", help="What is waiting on this job."
+    ),
+    eta: Optional[str] = typer.Option(
+        None, "--eta", help="Expected wall time, e.g. 90m, 2h, 45s."
+    ),
     cwd: Optional[str] = typer.Option(None, "--cwd", help="Directory to submit from."),
     snapshot: bool = typer.Option(
         True, "--snapshot/--no-snapshot", help="Freeze the source at submission time."
@@ -238,6 +252,14 @@ def submit(
             "  Note the '--' separator before your command."
         )
 
+    eta_seconds: Optional[float] = None
+    if eta is not None:
+        try:
+            eta_seconds = parse_duration(eta).total_seconds()
+        except ValueError as exc:
+            fail(str(exc))
+            return
+
     env_map: dict[str, str] = {}
     for item in env or []:
         try:
@@ -264,6 +286,9 @@ def submit(
         vram_gb=vram,
         cpus=cpus,
         preemptible=preemptible,
+        describe=describe,
+        blocks=blocks,
+        eta_seconds=eta_seconds,
     )
 
     try:
@@ -495,6 +520,10 @@ def show(
     rows = [
         ("Project", detail["project"]),
         ("Label", detail["label"] or "-"),
+        ("Description", detail.get("description") or "-"),
+        ("Blocks", detail.get("blocks") or "-"),
+        ("ETA", _fmt_eta(detail)),
+        ("Progress", _fmt_progress(detail)),
         ("Priority", detail["priority"]),
         ("Command", detail_command(detail)),
         ("Shell mode", "yes" if detail["shell_mode"] else "no"),
@@ -552,6 +581,22 @@ def detail_command(detail: dict[str, Any]) -> str:
     import shlex
 
     return shlex.join(command) if command else "-"
+
+
+def _fmt_eta(detail: dict[str, Any]) -> str:
+    est = detail.get("estimate") or {}
+    remaining = est.get("remaining_seconds")
+    if remaining is None:
+        return "unknown"
+    return f"{human_duration(remaining)} left ({detail.get('eta_source', '?')})"
+
+
+def _fmt_progress(detail: dict[str, Any]) -> str:
+    fraction = detail.get("progress_fraction")
+    if fraction is None:
+        return "-"
+    note = detail.get("progress_note")
+    return f"{fraction * 100:.0f}%" + (f" - {note}" if note else "")
 
 
 def _fmt_gib(mib: float | None) -> str:
@@ -1058,6 +1103,90 @@ def bump(
             f"[dim]Watch it with: workerq wait {job_id}   "
             f"(or workerq show {job_id})[/dim]"
         )
+    service.close()
+
+
+@app.command()
+def eta(
+    job_id: int = typer.Argument(..., help="worker-q job id."),
+    duration: str = typer.Argument(..., help="Expected wall time, e.g. 90m, 2h."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Correct a job's expected duration while it is queued or running.
+
+    Jobs often only learn their own cost after a few epochs, so the estimate
+    shown in `workerq top` should be correctable rather than fixed at submit.
+    """
+    service = get_service()
+    try:
+        seconds = parse_duration(duration).total_seconds()
+    except ValueError as exc:
+        service.close()
+        fail(str(exc))
+        return
+    try:
+        result = service.annotate_job(job_id, eta_seconds=seconds)
+    except (JobNotFound, GPUQError) as exc:
+        service.close()
+        fail(str(exc))
+        return
+
+    if json_output:
+        emit_json(result)
+    else:
+        console.print(f"job #{job_id} expected to take {human_duration(seconds)}")
+    service.close()
+
+
+@app.command()
+def describe(
+    job_id: int = typer.Argument(..., help="worker-q job id."),
+    text: Optional[str] = typer.Argument(None, help="What this job is doing."),
+    blocks: Optional[str] = typer.Option(
+        None, "--blocks", help="What is waiting on this job."
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Say what a job is doing, and what is waiting on it.
+
+    worker-q cannot infer intent from a command line, so this has to come from
+    the worker that submitted the job.
+    """
+    service = get_service()
+    if text is None and blocks is None:
+        detail = None
+        try:
+            detail = service.job_detail(job_id)
+        except JobNotFound as exc:
+            service.close()
+            fail(str(exc))
+            return
+        if json_output:
+            emit_json(
+                {
+                    "job_id": job_id,
+                    "description": detail.get("description"),
+                    "blocks": detail.get("blocks"),
+                }
+            )
+        else:
+            console.print(f"#{job_id} {detail.get('description') or '(no description)'}")
+            if detail.get("blocks"):
+                console.print(f"[dim]blocks: {detail['blocks']}[/dim]")
+        service.close()
+        return
+
+    try:
+        result = service.annotate_job(job_id, description=text, blocks=blocks)
+    except (JobNotFound, GPUQError) as exc:
+        service.close()
+        fail(str(exc))
+        return
+
+    if json_output:
+        emit_json(result)
+    else:
+        console.print(f"job #{job_id} described")
     service.close()
 
 

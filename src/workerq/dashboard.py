@@ -69,6 +69,48 @@ def _gib(mib: float | None) -> str:
     return "-" if mib is None else f"{mib / 1024:.1f}"
 
 
+#: Estimates are guesses of very different quality, so the source is always
+#: shown. A confident-looking wrong finish time is worse than an honest blank.
+_ETA_STYLES = {
+    "progress": "green",
+    "declared": "cyan",
+    "learned": "yellow",
+    "unknown": "dim",
+}
+
+
+def _eta_cell(job: Any, entry: dict[str, Any] | None) -> Text:
+    if job.state == JobState.RUNNING.value:
+        remaining = (entry or {}).get("remaining_seconds")
+        if remaining is None:
+            return Text("unknown", style="dim")
+        source = ((entry or {}).get("eta_source") or "unknown").split()[0]
+        cell = Text(f"~{human_duration(remaining)} left", style=_ETA_STYLES.get(source, ""))
+        if job.progress_fraction:
+            cell.append(f"  {job.progress_fraction * 100:.0f}%", style="dim")
+        return cell
+
+    starts = (entry or {}).get("starts_in_seconds")
+    if starts is None:
+        return Text("starts: unknown", style="dim")
+    total = (entry or {}).get("remaining_seconds")
+    source = ((entry or {}).get("eta_source") or "unknown").split()[0]
+    text = f"starts ~{human_duration(starts)}"
+    if total is not None:
+        text += f", runs {human_duration(total)}"
+    return Text(text, style=_ETA_STYLES.get(source, ""))
+
+
+def _what_cell(job: Any) -> Text:
+    """The worker's own description, falling back to the command."""
+    if job.description:
+        cell = Text(truncate(job.description, 52))
+        if job.blocks:
+            cell.append(f"  ▸ blocks {truncate(job.blocks, 24)}", style="dim")
+        return cell
+    return Text(truncate(job.display_command, 60), style="dim")
+
+
 class Dashboard:
     def __init__(self, service: GPUQService) -> None:
         self.service = service
@@ -127,14 +169,16 @@ class Dashboard:
 
     def queue_panel(self, jobs: list[Any]) -> Panel:
         summary = self.service.status_summary()
+        forecast = self.service.forecast(jobs)
         table = Table(box=None, pad_edge=False, expand=True)
         table.add_column("ID", justify="right", style="bold", width=5)
         table.add_column("STATE", width=9)
         table.add_column("PRI", width=8)
-        table.add_column("PROJECT", width=18, overflow="ellipsis")
-        table.add_column("TIME", justify="right", width=9)
-        table.add_column("REQ", width=15)
-        table.add_column("COMMAND", overflow="ellipsis")
+        table.add_column("PROJECT", width=14, overflow="ellipsis")
+        table.add_column("TIME", justify="right", width=8)
+        table.add_column("ETA", width=17)
+        table.add_column("REQ", width=11)
+        table.add_column("WHAT", overflow="ellipsis")
 
         shown = [j for j in jobs if not j.is_terminal][:12]
         for job in shown:
@@ -156,8 +200,9 @@ class Dashboard:
                 job.priority,
                 job.project,
                 age,
+                _eta_cell(job, forecast.get(job.id)),
                 " ".join(request) or "-",
-                truncate(job.display_command, 60),
+                _what_cell(job),
             )
             if job.state == JobState.QUEUED.value:
                 reason = self.service.queue_wait_reason(job)

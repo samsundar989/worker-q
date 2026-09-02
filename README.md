@@ -131,7 +131,7 @@ That is what lets several small jobs run together while two large ones
 serialise, without you picking a slot count. A blocked job says why:
 
 ```text
- 60  QUEUED   normal  biohub   4m wait  24G 4c
+ 60  QUEUED  normal  biohub  4m w  starts ~12m, runs 1h  24G 4c  celltrack train, holdout_44b6
      ↳ needs 24.0 GiB RAM but only 9.1 GiB is free after the 10% floor
 ```
 
@@ -160,6 +160,65 @@ min_host_free_percent = 10  # floor a job may not eat into
 max_commit_percent = 88     # hard stop; Windows fails allocations near this
 default_ram_gb = 4.0        # charged to jobs that declare nothing
 ```
+
+---
+
+
+## Saying what a job is, and how long it takes
+
+A command line does not say what a job is for, what is waiting on it, or when it
+will be done. worker-q cannot invent any of that, so it takes it from the worker
+and shows it in `workerq top`:
+
+```bash
+workerq submit --project biohub --ram 24   --describe "120-epoch celltrack train, holdout_44b6"   --blocks "slice 067 promotion gate"   --eta 90m -- python -m celltrack train
+```
+
+`--eta` accepts `90m`, `1h30m`, `5400`. Both the description and the estimate can
+be corrected once the job knows better than the person who queued it:
+
+```bash
+workerq eta 61 45m
+workerq describe 61 "revised: 40 epochs, early-stopped" --blocks "slice 067"
+```
+
+### Where the estimate comes from
+
+The queue would rather say nothing than say something confident and wrong, so
+every ETA is tagged with its source, and `unknown` is a normal answer:
+
+| Source | Meaning | Shown |
+| --- | --- | --- |
+| `progress` | the job reported its own completion fraction | green |
+| `declared` | a worker passed `--eta`, or corrected it at runtime | cyan |
+| `learned` | median of past successful runs of this same command | yellow |
+| `unknown` | fewer than two comparable runs, and nobody said | dim |
+
+Learning needs no setup. Every job records a **command signature** — the shape of
+the command with flag *values*, paths and numbers stripped out — so
+`train --fold A` and `train --fold B` count as runs of the same thing. After two
+successful runs in a project, worker-q offers a median; runs older than 30 days
+are ignored, because a command's cost changes as its code does.
+
+Queued jobs also get a projected start, laid out over the free slots in dispatch
+order. A job whose duration is unknown makes the jobs behind it unknown too,
+rather than quietly optimistic.
+
+### Reporting progress (the accurate option)
+
+Every job is handed a file path in `$WORKERQ_PROGRESS`. Write a fraction to it and
+the ETA stops being a guess — it becomes measured from the job's own pace, which
+is the only source that knows epoch 3 is slower than epoch 90:
+
+```python
+import os
+with open(os.environ["WORKERQ_PROGRESS"], "w") as fh:
+    fh.write(f'{{"frac": {epoch / total}, "note": "epoch {epoch}/{total}"}}')
+```
+
+A bare `0.42`, a `42%`, or that JSON all work. worker-q polls the file every few
+seconds; the note appears next to the percentage in the dashboard. Nothing about
+the job changes if it never writes the file.
 
 ---
 
@@ -559,7 +618,7 @@ See [docs/architecture.md](docs/architecture.md),
 | Command | Purpose |
 | --- | --- |
 | `workerq init` | Create state, database and dispatcher. Idempotent. |
-| `workerq submit [--ram N --vram N --cpus N] -- CMD` | Queue a job and return immediately. |
+| `workerq submit [--ram N --vram N --cpus N] [--describe T --blocks W --eta D] -- CMD` | Queue a job and return immediately. |
 | `workerq status` / `workerq list` | Show the queue. `--json` for agents. |
 | `workerq top` | Live dashboard: queue, pressure, memory owners. |
 | `workerq report` | Why recent jobs failed, grouped by cause and project. |
@@ -570,6 +629,8 @@ See [docs/architecture.md](docs/architecture.md),
 | `workerq promote ID` | Move a queued job to the front. |
 | `workerq bump ID LEVEL` | Raise one job's priority; may displace running work. |
 | `workerq wait ID` | Block until a job finishes; exits with its exit code. |
+| `workerq eta ID DURATION` | Set or correct a job's expected wall time. |
+| `workerq describe ID [TEXT] [--blocks W]` | Say what a job is and what waits on it. |
 | `workerq priority [PROJECT LEVEL]` | Show/set a project's default priority. |
 | `workerq doctor` | Health checks. Exit 0/1/2. |
 | `workerq gpu` | GPU inventory and who holds VRAM. |

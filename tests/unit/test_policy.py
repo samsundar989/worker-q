@@ -226,6 +226,11 @@ def test_policy_text_matches_the_spec():
         "workerq wait <job_id>",
         "--preemptible",
         "Do not resubmit it",
+        # The queue view is only as good as what workers declare.
+        "--describe",
+        "--blocks",
+        "workerq eta <job_id> 45m",
+        "$WORKERQ_PROGRESS",
     ):
         assert required in body
 

@@ -2,7 +2,7 @@
 #
 # GPUQ bootstrap - safe to re-run.
 #
-# Detects the platform and toolchain, installs gpuq, initialises the queue,
+# Detects the platform and toolchain, installs worker-q, initialises the queue,
 # installs the Claude policy, runs the health checks and finishes with a
 # non-destructive queue smoke test.
 #
@@ -95,39 +95,39 @@ fi
 say "6. Execution backend"
 # ---------------------------------------------------------------------------
 # On Linux the GPU-aware Task Spooler fork is the intended backend. Everywhere
-# else (and on Linux until it is built) gpuq ships its own dispatcher, which
+# else (and on Linux until it is built) worker-q ships its own dispatcher, which
 # implements the same SchedulerBackend contract.
 if command -v ts >/dev/null 2>&1 && ts -h 2>&1 | grep -q -- '--set_gpu_free_perc'; then
   ok "GPU-aware Task Spooler detected: $(ts -V 2>&1 | head -1)"
-  info "gpuq V1 on this machine uses its built-in dispatcher; the backend"
-  info "abstraction in src/gpuq/backends/base.py is where TS would slot in."
+  info "worker-q on this machine uses its built-in dispatcher; the backend"
+  info "abstraction in src/workerq/backends/base.py is where TS would slot in."
 else
-  ok "using the built-in gpuq dispatcher (no external queue daemon required)"
+  ok "using the built-in worker-q dispatcher (no external queue daemon required)"
 fi
 
 # ---------------------------------------------------------------------------
-say "7. Install gpuq"
+say "7. Install worker-q"
 # ---------------------------------------------------------------------------
 GPUQ_BIN=""
 case "$INSTALLER" in
   uv)
-    if uv tool install --force --from "$REPO_ROOT" gpuq >/dev/null 2>&1; then
+    if uv tool install --force --from "$REPO_ROOT" worker-q >/dev/null 2>&1; then
       ok "installed with uv tool install"
     else
       fail "uv tool install failed"
-      uv tool install --force --from "$REPO_ROOT" gpuq 2>&1 | tail -5
+      uv tool install --force --from "$REPO_ROOT" worker-q 2>&1 | tail -5
     fi
     ;;
   pipx)
     pipx install --force "$REPO_ROOT" >/dev/null 2>&1 && ok "installed with pipx" || fail "pipx install failed"
     ;;
   venv)
-    VENV="$HOME/.local/share/gpuq/venv"
+    VENV="$HOME/.local/share/worker-q/venv"
     "$PYTHON" -m venv "$VENV" >/dev/null 2>&1
     "$VENV/bin/pip" install -q --upgrade pip >/dev/null 2>&1 || true
     if "$VENV/bin/pip" install -q "$REPO_ROOT" >/dev/null 2>&1; then
       ok "installed into $VENV"
-      GPUQ_BIN="$VENV/bin/gpuq"
+      GPUQ_BIN="$VENV/bin/workerq"
     else
       fail "venv install failed"
     fi
@@ -135,26 +135,26 @@ case "$INSTALLER" in
 esac
 
 if [ -z "$GPUQ_BIN" ]; then
-  if command -v gpuq >/dev/null 2>&1; then
-    GPUQ_BIN="$(command -v gpuq)"
+  if command -v workerq >/dev/null 2>&1; then
+    GPUQ_BIN="$(command -v workerq)"
   else
-    for candidate in "$HOME/.local/bin/gpuq" "$HOME/.local/bin/gpuq.exe"; do
+    for candidate in "$HOME/.local/bin/workerq" "$HOME/.local/bin/workerq.exe"; do
       [ -x "$candidate" ] && GPUQ_BIN="$candidate" && break
     done
   fi
 fi
 
 if [ -z "$GPUQ_BIN" ]; then
-  fail "gpuq is installed but not on PATH"
+  fail "workerq is installed but not on PATH"
   info "add \$HOME/.local/bin to PATH, then re-run"
   exit 2
 fi
-ok "gpuq: $GPUQ_BIN ($("$GPUQ_BIN" --version 2>&1))"
+ok "workerq: $GPUQ_BIN ($("$GPUQ_BIN" --version 2>&1))"
 
 # ---------------------------------------------------------------------------
 say "8. Initialise the queue"
 # ---------------------------------------------------------------------------
-"$GPUQ_BIN" init || fail "gpuq init failed"
+"$GPUQ_BIN" init || fail "workerq init failed"
 
 # ---------------------------------------------------------------------------
 say "9. Install the Claude policy"
@@ -191,11 +191,11 @@ say "Done"
 # ---------------------------------------------------------------------------
 printf '\n%s\n\n' "The five commands you need:"
 cat <<'USAGE'
-  gpuq doctor                                        check the machine is healthy
-  gpuq submit --project NAME -- python train.py      queue a job, return at once
-  gpuq status                                        what is running / next
-  gpuq logs <id> --follow                            stream a job's output
-  gpuq cancel <id>                                   stop a queued or running job
+  workerq doctor                                        check the machine is healthy
+  workerq submit --project NAME -- python train.py      queue a job, return at once
+  workerq status                                        what is running / next
+  workerq logs <id> --follow                            stream a job's output
+  workerq cancel <id>                                   stop a queued or running job
 USAGE
 
 if [ "$FAILURES" -gt 0 ]; then
