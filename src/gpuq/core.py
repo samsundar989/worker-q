@@ -94,6 +94,11 @@ class SubmitRequest:
     shell: str | None = None
     env: dict[str, str] | None = None
     passthrough: list[str] | None = None
+    #: Declared resource footprint. None means "use the configured default",
+    #: so undeclared work is still accounted for rather than treated as free.
+    ram_gb: float | None = None
+    vram_gb: float | None = None
+    cpus: int | None = None
 
 
 @dataclass
@@ -202,6 +207,20 @@ class GPUQService:
         if gpus < 0:
             raise GPUQError("--gpus must be >= 0")
 
+        for name, value in (("--ram", request.ram_gb), ("--vram", request.vram_gb)):
+            if value is not None and value < 0:
+                raise GPUQError(f"{name} must be >= 0")
+        if request.cpus is not None and request.cpus < 0:
+            raise GPUQError("--cpus must be >= 0")
+
+        ram_mib = None if request.ram_gb is None else float(request.ram_gb) * 1024.0
+        vram_mib = None if request.vram_gb is None else float(request.vram_gb) * 1024.0
+        cpus = None if request.cpus is None else int(request.cpus)
+
+        # Refuse a request the machine could never satisfy, rather than
+        # letting it sit QUEUED forever.
+        self._reject_impossible(ram_mib, vram_mib, cpus)
+
         submitted_cwd = resolve_path(request.cwd or Path.cwd())
         if not submitted_cwd.is_dir():
             raise GPUQError(f"working directory does not exist: {submitted_cwd}")
@@ -256,6 +275,9 @@ class GPUQService:
             state=JobState.PREPARING.value,
             queued_at=now,
             env_json=json_dumps(env) if env else None,
+            requested_ram_mib=ram_mib,
+            requested_vram_mib=vram_mib,
+            requested_cpus=cpus,
             log_path=str(self.config.log_path(0)),  # placeholder, fixed below
         )
 
@@ -294,6 +316,9 @@ class GPUQService:
                 priority_rank=priority_rank(priority),
                 cwd=str(execution_cwd),
                 env=None,  # job env is applied by the runner, from the DB
+                ram_mib=ram_mib,
+                vram_mib=vram_mib,
+                cpus=cpus,
             )
 
             # ---- 5/6. record backend id, mark QUEUED -----------------
@@ -344,6 +369,35 @@ class GPUQService:
                 raise GPUQError(f"job not submitted: {exc}") from exc
             raise
 
+    def _reject_impossible(
+        self, ram_mib: float | None, vram_mib: float | None, cpus: int | None
+    ) -> None:
+        """Fail fast on a request no amount of waiting could ever satisfy."""
+        from gpuq import resources as res
+
+        if not self.config.resources.enforce:
+            return
+        capacity = res.capacity(self.config, gpu=self.gpu_info())
+        if ram_mib is not None and ram_mib > capacity.usable_ram_mib:
+            raise GPUQError(
+                f"requested {ram_mib / 1024:.1f} GiB RAM but only "
+                f"{capacity.usable_ram_mib / 1024:.1f} GiB is usable "
+                f"({capacity.total_ram_mib / 1024:.1f} GiB total minus "
+                f"{self.config.resources.reserve_ram_gb:.1f} GiB reserved). "
+                "This job would never start."
+            )
+        if cpus is not None and cpus > capacity.usable_cpus:
+            raise GPUQError(
+                f"requested {cpus} CPUs but only {capacity.usable_cpus} are usable "
+                f"of {capacity.total_cpus}. This job would never start."
+            )
+        if vram_mib is not None and vram_mib > capacity.usable_vram_mib:
+            raise GPUQError(
+                f"requested {vram_mib / 1024:.1f} GiB VRAM but only "
+                f"{capacity.usable_vram_mib / 1024:.1f} GiB is usable. "
+                "This job would never start."
+            )
+
     def _create_snapshot(
         self,
         job_id: int,
@@ -352,14 +406,18 @@ class GPUQService:
         submitted_cwd: Path,
         passthrough: list[str],
     ) -> Snapshot:
+        # `git worktree add` derives the worktree's registry name from the
+        # destination's basename, so every snapshot must have a *distinct*
+        # basename. Naming them all "repo" made two agents submitting at the
+        # same moment collide inside .git/worktrees/repo.
         if mode is SnapshotMode.GIT:
             assert repo_root is not None
-            destination = self.config.snapshots_dir / str(job_id) / "repo"
+            destination = self.config.snapshots_dir / str(job_id) / f"job-{job_id}"
             return create_git_snapshot(
                 repo_root, destination, job_id=job_id, passthrough=passthrough
             )
         if mode is SnapshotMode.COPY:
-            destination = self.config.snapshots_dir / str(job_id) / "repo"
+            destination = self.config.snapshots_dir / str(job_id) / f"job-{job_id}"
             return create_copy_snapshot(submitted_cwd, destination, passthrough=passthrough)
         return Snapshot(mode=mode.value, path=None, repo_root=repo_root, passthrough=[])
 
@@ -446,6 +504,9 @@ class GPUQService:
             "snapshot_passthrough": job.passthrough,
             "gpu_count": job.requested_gpu_count,
             "gpu_mode": job.gpu_mode,
+            "requested_ram_mib": job.requested_ram_mib,
+            "requested_vram_mib": job.requested_vram_mib,
+            "requested_cpus": job.requested_cpus,
             "env": job.env,
             "submitted_at": job.queued_at,
             "started_at": job.started_at,
@@ -833,9 +894,85 @@ class GPUQService:
                     pids.add(int(backend_pid))
         return pids
 
-    def status_summary(self) -> dict[str, Any]:
-        counts = self.db.count_by_state()
+    def own_pids(self) -> set[int]:
+        """Every process belonging to a running gpuq job, including children.
+
+        `own_gpu_pids` only knows the wrapper PIDs gpuq launched; the real
+        workload is typically a descendant (an interpreter re-exec, a
+        dataloader pool), so memory attribution must walk the process tree or
+        gpuq reports its own job as somebody else's.
+        """
+        from gpuq import host as _host
+
+        return _host.descendants_of(self.own_gpu_pids())
+
+    def throughput(self, *, hours: float = 24.0) -> dict[str, Any]:
+        """Queue performance over a window: outcomes, waits and utilisation."""
+        from gpuq.util import age_seconds as _age
+
+        cutoff = hours * 3600.0
+        succeeded = failed = cancelled = lost = 0
+        waits: list[float] = []
+        runtimes: list[float] = []
+        busy_seconds = 0.0
+
+        for job in self.db.list_jobs():
+            if not job.is_terminal:
+                continue
+            age = _age(job.finished_at or job.updated_at)
+            if age is not None and age > cutoff:
+                continue
+            state = job.state
+            if state == JobState.SUCCEEDED.value:
+                succeeded += 1
+            elif state == JobState.FAILED.value:
+                failed += 1
+            elif state == JobState.CANCELLED.value:
+                cancelled += 1
+            elif state == JobState.LOST.value:
+                lost += 1
+            if job.wait_seconds is not None:
+                waits.append(job.wait_seconds)
+            if job.runtime_seconds is not None:
+                runtimes.append(job.runtime_seconds)
+                busy_seconds += job.runtime_seconds
+
+        finished = succeeded + failed + cancelled + lost
+        completed = succeeded + failed
+
+        def _median(values: list[float]) -> float | None:
+            if not values:
+                return None
+            ordered = sorted(values)
+            middle = len(ordered) // 2
+            if len(ordered) % 2:
+                return ordered[middle]
+            return (ordered[middle - 1] + ordered[middle]) / 2.0
+
         return {
+            "window_hours": hours,
+            "finished": finished,
+            "succeeded": succeeded,
+            "failed": failed,
+            "cancelled": cancelled,
+            "lost": lost,
+            "success_rate": (100.0 * succeeded / completed) if completed else 100.0,
+            "median_wait_seconds": _median(waits),
+            "median_runtime_seconds": _median(runtimes),
+            "busy_seconds": busy_seconds,
+            "utilisation_percent": min(100.0, 100.0 * busy_seconds / (hours * 3600.0))
+            if hours
+            else 0.0,
+        }
+
+    def status_summary(self) -> dict[str, Any]:
+        from gpuq import host as _host
+
+        counts = self.db.count_by_state()
+        memory = _host.memory()
+        return {
+            "host": memory.to_dict(),
+            "resources_enforced": self.config.resources.enforce,
             "concurrency": self.config.core.max_concurrent_jobs,
             "backend_slots": self.backend.get_slots(),
             "gpu_free_threshold_percent": self.backend.get_gpu_free_percent(),

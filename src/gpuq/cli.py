@@ -188,6 +188,13 @@ def submit(
         "normal", "--priority", help="critical | high | normal | low"
     ),
     gpus: Optional[int] = typer.Option(None, "--gpus", help="GPUs to request (default 1)."),
+    ram: Optional[float] = typer.Option(
+        None, "--ram", help="Peak host RAM this job needs, in GiB."
+    ),
+    vram: Optional[float] = typer.Option(
+        None, "--vram", help="Peak VRAM this job needs, in GiB."
+    ),
+    cpus: Optional[int] = typer.Option(None, "--cpus", help="CPU cores this job needs."),
     label: Optional[str] = typer.Option(None, "--label", help="Free-text label."),
     cwd: Optional[str] = typer.Option(None, "--cwd", help="Directory to submit from."),
     snapshot: bool = typer.Option(
@@ -245,6 +252,9 @@ def submit(
         shell=shell,
         env=env_map,
         passthrough=list(passthrough or []),
+        ram_gb=ram,
+        vram_gb=vram,
+        cpus=cpus,
     )
 
     try:
@@ -279,6 +289,17 @@ def submit(
         console.print(f"Passthrough: {', '.join(result.snapshot.passthrough)}")
     if result.queue_position is not None and result.queue_position > 0:
         console.print(f"Queue position: {result.queue_position + 1}")
+    footprint: list[str] = []
+    if job.requested_ram_mib:
+        footprint.append(f"{job.requested_ram_mib / 1024:.1f} GiB RAM")
+    if job.requested_vram_mib:
+        footprint.append(f"{job.requested_vram_mib / 1024:.1f} GiB VRAM")
+    if job.requested_cpus:
+        footprint.append(f"{job.requested_cpus} CPU")
+    if job.requested_gpu_count:
+        footprint.append(f"{job.requested_gpu_count} GPU")
+    if footprint:
+        console.print("Requests: " + ", ".join(footprint))
     console.print(f"Logs:     gpuq logs {job.id} --follow")
     service.close()
 
@@ -471,6 +492,9 @@ def show(
         ("Queue position", _fmt_position(detail.get("queue_position"))),
         ("Waiting on", detail.get("wait_reason") or "-"),
         ("GPUs requested", str(detail["requested_gpu_count"])),
+        ("RAM requested", _fmt_gib(detail.get("requested_ram_mib"))),
+        ("VRAM requested", _fmt_gib(detail.get("requested_vram_mib"))),
+        ("CPUs requested", str(detail.get("requested_cpus") or "-")),
         ("GPU mode", detail["gpu_mode"]),
         ("CUDA_VISIBLE_DEVICES", detail.get("cuda_visible_devices") or "-"),
         ("Repo root", detail["repo_root"] or "-"),
@@ -513,6 +537,10 @@ def detail_command(detail: dict[str, Any]) -> str:
     import shlex
 
     return shlex.join(command) if command else "-"
+
+
+def _fmt_gib(mib: float | None) -> str:
+    return "-" if not mib else f"{mib / 1024:.1f} GiB"
 
 
 def _fmt_position(position: int | None) -> str:
@@ -854,6 +882,179 @@ def gpu(
     console.print(
         f"[dim]gpuq gates jobs at {service.config.gpu.free_memory_threshold_percent}% "
         "free memory.[/dim]"
+    )
+    service.close()
+
+
+# --------------------------------------------------------------------------
+# top / report / resources
+# --------------------------------------------------------------------------
+
+
+@app.command()
+def top(
+    interval: float = typer.Option(2.0, "--interval", "-i", help="Refresh seconds."),
+    once: bool = typer.Option(False, "--once", help="Render a single frame and exit."),
+) -> None:
+    """Live dashboard: queue, machine pressure, and who is holding memory."""
+    from gpuq.dashboard import run_dashboard
+
+    service = get_service()
+    try:
+        run_dashboard(service, interval=max(0.25, interval), once=once)
+    finally:
+        service.close()
+
+
+@app.command()
+def report(
+    hours: float = typer.Option(24.0, "--hours", "-H", help="Window to analyse."),
+    limit: int = typer.Option(50, "--limit", help="Maximum failures to list."),
+    pressure: bool = typer.Option(
+        False, "--pressure", help="Also show what held memory in the window."
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Explain recent failures: what caused them, and whose workload it was."""
+    from gpuq.report import analyse, foreign_pressure_report
+
+    service = get_service()
+    data = analyse(service, hours=hours, limit=limit)
+    if pressure:
+        data["pressure"] = foreign_pressure_report(service, hours=hours)
+
+    if json_output:
+        emit_json(data)
+        service.close()
+        return
+
+    counts = data["counts"]
+    stats = data["throughput"]
+    console.print(
+        f"[bold]Last {hours:g}h[/bold]  "
+        f"{stats['finished']} finished - "
+        f"[green]{stats['succeeded']} ok[/green] - "
+        f"[red]{stats['failed']} failed[/red] - "
+        f"{stats['cancelled']} cancelled - "
+        f"success {stats['success_rate']:.0f}%"
+    )
+    console.print(
+        f"[dim]median wait {human_duration(stats['median_wait_seconds'])}, "
+        f"median runtime {human_duration(stats['median_runtime_seconds'])}, "
+        f"queue busy {stats['utilisation_percent']:.0f}% of the window[/dim]"
+    )
+    console.print()
+
+    if not data["failures"]:
+        console.print("[green]No failures in this window.[/green]")
+        service.close()
+        return
+
+    grouped = Table(box=None, pad_edge=False)
+    grouped.add_column("CAUSE", width=34)
+    grouped.add_column("N", justify="right", width=4)
+    for label, count in counts["by_cause"].items():
+        grouped.add_row(label, str(count))
+    console.print(grouped)
+
+    who = Table(box=None, pad_edge=False)
+    who.add_column("PROJECT", width=24)
+    who.add_column("N", justify="right", width=4)
+    who.add_column("AGENT", width=18)
+    who.add_column("N", justify="right", width=4)
+    projects = list(counts["by_project"].items())
+    agents = list(counts["by_agent"].items())
+    for index in range(max(len(projects), len(agents))):
+        p_name, p_count = projects[index] if index < len(projects) else ("", "")
+        a_name, a_count = agents[index] if index < len(agents) else ("", "")
+        who.add_row(str(p_name), str(p_count), str(a_name), str(a_count))
+    console.print()
+    console.print(who)
+    console.print()
+    console.print("[bold]Failures[/bold]")
+
+    for failure in data["failures"][:limit]:
+        style = "red" if failure["resource_caused"] else "yellow"
+        console.print(
+            f"  [bold]#{failure['job_id']}[/bold] {failure['project']} "
+            f"[{style}]{failure['cause_label']}[/{style}]"
+            f" [dim](exit {failure['exit_code']}, "
+            f"{failure['agent'] or 'unknown agent'})[/dim]"
+        )
+        if failure["excerpt"]:
+            console.print(
+                f"      [dim]{truncate(failure['excerpt'], max(40, console.width - 10))}[/dim]"
+            )
+        state = failure.get("resource_state") or {}
+        if failure["resource_caused"] and state:
+            console.print(
+                f"      [dim]at the time: host "
+                f"{state.get('host_free_percent') or 0:.0f}% free, commit "
+                f"{state.get('commit_percent') or 0:.0f}%[/dim]"
+            )
+        if failure["advice"]:
+            console.print(f"      [dim]-> {failure['advice']}[/dim]")
+
+    if pressure:
+        p = data["pressure"]
+        console.print()
+        console.print("[bold]Memory pressure in this window[/bold]")
+        console.print(
+            f"  [dim]worst host free {p['worst_host_free_percent'] or 0:.0f}%, "
+            f"worst commit {p['worst_commit_percent'] or 0:.0f}%, "
+            f"{p['samples']} samples[/dim]"
+        )
+        for entry in p["peak_consumers"][:8]:
+            console.print(f"  {entry['peak_gib']:>6.1f} GiB  {entry['name']}")
+
+    console.print()
+    console.print(f"[bold]{data['verdict']}[/bold]")
+    service.close()
+
+
+@app.command()
+def resources(
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Show capacity, headroom and the limits admission control enforces."""
+    from gpuq.resources import describe_capacity
+
+    service = get_service()
+    data = describe_capacity(service.config)
+    if json_output:
+        emit_json(data)
+        service.close()
+        return
+
+    cap = data["capacity"]
+    host_info = data["host"]
+    state = "[green]enforced[/green]" if data["enforced"] else "[yellow]off[/yellow]"
+    console.print(f"[bold]Admission control:[/bold] {state}")
+    console.print(
+        f"  RAM   {cap['usable_ram_mib'] / 1024:6.1f} GiB usable of "
+        f"{cap['total_ram_mib'] / 1024:.1f} GiB "
+        f"(now {(host_info.get('available_mib') or 0) / 1024:.1f} GiB free, "
+        f"{host_info.get('free_percent') or 0:.0f}%)"
+    )
+    console.print(
+        f"  VRAM  {cap['usable_vram_mib'] / 1024:6.1f} GiB usable of "
+        f"{cap['total_vram_mib'] / 1024:.1f} GiB"
+    )
+    console.print(f"  CPU   {cap['usable_cpus']:6d} usable of {cap['total_cpus']}")
+    console.print(
+        f"  Commit charge now {host_info.get('commit_percent') or 0:.0f}% "
+        f"(hard stop at {data['limits']['max_commit_percent']}%)"
+    )
+    console.print()
+    console.print(
+        f"[dim]Reserved for the OS and your editors: "
+        f"{data['reserve']['ram_gb']:.0f} GiB RAM, {data['reserve']['cpus']} CPU, "
+        f"{data['reserve']['vram_gb']:.0f} GiB VRAM[/dim]"
+    )
+    console.print(
+        f"[dim]Jobs that declare nothing are charged "
+        f"{data['defaults']['ram_gb']:.0f} GiB RAM / {data['defaults']['cpus']} CPU. "
+        f"Declare real numbers with --ram/--cpus/--vram.[/dim]"
     )
     service.close()
 
@@ -1369,6 +1570,14 @@ def main_callback(
 
 
 def main() -> None:
+    # Output is UTF-8: meters, box drawing and the ellipsis in truncated
+    # commands are all non-ASCII, and on Windows a redirected stdout defaults
+    # to the locale codec, which turns `gpuq report | tee` into a crash.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):  # pragma: no cover
+            pass
     try:
         app()
     except KeyboardInterrupt:  # pragma: no cover

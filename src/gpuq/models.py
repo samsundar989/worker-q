@@ -151,6 +151,9 @@ class Job:
     # Derived / late-bound fields.
     log_path: str | None = None
     cuda_visible_devices: str | None = None
+    requested_ram_mib: float | None = None
+    requested_vram_mib: float | None = None
+    requested_cpus: int | None = None
     passthrough_json: str | None = None
     env_json: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
@@ -223,6 +226,9 @@ class Job:
             "command": self.command,
             "shell_mode": bool(self.shell_mode),
             "requested_gpu_count": self.requested_gpu_count,
+            "requested_ram_mib": self.requested_ram_mib,
+            "requested_vram_mib": self.requested_vram_mib,
+            "requested_cpus": self.requested_cpus,
             "gpu_mode": self.gpu_mode,
             "snapshot_mode": self.snapshot_mode,
             "snapshot_commit": self.snapshot_commit,

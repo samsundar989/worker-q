@@ -22,7 +22,7 @@ from gpuq.models import (
 )
 from gpuq.util import ensure_dir, restrict_permissions, utcnow_iso
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _MIGRATIONS: list[tuple[int, str]] = [
     (
@@ -84,6 +84,18 @@ _MIGRATIONS: list[tuple[int, str]] = [
         CREATE INDEX IF NOT EXISTS idx_jobs_queued_at ON jobs(queued_at);
         """,
     ),
+    (
+        2,
+        """
+        -- Resource requests. gpuq brokers any heavy workload, not just GPU
+        -- work, so a job declares what it needs and the dispatcher admits it
+        -- only when that fits. NULL means "use the configured default", which
+        -- keeps rows written by an older gpuq working unchanged.
+        ALTER TABLE jobs ADD COLUMN requested_ram_mib REAL;
+        ALTER TABLE jobs ADD COLUMN requested_vram_mib REAL;
+        ALTER TABLE jobs ADD COLUMN requested_cpus INTEGER;
+        """,
+    ),
 ]
 
 _JOB_COLUMNS = (
@@ -91,7 +103,8 @@ _JOB_COLUMNS = (
     "execution_cwd, command_json, shell_mode, requested_gpu_count, gpu_mode, snapshot_mode, "
     "snapshot_commit, snapshot_path, host, submitter_pid, submitter_agent, state, exit_code, "
     "runner_pid, queued_at, started_at, finished_at, error, created_at, updated_at, log_path, "
-    "cuda_visible_devices, passthrough_json, env_json"
+    "cuda_visible_devices, passthrough_json, env_json, requested_ram_mib, "
+    "requested_vram_mib, requested_cpus"
 )
 
 #: Columns callers are allowed to update through `update_job`.
@@ -114,6 +127,9 @@ _UPDATABLE = frozenset(
         "cuda_visible_devices",
         "passthrough_json",
         "env_json",
+        "requested_ram_mib",
+        "requested_vram_mib",
+        "requested_cpus",
     }
 )
 

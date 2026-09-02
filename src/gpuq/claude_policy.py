@@ -22,12 +22,15 @@ from gpuq.util import atomic_write_text, ensure_dir, expand_path
 START_MARKER = "<!-- gpuq-policy:start -->"
 END_MARKER = "<!-- gpuq-policy:end -->"
 
-POLICY_BODY = """## GPU / Heavy Workload Policy
+POLICY_BODY = """## Heavy Workload Policy (GPU, RAM and CPU)
 
-This machine uses `gpuq` to coordinate expensive workloads across concurrent agents.
+This machine uses `gpuq` to broker expensive workloads across concurrent agents.
+It is not only for GPU work: host RAM exhaustion is the most common way this
+box falls over, so anything heavy in **VRAM, RAM or CPU** goes through the queue.
 
-NEVER directly launch a command expected to substantially use NVIDIA CUDA/VRAM
-or large enough host resources that overlapping runs could cause OOM.
+NEVER directly launch a command expected to substantially use NVIDIA CUDA/VRAM,
+host RAM, or many CPU cores - overlapping runs cause OOM and take the machine
+down for everyone.
 
 This includes, unless clearly tiny:
 - model training or fine-tuning
@@ -38,11 +41,23 @@ This includes, unless clearly tiny:
 - GPU simulators
 - hyperparameter/ablation sweeps
 - commands that load large models
+- large data processing, memory-mapped volumes, big dataframes
+- anything you expect to hold more than ~4 GiB of RAM
 - other long-running high-memory experiments
 
 Submit them instead:
 
     gpuq submit --project <project> --priority normal -- <command> <args...>
+
+**Declare what the job needs.** This is what lets gpuq run small jobs in
+parallel and serialise big ones, instead of guessing:
+
+    gpuq submit --project <project> --ram 24 --vram 12 --cpus 4 -- <command>
+
+`--ram` and `--vram` are peak GiB. Estimate high rather than low; an undeclared
+job is charged a small default and may be admitted when it should have waited.
+A job that asks for more than the machine has is rejected immediately rather
+than queued forever.
 
 Use `--priority critical` only for work that is genuinely blocking urgent progress.
 
@@ -52,16 +67,24 @@ unless the result is required for the next action.
 Inspect work with:
 
     gpuq status
+    gpuq top                      live dashboard: queue + machine pressure
     gpuq show <job_id>
     gpuq logs <job_id>
     gpuq logs <job_id> --follow
+    gpuq report                   why recent jobs failed, and whose they were
+    gpuq resources                capacity, headroom and current limits
 
 Cancel with:
 
     gpuq cancel <job_id>
 
-Do not bypass `gpuq` just because `nvidia-smi` currently looks idle.
-The shared queue is the source of truth for broker-managed heavy work.
+Do not bypass `gpuq` just because `nvidia-smi` currently looks idle. GPU memory
+is not the binding constraint most of the time - host RAM is - and the queue is
+the only thing that can see the whole picture.
+
+If a job is QUEUED and not starting, that is usually deliberate: `gpuq status`
+prints the reason (waiting for RAM, VRAM or CPU). Do not work around it by
+running the command directly.
 
 Small CPU-only commands and genuinely lightweight tests may run directly.
 

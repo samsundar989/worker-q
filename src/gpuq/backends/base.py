@@ -71,6 +71,9 @@ class SchedulerBackend(Protocol):
         priority_rank: int = 100,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
+        ram_mib: float | None = None,
+        vram_mib: float | None = None,
+        cpus: int | None = None,
     ) -> int: ...
 
     def list_jobs(self) -> list[BackendJob]: ...

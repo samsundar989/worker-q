@@ -59,10 +59,19 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 """
 
+#: Columns added after v1. Applied with ALTER so an existing queue database -
+#: possibly with jobs in flight - upgrades in place.
+_ADDED_COLUMNS = (
+    ("ram_mib", "REAL"),
+    ("vram_mib", "REAL"),
+    ("cpus", "INTEGER"),
+)
+
 _COLUMNS = (
     "id, label, argv_json, cwd, env_json, gpu_count, slots, priority_rank, position, "
     "log_path, state, exit_code, pid, pid_creation, assigned_devices, cancel_requested, "
-    "cancel_force, cancel_at, wait_reason, enqueued_at, started_at, finished_at"
+    "cancel_force, cancel_at, wait_reason, enqueued_at, started_at, finished_at, "
+    "ram_mib, vram_mib, cpus"
 )
 
 
@@ -86,6 +95,10 @@ class QueueStore:
 
     def initialize(self) -> None:
         self.conn.executescript(SCHEMA)
+        existing = {row["name"] for row in self.conn.execute("PRAGMA table_info(bjobs)")}
+        for column, sql_type in _ADDED_COLUMNS:
+            if column not in existing:
+                self.conn.execute(f"ALTER TABLE bjobs ADD COLUMN {column} {sql_type}")
 
     def close(self) -> None:
         if self._conn is not None:
@@ -138,14 +151,18 @@ class QueueStore:
         log_path: str | None,
         cwd: str | None,
         env: dict[str, str] | None,
+        ram_mib: float | None = None,
+        vram_mib: float | None = None,
+        cpus: int | None = None,
     ) -> int:
         with self.transaction() as conn:
             row = conn.execute("SELECT COALESCE(MAX(position), 0) AS p FROM bjobs").fetchone()
             position = int(row["p"]) + 1
             cur = conn.execute(
                 "INSERT INTO bjobs (label, argv_json, cwd, env_json, gpu_count, slots, "
-                "priority_rank, position, log_path, state, enqueued_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "priority_rank, position, log_path, state, enqueued_at, ram_mib, "
+                "vram_mib, cpus) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     label,
                     json.dumps(argv, ensure_ascii=False),
@@ -158,6 +175,9 @@ class QueueStore:
                     log_path,
                     BACKEND_QUEUED,
                     utcnow_iso(),
+                    ram_mib,
+                    vram_mib,
+                    cpus,
                 ),
             )
             return int(cur.lastrowid)
@@ -309,5 +329,8 @@ def row_to_backend_job(row: dict[str, Any]) -> BackendJob:
             "cancel_requested": bool(row.get("cancel_requested")),
             "priority_rank": row.get("priority_rank"),
             "position": row.get("position"),
+            "ram_mib": row.get("ram_mib"),
+            "vram_mib": row.get("vram_mib"),
+            "cpus": row.get("cpus"),
         },
     )

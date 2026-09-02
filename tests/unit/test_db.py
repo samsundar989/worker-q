@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from gpuq.db import Database, json_dumps
+from gpuq.db import SCHEMA_VERSION, Database, json_dumps
 from gpuq.models import InvalidTransition, JobState, can_transition
 from gpuq.util import utcnow_iso
 
@@ -37,7 +37,7 @@ def db(tmp_path: Path) -> Database:
 
 
 def test_schema_initializes(db: Database):
-    assert db.schema_version() == 1
+    assert db.schema_version() == SCHEMA_VERSION
     tables = {
         r["name"]
         for r in db.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -67,15 +67,15 @@ def test_pragmas_applied(db: Database):
 def test_migration_is_idempotent(tmp_path: Path):
     path = tmp_path / "gpuq.sqlite3"
     first = Database(path)
-    assert first.initialize() == 1
+    assert first.initialize() == SCHEMA_VERSION
     job_id = _insert(first)
     first.close()
 
     second = Database(path)
-    assert second.initialize() == 1  # re-running changes nothing
+    assert second.initialize() == SCHEMA_VERSION  # re-running changes nothing
     assert second.get_job(job_id) is not None
     applied = second.conn.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0]
-    assert applied == 1
+    assert applied == SCHEMA_VERSION  # one row per applied migration, none repeated
     second.close()
 
 
@@ -245,3 +245,40 @@ def test_timestamps_are_utc_iso(db: Database):
     job = db.get_job(_insert(db))
     assert job.created_at.endswith("+00:00")
     assert utcnow_iso().endswith("+00:00")
+
+
+def test_migration_adds_resource_columns(db: Database):
+    """v2 adds the resource request columns without touching existing rows."""
+    columns = {row["name"] for row in db.conn.execute("PRAGMA table_info(jobs)")}
+    assert {"requested_ram_mib", "requested_vram_mib", "requested_cpus"} <= columns
+
+
+def test_resource_request_roundtrip(db: Database):
+    job_id = _insert(db, requested_ram_mib=16384.0, requested_cpus=8)
+    job = db.get_job(job_id)
+    assert job.requested_ram_mib == 16384.0
+    assert job.requested_cpus == 8
+    assert job.requested_vram_mib is None  # undeclared -> configured default
+
+
+def test_upgrade_from_v1_preserves_rows(tmp_path: Path):
+    """A database written by the previous schema keeps its jobs on upgrade."""
+    from gpuq.db import _MIGRATIONS
+
+    path = tmp_path / "old.sqlite3"
+    old = Database(path)
+    old.conn.executescript(
+        "CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at TEXT NOT NULL);"
+    )
+    old.conn.executescript(_MIGRATIONS[0][1])
+    old.conn.execute(
+        "INSERT INTO schema_version(version, applied_at) VALUES (1, '2020-01-01T00:00:00+00:00')"
+    )
+    job_id = _insert(old)
+    old.close()
+
+    upgraded = Database(path)
+    assert upgraded.initialize() == SCHEMA_VERSION
+    job = upgraded.get_job(job_id)
+    assert job is not None and job.requested_ram_mib is None
+    upgraded.close()

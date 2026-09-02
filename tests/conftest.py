@@ -14,7 +14,14 @@ from pathlib import Path
 
 import pytest
 
-from gpuq.config import BackendConfig, ClaudeConfig, Config, CoreConfig, GpuConfig
+from gpuq.config import (
+    BackendConfig,
+    ClaudeConfig,
+    Config,
+    CoreConfig,
+    GpuConfig,
+    ResourcesConfig,
+)
 from gpuq.core import GPUQService
 
 
@@ -55,6 +62,11 @@ def isolated_config(tmp_path: Path) -> Config:
             free_memory_threshold_percent=0,
         ),
         backend=BackendConfig(poll_interval_seconds=0.1),
+        # Admission control is exercised deterministically in
+        # tests/unit/test_resources.py. Leaving it on here would make every
+        # queue test depend on how much memory this machine happens to have
+        # free while the suite runs.
+        resources=ResourcesConfig(enforce=False),
         claude=ClaudeConfig(install_user_policy=False),
         source_path=tmp_path / "config.toml",
         profile="pytest",

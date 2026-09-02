@@ -386,3 +386,41 @@ def test_missing_or_malformed_project_config_is_safe(git_repo: Path, tmp_path: P
     assert load_project_passthrough(None) == []
     (git_repo / ".gpuq.toml").write_text("[snapshot\nbroken", encoding="utf-8")
     assert load_project_passthrough(git_repo) == []
+
+
+def test_concurrent_snapshots_of_one_repo(git_repo: Path, tmp_path: Path):
+    """Several agents submitting at once must not collide in .git/worktrees.
+
+    Regression guard: `git worktree add` names the worktree after the
+    destination's basename, so snapshots that all ended in "/repo" raced and
+    failed with "failed to read .git/worktrees/repo/commondir".
+    """
+    import threading
+
+    errors: list[Exception] = []
+    created: list[Snapshot] = []
+    lock = threading.Lock()
+
+    def worker(job_id: int) -> None:
+        try:
+            snap = create_git_snapshot(
+                git_repo,
+                tmp_path / "state" / "snapshots" / str(job_id) / f"job-{job_id}",
+                job_id=job_id,
+            )
+            with lock:
+                created.append(snap)
+        except Exception as exc:
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(1, 6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=180)
+
+    assert not errors, errors
+    assert len(created) == 5
+    for snap in created:
+        assert (snap.path / "tracked.txt").read_text(encoding="utf-8") == "original\n"

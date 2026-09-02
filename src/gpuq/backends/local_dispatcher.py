@@ -261,6 +261,9 @@ class LocalDispatcherBackend:
         priority_rank: int = 100,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
+        ram_mib: float | None = None,
+        vram_mib: float | None = None,
+        cpus: int | None = None,
     ) -> int:
         """Enqueue an argv vector. No shell, no string concatenation."""
         argv = [str(a) for a in argv]
@@ -279,6 +282,9 @@ class LocalDispatcherBackend:
             log_path=log_path,
             cwd=cwd,
             env=env,
+            ram_mib=ram_mib,
+            vram_mib=vram_mib,
+            cpus=cpus,
         )
 
     def list_jobs(self, *, limit: int | None = None) -> list[BackendJob]:

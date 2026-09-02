@@ -190,6 +190,90 @@ away when the job ends.
 
 ---
 
+## My box is crashing / jobs die with MemoryError
+
+Start here:
+
+```bash
+gpuq report --pressure     # what failed, why, and what held memory
+gpuq top                   # live view while it is happening
+```
+
+`gpuq report` separates failures caused by **the machine** (CUDA OOM, host OOM,
+killed) from failures caused by **the job's own code**, and groups them by
+project and submitting agent. If the verdict blames resource exhaustion, the
+usual cause is one of these two.
+
+### Something heavy is running outside the queue
+
+This is the common one. A slot count cannot see work gpuq did not start, so a
+single unqueued job can exhaust the box while gpuq believes it is idle.
+
+`gpuq top` tags every large process **gpuq** or **foreign**, and `gpuq doctor`
+raises "Unqueued heavy workloads". Fix it by submitting that work:
+
+```bash
+gpuq submit --project the-other-project --ram 20 -- <its command>
+```
+
+### Jobs are not declaring what they need
+
+An undeclared job is charged only a small default, so gpuq may admit it when it
+should have waited. Declare real numbers:
+
+```bash
+gpuq submit --project biohub --ram 24 --cpus 4 -- python -m celltrack train
+```
+
+`gpuq show <id>` prints what a job actually requested.
+
+---
+
+## A job is QUEUED and gpuq says it is waiting for RAM
+
+That is admission control, and it is preventing a crash rather than causing a
+problem. `gpuq status` prints the reason:
+
+```text
+ 60  QUEUED  normal  biohub  4m wait
+     ↳ needs 24.0 GiB RAM but only 9.1 GiB is free after the 10% floor
+```
+
+It starts on its own once the memory frees up. Check what is holding it with
+`gpuq top`. If the request was simply too pessimistic, cancel and resubmit with
+a smaller `--ram`.
+
+Current limits and headroom:
+
+```bash
+gpuq resources
+```
+
+If the machine is genuinely bigger than gpuq thinks it can use, adjust the
+guard rails rather than disabling them:
+
+```bash
+gpuq config set resources.reserve_ram_gb 6
+gpuq config set resources.max_commit_percent 90
+```
+
+Turning enforcement off entirely (`resources.enforce = false`) restores the old
+behaviour where only the slot count limits jobs - and with it the crashes.
+
+---
+
+## "Commit charge 91% of the limit" in doctor
+
+Windows fails allocations as the system commit charge approaches its limit,
+even while physical RAM still looks free, so gpuq stops starting jobs before
+that point. This is reported as **degraded**, not broken: submitting still
+works, jobs simply wait, and they resume by themselves.
+
+If it stays high, something large is resident. `gpuq top` names it. Growing the
+page file raises the limit if that is genuinely what you want.
+
+---
+
 ## Cancel did not stop everything
 
 ```bash

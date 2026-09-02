@@ -208,13 +208,18 @@ def test_remove_block_on_text_without_markers():
 def test_policy_text_matches_the_spec():
     body = POLICY_BODY
     for required in (
-        "## GPU / Heavy Workload Policy",
+        "## Heavy Workload Policy (GPU, RAM and CPU)",
         "NEVER directly launch a command",
         "gpuq submit --project <project> --priority normal -- <command> <args...>",
         "gpuq status",
         "gpuq cancel <job_id>",
         "Do not bypass `gpuq`",
         "Small CPU-only commands",
+        # The policy must teach declaring a footprint, or admission control is
+        # guessing and jobs get admitted that should have waited.
+        "--ram 24 --vram 12 --cpus 4",
+        "gpuq top",
+        "gpuq report",
     ):
         assert required in body
 

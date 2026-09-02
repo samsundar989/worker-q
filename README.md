@@ -106,6 +106,103 @@ Exit code `0` healthy, `1` degraded but usable, `2` broken — do not submit.
 
 ---
 
+
+## Declaring what a job needs
+
+gpuq brokers **any** heavy workload, not just GPU work. Host RAM exhaustion is
+the most common way a dev box falls over, and a slot count cannot see it.
+
+```bash
+gpuq submit --project biohub --ram 24 --vram 12 --cpus 4 --   C:/Users/you/Documents/biohub/.venv/Scripts/python.exe -m celltrack train
+```
+
+`--ram` and `--vram` are peak GiB. A job starts only when its declared
+footprint fits, judged two ways at once:
+
+* against **measured free memory** right now, which is the only thing that
+  accounts for workloads gpuq did not start;
+* against the **sum of what running jobs reserved**, because a job that started
+  moments ago has not grown to full size yet.
+
+That is what lets several small jobs run together while two large ones
+serialise, without you picking a slot count. A blocked job says why:
+
+```text
+ 60  QUEUED   normal  biohub   4m wait  24G 4c
+     ↳ needs 24.0 GiB RAM but only 9.1 GiB is free after the 10% floor
+```
+
+A job that asks for more than the machine has is rejected at submit time rather
+than queued forever.
+
+Undeclared jobs are charged a modest default (4 GiB RAM, 1 CPU) so they are
+never treated as free — but estimate properly, since a job that under-declares
+can be admitted when it should have waited.
+
+To run more than one job at a time, raise the slot cap; admission control keeps
+it honest:
+
+```bash
+gpuq concurrency 4 --yes
+```
+
+Tune the guard rails in `[resources]` (see `gpuq resources` for current values):
+
+```toml
+[resources]
+enforce = true
+reserve_ram_gb = 8.0        # never handed out: OS, editors, agents
+reserve_cpus = 2
+min_host_free_percent = 10  # floor a job may not eat into
+max_commit_percent = 88     # hard stop; Windows fails allocations near this
+default_ram_gb = 4.0        # charged to jobs that declare nothing
+```
+
+---
+
+
+## Watching the queue and diagnosing crashes
+
+```bash
+gpuq top        # live dashboard: queue, machine pressure, who holds memory
+gpuq report     # why recent jobs failed, and whose workload it was
+gpuq resources  # capacity, headroom, and the limits being enforced
+```
+
+`gpuq top` refreshes in place and shows four things at once: VRAM / RAM /
+commit-charge meters that turn amber then red under pressure, the live queue
+with a wait reason under anything that is blocked, the largest memory consumers
+tagged **gpuq** or **foreign**, and recently finished jobs with a one-line cause
+for each failure. Ctrl-C exits. `--once` prints a single frame, which is what
+you want in a script.
+
+That `foreign` tag is usually the answer when the box falls over: it is a heavy
+workload running outside the queue, which gpuq can see but cannot schedule
+around.
+
+`gpuq report` classifies every recent failure - CUDA OOM, host OOM, killed,
+missing file, import error, application exception - and groups them by project
+and by the agent that submitted them. For failures caused by the machine rather
+than the code, it prints what memory looked like at that moment:
+
+```text
+Last 24h  33 finished - 11 ok - 18 failed - 4 cancelled - success 38%
+
+CAUSE                                  N
+host out of memory                     1
+job raised an exception                4
+
+  #51 biohub host out of memory (exit 1, claude-code)
+      MemoryError: could not read frame 78 ... the host is out of memory
+      at the time: host 6% free, commit 94%
+      -> declare --ram so gpuq holds the job until that much is actually free
+```
+
+Add `--pressure` to also list what peaked in that window, and `--json` for
+anything you want to parse.
+
+---
+
 ## Installation
 
 Requires Python 3.11+, git, and (for GPU gating) a working NVIDIA driver.
@@ -369,8 +466,11 @@ See [docs/architecture.md](docs/architecture.md),
 | Command | Purpose |
 | --- | --- |
 | `gpuq init` | Create state, database and dispatcher. Idempotent. |
-| `gpuq submit -- CMD` | Queue a job and return immediately. |
+| `gpuq submit [--ram N --vram N --cpus N] -- CMD` | Queue a job and return immediately. |
 | `gpuq status` / `gpuq list` | Show the queue. `--json` for agents. |
+| `gpuq top` | Live dashboard: queue, pressure, memory owners. |
+| `gpuq report` | Why recent jobs failed, grouped by cause and project. |
+| `gpuq resources` | Capacity, headroom and enforced limits. |
 | `gpuq show ID` | Full detail and source provenance. |
 | `gpuq logs ID [--follow] [--tail N]` | Job output. |
 | `gpuq cancel ID [--force]` | Cancel queued or running work. |
@@ -389,11 +489,6 @@ See [docs/architecture.md](docs/architecture.md),
 Every command that produces data supports `--json`, which writes only JSON to
 stdout. Errors always go to stderr.
 
-## License
-
-MIT. See [LICENSE](LICENSE).
-
----
 
 ## Windows notes
 
@@ -434,3 +529,10 @@ child, so the polite stop is best-effort and the tree kill is the guarantee;
 
 **Job encoding.** Logs are UTF-8, so jobs get `PYTHONIOENCODING=utf-8` unless
 you override it with `--env`.
+
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+---

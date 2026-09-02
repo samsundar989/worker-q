@@ -286,10 +286,26 @@ class Doctor:
                 f"{free:.0f}% free" if free is not None else "memory unknown",
             )
 
-        # Would the configured threshold currently block dispatch?
+        # Would the configured threshold currently block dispatch? A gpuq job
+        # that is legitimately using the GPU is not a problem to report - the
+        # next job was going to wait for the slot regardless.
         threshold = self.config.gpu.free_memory_threshold_percent
         best = info.max_free_percent()
-        if best is not None and best + 1e-9 < threshold:
+        running = [
+            job
+            for job in self.service.db.list_jobs(states=["RUNNING"])
+            if job.requested_gpu_count
+        ]
+        if best is None:
+            pass
+        elif running:
+            self.add(
+                "GPU meets free-memory threshold",
+                PASS,
+                f"{best:.0f}% free; the GPU is in use by gpuq job "
+                f"#{running[0].id} ({running[0].project})",
+            )
+        elif best + 1e-9 < threshold:
             self.add(
                 "GPU meets free-memory threshold",
                 WARN,
@@ -298,7 +314,7 @@ class Doctor:
                 f"lower it with 'gpuq gpu-threshold {max(0, int(best) - 5)}' "
                 "if this baseline usage is normal for this desktop",
             )
-        elif best is not None:
+        else:
             self.add(
                 "GPU meets free-memory threshold",
                 PASS,
@@ -311,7 +327,11 @@ class Doctor:
         # doctor. What is actually actionable is foreign work consuming enough
         # VRAM to block or endanger a job - so escalate on the memory, not on
         # the mere existence of other processes. `gpuq gpu` always lists them.
-        foreign = foreign_processes(info, own_pids=self.service.own_gpu_pids())
+        try:
+            own_pids = self.service.own_pids()
+        except Exception:
+            own_pids = self.service.own_gpu_pids()
+        foreign = foreign_processes(info, own_pids=own_pids)
         listed = ", ".join(
             f"{p.pid} {os.path.basename(p.process_name)}"
             f"{f' {p.used_memory_mib / 1024:.1f} GiB' if p.used_memory_mib else ''}"
@@ -319,6 +339,13 @@ class Doctor:
         )
         if not foreign:
             self.add("Foreign GPU processes", PASS, "none detected")
+        elif running:
+            self.add(
+                "Foreign GPU processes",
+                PASS,
+                f"{len(foreign)} other process(es) alongside gpuq job "
+                f"#{running[0].id}",
+            )
         elif best is not None and best + 1e-9 < threshold:
             self.add(
                 "Foreign GPU processes",
@@ -335,6 +362,93 @@ class Doctor:
                 f"but {best:.0f}% is free" if best is not None else f"{len(foreign)} other process(es)",
                 "gpuq cannot control these; the free-memory threshold is the guard",
             )
+
+    def check_host_resources(self) -> None:
+        """Host RAM and commit charge - the limits that actually crash a box."""
+        from gpuq import host
+        from gpuq.resources import capacity
+
+        mem = host.memory()
+        if mem.error:
+            self.add("Host memory", WARN, mem.error)
+            return
+
+        cap = capacity(self.config, gpu=None, mem=mem)
+        self.add(
+            "Host memory",
+            PASS,
+            f"{(mem.available_mib or 0) / 1024:.1f} GiB free of "
+            f"{(mem.total_mib or 0) / 1024:.1f} GiB "
+            f"({mem.free_percent or 0:.0f}%), {cap.usable_ram_mib / 1024:.0f} GiB usable",
+        )
+
+        r = self.config.resources
+        if not r.enforce:
+            self.add(
+                "Resource admission control",
+                WARN,
+                "disabled (resources.enforce = false)",
+                "jobs are gated only by slot count, so a heavy job can still "
+                "start on an exhausted machine",
+            )
+        else:
+            self.add(
+                "Resource admission control",
+                PASS,
+                f"enforced - reserve {r.reserve_ram_gb:.0f} GiB RAM / {r.reserve_cpus} CPU, "
+                f"floor {r.min_host_free_percent}% free, commit stop {r.max_commit_percent}%",
+            )
+
+        commit = mem.commit_percent
+        if commit is None:
+            return
+        if commit >= r.max_commit_percent:
+            # Degraded, not broken. gpuq is doing exactly its job by holding
+            # work back, submitting is still safe (the job queues), and the
+            # condition clears itself when the pressure does. Reserving FAIL
+            # for "gpuq is broken" keeps the signal worth reading.
+            self.add(
+                "Commit charge",
+                WARN,
+                f"{commit:.0f}% of the limit, at or above the {r.max_commit_percent}% "
+                "stop - new jobs will wait rather than start",
+                "run 'gpuq top' to see what is holding memory; jobs resume "
+                "automatically once it frees up",
+            )
+        elif commit >= r.max_commit_percent - 8:
+            self.add(
+                "Commit charge",
+                WARN,
+                f"{commit:.0f}% of the limit, close to the {r.max_commit_percent}% stop",
+                "run 'gpuq top' to see what is holding memory",
+            )
+        else:
+            self.add("Commit charge", PASS, f"{commit:.0f}% of the limit")
+
+    def check_unqueued_heavy_work(self) -> None:
+        """Large processes gpuq did not start are the usual cause of a crash."""
+        from gpuq import host
+
+        try:
+            own = self.service.own_pids()
+        except Exception:
+            own = set()
+        offenders = [
+            proc
+            for proc in host.top_processes(12)
+            if proc.pid not in own and proc.memory_gib >= 6.0
+        ]
+        if not offenders:
+            self.add("Unqueued heavy workloads", PASS, "none holding 6+ GiB")
+            return
+        listed = ", ".join(f"{p.name} ({p.memory_gib:.1f} GiB, pid {p.pid})" for p in offenders[:4])
+        self.add(
+            "Unqueued heavy workloads",
+            WARN,
+            f"{len(offenders)} process(es) gpuq did not start: {listed}",
+            "gpuq cannot schedule around these; submit that work through the "
+            "queue so it is accounted for",
+        )
 
     def check_cuda_toolkit(self) -> None:
         """The toolkit is informational here.
@@ -449,6 +563,8 @@ class Doctor:
         self.guard("Backend", self.check_backend)
         self.guard("Stale daemon", self.check_stale_daemon)
         self.guard("NVIDIA", self.check_nvidia)
+        self.guard("Host resources", self.check_host_resources)
+        self.guard("Unqueued work", self.check_unqueued_heavy_work)
         self.guard("CUDA toolkit", self.check_cuda_toolkit)
         self.guard("git", self.check_git)
         self.guard("Claude policy", self.check_claude_policy)

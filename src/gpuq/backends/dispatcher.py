@@ -30,7 +30,15 @@ from typing import Any, TextIO
 from gpuq.backends.base import BACKEND_QUEUED, BACKEND_RUNNING
 from gpuq.backends.queue_store import QueueStore
 from gpuq.config import Config
+from gpuq import host, resources as res
 from gpuq.gpu import query_gpus
+from gpuq.telemetry import (
+    EVENT_BLOCKED,
+    EVENT_DAEMON,
+    EVENT_FINISHED,
+    EVENT_STARTED,
+    open_telemetry,
+)
 from gpuq.util import ensure_dir, utcnow_iso
 from gpuq.winproc import (
     ProcessGroup,
@@ -54,6 +62,7 @@ META_VERSION = "daemon_version"
 META_INTERPRETER = "interpreter"
 
 _GPU_CACHE_SECONDS = 3.0
+_SAMPLE_INTERVAL_SECONDS = 10.0
 
 
 @dataclass
@@ -74,6 +83,11 @@ class Dispatcher:
         #: Jobs inherited from a previous dispatcher: id -> (pid, creation).
         self.adopted: dict[int, tuple[int, int]] = {}
         self._gpu_cache: tuple[float, Any] | None = None
+        self.telemetry = open_telemetry(config.state_dir)
+        self._last_sample = 0.0
+        #: backend_id -> (first_blocked_monotonic, last_reason), so a job that
+        #: cannot be admitted is reported once rather than every tick.
+        self._blocked: dict[int, tuple[float, str]] = {}
         self._log_path = config.state_dir / "run" / "dispatcher.log"
         self._stop = False
 
@@ -176,6 +190,86 @@ class Dispatcher:
             env["GPUQ_PROFILE"] = self.config.profile
         return env
 
+
+    # -- resource accounting -----------------------------------------------
+    def _request_for(self, row: dict[str, Any]) -> res.ResourceRequest:
+        """What this queued row is asking for, filling in configured defaults."""
+        return res.ResourceRequest.from_job(
+            self.config,
+            ram_mib=row.get("ram_mib"),
+            vram_mib=row.get("vram_mib"),
+            cpus=row.get("cpus"),
+            gpu_count=int(row.get("gpu_count") or 0),
+        )
+
+    def _running_requests(self) -> list[res.ResourceRequest]:
+        """Reservations held by everything currently executing."""
+        requests: list[res.ResourceRequest] = []
+        active = set(self.running) | set(self.adopted)
+        for row in self.store.running():
+            if int(row["id"]) in active:
+                requests.append(self._request_for(row))
+        return requests
+
+    def _admit(self, row: dict[str, Any]) -> res.Decision:
+        return res.admit(
+            self.config,
+            self._request_for(row),
+            self._running_requests(),
+            gpu=self._gpu_info(),
+            mem=host.memory(),
+        )
+
+    def _note_blocked(self, backend_id: int, reason: str) -> None:
+        """Record a blocked job once, and escalate if it stays blocked."""
+        now = time.monotonic()
+        first, previous = self._blocked.get(backend_id, (now, ""))
+        self._blocked[backend_id] = (first, reason)
+        if previous == reason:
+            waited = now - first
+            threshold = self.config.resources.blocked_warning_seconds
+            if threshold and waited >= threshold and int(waited) % 300 < 1:
+                self.log(f"job {backend_id}: still blocked after {waited / 60:.0f}m - {reason}")
+            return
+        self.log(f"job {backend_id}: waiting - {reason}")
+        self.telemetry.record_event(
+            EVENT_BLOCKED, backend_job_id=backend_id, detail=reason
+        )
+
+    # -- telemetry ----------------------------------------------------------
+    def _sample_resources(self) -> None:
+        """Cheap periodic snapshot so failures can be explained afterwards."""
+        now = time.monotonic()
+        if now - self._last_sample < _SAMPLE_INTERVAL_SECONDS:
+            return
+        self._last_sample = now
+        try:
+            gpu = self._gpu_info()
+            mem = host.memory()
+            device = gpu.devices[0] if (gpu.available and gpu.devices) else None
+            running_ids = sorted(set(self.running) | set(self.adopted))
+            top = [
+                {"pid": p.pid, "name": p.name, "mib": round(p.memory_mib, 1)}
+                for p in host.top_processes(6)
+            ]
+            self.telemetry.record_sample(
+                gpu_used_mib=device.memory_used_mib if device else None,
+                gpu_total_mib=device.memory_total_mib if device else None,
+                gpu_free_percent=device.free_percent if device else None,
+                gpu_utilization=device.utilization_percent if device else None,
+                host_total_mib=mem.total_mib,
+                host_available_mib=mem.available_mib,
+                host_free_percent=mem.free_percent,
+                commit_used_mib=mem.commit_used_mib,
+                commit_limit_mib=mem.commit_limit_mib,
+                commit_percent=mem.commit_percent,
+                running_job_id=running_ids[0] if running_ids else None,
+                queued_count=len(self.store.queued()),
+                top_consumers=top,
+            )
+        except Exception:
+            pass
+
     # -- start ------------------------------------------------------------
     def _start_job(self, row: dict[str, Any], devices: list[int]) -> bool:
         backend_id = int(row["id"])
@@ -246,9 +340,16 @@ class Dispatcher:
         self.running[backend_id] = _RunningJob(
             backend_id=backend_id, proc=proc, group=group, log_handle=handle, devices=devices
         )
+        request = self._request_for(row)
         self.log(
             f"job {backend_id}: started pid={proc.pid} devices={devices or '-'} "
-            f"cmd={argv[:4]}"
+            f"ram={request.ram_mib / 1024:.1f}GiB cpus={request.cpus} cmd={argv[:4]}"
+        )
+        self.telemetry.record_event(
+            EVENT_STARTED,
+            backend_job_id=backend_id,
+            detail=f"pid {proc.pid}",
+            data={"devices": devices, "request": request.to_dict()},
         )
         return True
 
@@ -264,15 +365,32 @@ class Dispatcher:
                 break
             if row.get("cancel_requested"):
                 continue  # handled by the cancellation pass
+
+            backend_id = int(row["id"])
+
+            # Admission control: does this job's declared RAM/CPU/VRAM fit in
+            # the headroom that is actually free, once running reservations and
+            # foreign workloads are accounted for?
+            decision = self._admit(row)
+            if not decision.admit:
+                if first_blocked_reason is None:
+                    first_blocked_reason = decision.reason
+                    self.store.update(backend_id, wait_reason=decision.reason)
+                    self._note_blocked(backend_id, decision.reason or "blocked")
+                break
+
             devices, reason = self._allocate_devices(int(row.get("gpu_count") or 0))
             if devices is None:
                 # Head-of-line blocking is intentional: a queued critical job
                 # must not be overtaken just because the GPU is busy.
                 if first_blocked_reason is None:
                     first_blocked_reason = reason
-                    self.store.update(int(row["id"]), wait_reason=reason)
+                    self.store.update(backend_id, wait_reason=reason)
+                    self._note_blocked(backend_id, reason or "blocked")
                 break
+
             if self._start_job(row, devices):
+                self._blocked.pop(backend_id, None)
                 in_flight += 1
 
     # -- reap -------------------------------------------------------------
@@ -292,6 +410,10 @@ class Dispatcher:
             job.group.close()
             self.store.finish(backend_id, exit_code=code)
             self.log(f"job {backend_id}: finished exit={code}")
+            self.telemetry.record_event(
+                EVENT_FINISHED, backend_job_id=backend_id, detail=f"exit {code}",
+                data={"exit_code": code},
+            )
 
         self._reap_adopted()
 
@@ -390,6 +512,7 @@ class Dispatcher:
         self.store.set_meta(META_LOGDIR, str(self.config.logs_dir))
         self._heartbeat()
         self.log(f"dispatcher started pid={pid} state_dir={self.config.state_dir}")
+        self.telemetry.record_event(EVENT_DAEMON, detail=f"started pid {pid}")
 
         self._recover_orphans()
 
@@ -399,6 +522,7 @@ class Dispatcher:
             while not self._stop:
                 try:
                     self._heartbeat()
+                    self._sample_resources()
                     self._reap()
                     self._service_cancellations()
                     self._start_ready_jobs()
@@ -406,6 +530,7 @@ class Dispatcher:
                     if trim_counter >= int(60 / max(interval, 0.05)):
                         trim_counter = 0
                         self.store.trim_finished(self.config.backend.max_finished)
+                        self.telemetry.prune()
                     if self.store.get_meta(META_SHUTDOWN, "0") == "1":
                         self.log("shutdown requested")
                         break
@@ -423,6 +548,8 @@ class Dispatcher:
                 # Deliberately not killed: a training run must survive a
                 # dispatcher restart.
                 job.group.close()
+            self.telemetry.record_event(EVENT_DAEMON, detail="stopped")
+            self.telemetry.close()
             self.store.set_meta(META_DAEMON_PID, 0)
             self.store.set_meta(META_SHUTDOWN, "0")
             self.store.close()

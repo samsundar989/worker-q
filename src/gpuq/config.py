@@ -81,6 +81,40 @@ class BackendConfig:
 
 
 @dataclass
+class ResourcesConfig:
+    """Admission control for *any* heavy workload, not just GPU work.
+
+    A job is only started when its declared RAM/VRAM/CPU request fits in the
+    headroom that is actually free right now, after subtracting what already
+    running gpuq jobs have reserved. That is what lets small jobs run in
+    parallel while big ones serialise, and what stops the box being pushed
+    into swap or commit exhaustion by work gpuq did not start.
+    """
+
+    #: Master switch. Off means priority + slot count are the only limits.
+    enforce: bool = True
+
+    #: Assumed request for jobs that declare nothing, so undeclared work is
+    #: never treated as free.
+    default_ram_gb: float = 4.0
+    default_vram_gb: float = 0.0
+    default_cpus: int = 1
+
+    #: Never handed out - headroom for the OS, editors and the agents.
+    reserve_ram_gb: float = 8.0
+    reserve_vram_gb: float = 1.0
+    reserve_cpus: int = 2
+
+    #: Hard stops. Windows fails allocations near the commit limit even while
+    #: physical RAM still looks available, so commit is tracked separately.
+    max_commit_percent: int = 88
+    min_host_free_percent: int = 10
+
+    #: How long a job may sit blocked before gpuq says so loudly.
+    blocked_warning_seconds: int = 900
+
+
+@dataclass
 class ClaudeConfig:
     install_user_policy: bool = True
     hide_cuda_in_safe_launcher: bool = False
@@ -91,6 +125,7 @@ class Config:
     core: CoreConfig = field(default_factory=CoreConfig)
     gpu: GpuConfig = field(default_factory=GpuConfig)
     backend: BackendConfig = field(default_factory=BackendConfig)
+    resources: ResourcesConfig = field(default_factory=ResourcesConfig)
     claude: ClaudeConfig = field(default_factory=ClaudeConfig)
 
     #: Path the config was loaded from (may not exist yet).
@@ -194,6 +229,17 @@ class Config:
             raise ConfigError("backend.max_finished must be >= 1")
         if b.poll_interval_seconds <= 0:
             raise ConfigError("backend.poll_interval_seconds must be > 0")
+        r = self.resources
+        for name in ("default_ram_gb", "default_vram_gb", "reserve_ram_gb", "reserve_vram_gb"):
+            if getattr(r, name) < 0:
+                raise ConfigError(f"resources.{name} must be >= 0")
+        for name in ("default_cpus", "reserve_cpus"):
+            if getattr(r, name) < 0:
+                raise ConfigError(f"resources.{name} must be >= 0")
+        for name in ("max_commit_percent", "min_host_free_percent"):
+            value = getattr(r, name)
+            if not 0 <= value <= 100:
+                raise ConfigError(f"resources.{name} must be between 0 and 100")
 
     # -- serialization ----------------------------------------------------
     def to_dict(self) -> dict[str, Any]:
@@ -201,6 +247,7 @@ class Config:
             "core": asdict(self.core),
             "gpu": asdict(self.gpu),
             "backend": asdict(self.backend),
+            "resources": asdict(self.resources),
             "claude": asdict(self.claude),
         }
 
@@ -251,6 +298,7 @@ _SECTION_TYPES: dict[str, type] = {
     "core": CoreConfig,
     "gpu": GpuConfig,
     "backend": BackendConfig,
+    "resources": ResourcesConfig,
     "claude": ClaudeConfig,
 }
 
@@ -351,6 +399,7 @@ def _from_dict(
         core=CoreConfig(**data.get("core", {})),
         gpu=GpuConfig(**data.get("gpu", {})),
         backend=BackendConfig(**data.get("backend", {})),
+        resources=ResourcesConfig(**data.get("resources", {})),
         claude=ClaudeConfig(**data.get("claude", {})),
         source_path=source_path,
         profile=profile,
