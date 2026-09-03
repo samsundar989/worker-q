@@ -251,20 +251,6 @@ def admit(
                 f"{_gib(mem.commit_used_mib)} of {_gib(mem.commit_limit_mib)} committed",
                 detail,
             )
-        # A high commit charge with plenty of physical RAM free is the normal
-        # state of a loaded workstation with a growing pagefile, not a warning.
-        # It only means trouble when physical memory is short too.
-        if commit >= r.commit_soft_percent and (
-            free_percent is not None and free_percent < r.commit_soft_free_percent
-        ):
-            return Decision(
-                False,
-                f"system commit charge is {commit:.0f}% and only "
-                f"{free_percent:.0f}% of RAM is free ({_gib(mem.available_mib)}); "
-                "starting more work here is how the machine locks up",
-                detail,
-            )
-
     if free_percent is not None and free_percent < r.min_host_free_percent:
         return Decision(
             False,
@@ -330,6 +316,36 @@ def admit(
                 False,
                 f"needs {_gib(request.vram_mib)} VRAM; running job(s) reserve "
                 f"{_gib(reserved.vram_mib)} of {_gib(cap.usable_vram_mib)} usable{held}",
+                detail,
+            )
+
+    # Will this job's own commit fit in what is left? This is the check
+    # that matters on a GPU box, and percentages cannot express it.
+    #
+    # Under WDDM the driver backs video allocations with system commit, so
+    # a job's commit cost is roughly its RAM *plus its VRAM* - measured on
+    # one workstation, going from 4 to 17 GiB of VRAM in use raised commit
+    # charge by 24 GiB while physical RAM moved by 1.6 GiB. The commit
+    # limit is RAM plus pagefile, and a pagefile with a fixed maximum stops
+    # growing, so this ceiling is real and can be hit while most of RAM
+    # sits free. A job died that way here: 100% commit, 40% of RAM free.
+    #
+    # Judging that on "commit % is high AND physical RAM is low" never
+    # fires, because on this failure physical RAM is never low.
+    headroom = None
+    if mem.commit_limit_mib is not None and mem.commit_used_mib is not None:
+        headroom = mem.commit_limit_mib - mem.commit_used_mib
+    if headroom is not None:
+        wants = request.ram_mib + request.vram_mib
+        margin = cap.total_ram_mib * (r.commit_headroom_percent / 100.0)
+        if wants > max(0.0, headroom - margin):
+            return Decision(
+                False,
+                f"needs about {_gib(wants)} of commit (RAM + VRAM) but only "
+                f"{_gib(headroom)} is left before the system commit limit "
+                f"({_gib(mem.commit_used_mib)} of {_gib(mem.commit_limit_mib)} "
+                "used). On Windows, GPU memory is backed by commit, so VRAM "
+                "counts here even though physical RAM looks free",
                 detail,
             )
 

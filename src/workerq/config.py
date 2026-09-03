@@ -130,6 +130,15 @@ class ResourcesConfig:
     #: only blocks when physical memory is short too - the combination that
     #: actually precedes thrashing, and the one worth refusing work over.
     max_commit_percent: int = 99
+    #: Safety margin, as a percentage of physical RAM, kept free of the commit
+    #: limit so the OS and unqueued work can still allocate. The gate that
+    #: matters is absolute: a job's RAM + VRAM must fit the remaining commit
+    #: headroom, because on Windows the GPU driver backs video memory with
+    #: system commit and the limit stops rising once the pagefile hits its
+    #: configured maximum.
+    commit_headroom_percent: int = 10
+    #: Retained so an existing config file keeps loading; superseded by the
+    #: headroom check above, which fires on the failure these never caught.
     commit_soft_percent: int = 88
     commit_soft_free_percent: int = 25
     #: Physical memory floor. This is the primary gate: it is the thing whose

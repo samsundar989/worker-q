@@ -392,12 +392,11 @@ def _default_commit_config(tmp_path) -> Config:
     )
 
 
-def test_high_commit_with_plenty_of_free_ram_is_not_a_stop(tmp_path):
-    """The measured normal state of a loaded box with a growing pagefile.
+def test_high_commit_is_fine_while_there_is_room_left_to_commit(tmp_path):
+    """A high percentage on its own says little; the absolute room does.
 
-    Half of all samples taken on the live machine while a job ran sat above
-    88% commit with ~42% of RAM free. Blocking there stopped work for no
-    reason.
+    Half the samples taken on a live workstation while a job ran sat above 88%
+    commit with ~42% of RAM free, and nothing was wrong.
     """
     config = _default_commit_config(tmp_path)
     decision = admit(
@@ -405,24 +404,56 @@ def test_high_commit_with_plenty_of_free_ram_is_not_a_stop(tmp_path):
         request(4),
         [],
         gpu=gpu(),
-        mem=mem(total_gb=64, free_gb=27, commit_percent=94),
+        # 64 GiB machine, limit 89.6, 70% used -> 26.9 GiB of commit left.
+        mem=mem(total_gb=64, free_gb=27, commit_percent=70),
     )
     assert decision.admit, decision.reason
 
 
-def test_high_commit_with_little_free_ram_is_a_stop(tmp_path):
-    """The combination that actually precedes thrashing."""
+def test_a_job_may_not_exceed_the_remaining_commit(tmp_path):
+    """The failure this actually catches, and percentages could not express.
+
+    A job died on the live machine at 100% commit with 40% of RAM free. Under
+    WDDM the GPU driver backs video memory with system commit, so VRAM counts
+    against the commit limit even though physical RAM looks untouched.
+    """
     config = _default_commit_config(tmp_path)
     decision = admit(
         config,
-        request(4),
+        ResourceRequest(ram_mib=8 * GIB, vram_mib=20 * GIB, cpus=1),
         [],
         gpu=gpu(),
-        mem=mem(total_gb=64, free_gb=10, commit_percent=94),
+        # limit 89.6, 90% used -> 9.0 GiB left; the job wants 28 GiB of commit.
+        mem=mem(total_gb=64, free_gb=40, commit_percent=90),
     )
     assert not decision.admit
-    assert "commit charge" in (decision.reason or "")
-    assert "locks up" in (decision.reason or "")
+    assert "commit" in (decision.reason or "")
+    assert "VRAM counts here" in (decision.reason or "")
+
+
+def test_vram_counts_toward_commit_even_with_no_ram_declared(tmp_path):
+    """The GPU-only job is exactly the one the old percentage rule missed."""
+    config = _default_commit_config(tmp_path)
+    decision = admit(
+        config,
+        ResourceRequest(ram_mib=0.0, vram_mib=24 * GIB, cpus=1),
+        [],
+        gpu=gpu(),
+        mem=mem(total_gb=64, free_gb=40, commit_percent=90),
+    )
+    assert not decision.admit
+    assert "commit" in (decision.reason or "")
+
+
+def test_the_ram_ledger_still_explains_itself_first(tmp_path):
+    """Commit headroom is the specialised guard; it must not mask the common
+    case, where the useful thing to say is which job is holding the RAM."""
+    config = _default_commit_config(tmp_path)
+    decision = admit(
+        config, request(40), [request(40)], gpu=gpu(), mem=mem(total_gb=64, free_gb=60)
+    )
+    assert not decision.admit
+    assert "already reserve" in (decision.reason or "")
 
 
 def test_commit_at_the_limit_is_still_a_hard_stop(tmp_path):
