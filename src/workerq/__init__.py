@@ -1,6 +1,6 @@
 """worker-q - resource broker for machines shared by AI coding agents."""
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # Pinned backend identity. Isolated here so swapping/upgrading the execution
 # backend is a one-line change (spec section 2).

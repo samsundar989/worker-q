@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "worker-q"
-version = "1.1.0"
+version = "1.2.0"
 description = "Resource broker for machines shared by AI coding agents - one queue for GPU, RAM and CPU heavy work"
 readme = "README.md"
 requires-python = ">=3.11"
