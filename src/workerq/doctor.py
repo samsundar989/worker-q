@@ -408,7 +408,18 @@ class Doctor:
                 f"floor {r.min_host_free_percent}% free, commit stop {r.max_commit_percent}%",
             )
 
-        commit = mem.commit_percent
+        # Against the ceiling the pagefile can grow to, matching what admission
+        # actually judges. Reporting the *current* limit said "95%, close to the
+        # stop" while `workerq resources` said 14.5 GiB free - two true numbers
+        # that read as a contradiction.
+        from workerq import host as host_mod
+
+        ceiling = host_mod.commit_ceiling_mib(mem)
+        commit = (
+            100.0 * mem.commit_used_mib / ceiling
+            if ceiling and mem.commit_used_mib is not None
+            else mem.commit_percent
+        )
         if commit is None:
             return
         if commit >= r.max_commit_percent:
@@ -419,7 +430,7 @@ class Doctor:
             self.add(
                 "Commit charge",
                 WARN,
-                f"{commit:.0f}% of the limit, at or above the {r.max_commit_percent}% "
+                f"{commit:.0f}% of the ceiling, at or above the {r.max_commit_percent}% "
                 "stop - new jobs will wait rather than start",
                 "run 'workerq top' to see what is holding memory; jobs resume "
                 "automatically once it frees up",
@@ -428,11 +439,11 @@ class Doctor:
             self.add(
                 "Commit charge",
                 WARN,
-                f"{commit:.0f}% of the limit, close to the {r.max_commit_percent}% stop",
+                f"{commit:.0f}% of the ceiling, close to the {r.max_commit_percent}% stop",
                 "run 'workerq top' to see what is holding memory",
             )
         else:
-            self.add("Commit charge", PASS, f"{commit:.0f}% of the limit")
+            self.add("Commit charge", PASS, f"{commit:.0f}% of the ceiling")
 
     def check_unqueued_heavy_work(self) -> None:
         """Large processes worker-q did not start are the usual cause of a crash."""
