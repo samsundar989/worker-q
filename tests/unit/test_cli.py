@@ -560,3 +560,31 @@ def test_two_submissions_in_parallel_both_succeed(
 
     assert not errors, errors
     assert len(set(results)) == 4
+
+
+def test_changing_a_startup_setting_says_it_is_not_in_force(
+    runner: CliRunner, cli_env: Config
+):
+    """A silent no-op is worse than the edit failing: the daemon reads these once."""
+    result = invoke(runner, "config", "set", "resources.reserve_ram_gb", "12.0")
+    assert result.exit_code == 0, result.output
+    assert "not in force" in result.output
+    assert "workerq restart" in result.output
+    invoke(runner, "config", "set", "resources.reserve_ram_gb", "8.0")
+
+
+def test_changing_a_reserve_points_at_the_instant_alternative(
+    runner: CliRunner, cli_env: Config
+):
+    result = invoke(runner, "config", "set", "resources.reserve_vram_gb", "6.0")
+    assert "workerq reserve" in result.output
+    invoke(runner, "config", "set", "resources.reserve_vram_gb", "4.0")
+
+
+def test_a_live_applied_setting_does_not_ask_for_a_restart(
+    runner: CliRunner, cli_env: Config
+):
+    """Slots reach the dispatcher through the queue store, so they apply at once."""
+    result = invoke(runner, "config", "set", "core.max_concurrent_jobs", "2")
+    assert "not in force" not in result.output
+    invoke(runner, "config", "set", "core.max_concurrent_jobs", "1")

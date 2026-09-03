@@ -164,6 +164,31 @@ max_commit_percent = 99     # hard stop; below this, commit only blocks
 default_ram_gb = 4.0        # charged to jobs that declare nothing
 ```
 
+### Headroom: keeping the desktop usable
+
+worker-q never hands out everything. Two layers, adjusted differently:
+
+| | Held back | Adjust |
+|---|---|---|
+| RAM | `reserve_ram_gb`, plus a live `min_host_free_percent` floor no job may eat into | config |
+| VRAM | `reserve_vram_gb` | config |
+| CPU | `reserve_cpus`, **plus every job runs below normal priority** | config |
+
+```bash
+workerq resources                 # what is reserved and what is left
+workerq config set resources.reserve_cpus 3
+workerq restart                   # apply it; running jobs keep going
+```
+
+`config set` changes the standing baseline. The dispatcher reads those at
+startup, so it tells you a restart is needed rather than silently doing
+nothing. Only `max_concurrent_jobs` and the GPU threshold apply immediately.
+
+Two more guards you rarely touch: the **pressure guard** stops new work and
+displaces the newest `--preemptible` job if physical RAM stays below
+`scheduling.pressure_free_percent`, and `gpu.free_memory_threshold_percent`
+requires a device to be that free before a GPU job lands on it.
+
 ### Taking the machine back
 
 To play a game, join a call, or just get the desktop back, claim resources from

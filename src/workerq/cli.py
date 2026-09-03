@@ -1341,6 +1341,42 @@ def priority(
 
 
 @app.command()
+def restart(
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Restart the dispatcher so changed settings take effect.
+
+    Running jobs are deliberately left alone - the dispatcher does not own them,
+    it only supervises - so this is safe while work is in flight. The new
+    dispatcher adopts them again on the way up.
+    """
+    service = get_service()
+    service.ensure_ready()
+    running = len(service.db.list_jobs(states=[JobState.RUNNING.value]))
+    try:
+        service.backend.shutdown(timeout=25)
+        if not service.backend.ensure_daemon(timeout=30):
+            service.close()
+            fail("the dispatcher did not come back up; run 'workerq doctor'")
+            return
+    except GPUQError as exc:
+        service.close()
+        fail(str(exc))
+        return
+
+    info = {"restarted": True, "running_jobs_kept": running}
+    if json_output:
+        emit_json(info)
+    else:
+        console.print("Dispatcher restarted; settings from the config file are in force.")
+        if running:
+            console.print(
+                f"[dim]{running} running job(s) were left alone and re-adopted.[/dim]"
+            )
+    service.close()
+
+
+@app.command()
 def requests(
     job_id: int = typer.Argument(..., help="Queued job to correct."),
     ram: float = typer.Option(None, "--ram", help="GiB of RAM this job really needs."),
@@ -1777,6 +1813,22 @@ def config_set(
         except Exception:
             console.print("[yellow]run 'workerq init' to apply this to the dispatcher[/yellow]")
         service.close()
+        return
+
+    # Everything else is read once when the dispatcher starts. Saying so is the
+    # difference between a setting that looks applied and one that is: a silent
+    # no-op here is worse than the edit failing outright.
+    if key.split(".", 1)[0] in ("resources", "scheduling", "preemption", "backend"):
+        console.print(
+            "[yellow]The dispatcher reads this at startup, so it is not in force "
+            "yet.[/yellow]\n"
+            "  Apply it now:  workerq restart   [dim](running jobs keep going)[/dim]"
+        )
+        if key.startswith("resources.reserve_"):
+            console.print(
+                "[dim]For a temporary claim that applies immediately and expires "
+                "on its own, use 'workerq reserve' instead.[/dim]"
+            )
 
 
 @app.command()
