@@ -189,6 +189,36 @@ displaces the newest `--preemptible` job if physical RAM stays below
 `scheduling.pressure_free_percent`, and `gpu.free_memory_threshold_percent`
 requires a device to be that free before a GPU job lands on it.
 
+### The live dashboard
+
+```bash
+workerq top
+```
+
+| Key | |
+|---|---|
+| `j` `k` / `↑` `↓` | scroll the queue |
+| `PgUp` `PgDn` `Home` `End` | page and jump |
+| `g` | **gaming mode** on/off - hold back the `[gaming]` headroom in one key |
+| `r` `R` | RAM held back, down / up 2 GiB |
+| `v` `V` | VRAM held back, down / up 1 GiB |
+| `c` `C` | CPU cores held back, down / up 1 |
+| `0` | give it all back |
+| `q` | quit |
+
+Every change applies to the queue immediately - running jobs are never
+displaced, the new limit governs what starts next. What gaming mode claims is
+configurable:
+
+```toml
+[gaming]
+ram_gb = 24.0
+vram_gb = 24.0
+cpus = 8
+```
+
+Piping `workerq top` somewhere still works; it is just read-only.
+
 ### Taking the machine back
 
 To play a game, join a call, or just get the desktop back, claim resources from

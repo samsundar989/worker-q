@@ -211,6 +211,21 @@ class PreemptionConfig:
 
 
 @dataclass
+class GamingConfig:
+    """Headroom to claim when you want the machine back for something else.
+
+    A flat section on purpose: the config writer regenerates the file from
+    these dataclasses, so a nested table of named presets would be deleted by
+    the next `config set`. One preset, reachable from `workerq top` with a
+    single key, covers the case people actually have.
+    """
+
+    ram_gb: float = 24.0
+    vram_gb: float = 24.0
+    cpus: int = 8
+
+
+@dataclass
 class ClaudeConfig:
     install_user_policy: bool = True
     hide_cuda_in_safe_launcher: bool = False
@@ -224,6 +239,7 @@ class Config:
     resources: ResourcesConfig = field(default_factory=ResourcesConfig)
     scheduling: SchedulingConfig = field(default_factory=SchedulingConfig)
     preemption: PreemptionConfig = field(default_factory=PreemptionConfig)
+    gaming: GamingConfig = field(default_factory=GamingConfig)
     claude: ClaudeConfig = field(default_factory=ClaudeConfig)
 
     #: Path the config was loaded from (may not exist yet).
@@ -366,6 +382,7 @@ class Config:
             "resources": asdict(self.resources),
             "scheduling": asdict(self.scheduling),
             "preemption": asdict(self.preemption),
+            "gaming": asdict(self.gaming),
             "claude": asdict(self.claude),
         }
 
@@ -419,6 +436,7 @@ _SECTION_TYPES: dict[str, type] = {
     "resources": ResourcesConfig,
     "scheduling": SchedulingConfig,
     "preemption": PreemptionConfig,
+    "gaming": GamingConfig,
     "claude": ClaudeConfig,
 }
 
@@ -522,6 +540,7 @@ def _from_dict(
         resources=ResourcesConfig(**data.get("resources", {})),
         scheduling=SchedulingConfig(**data.get("scheduling", {})),
         preemption=PreemptionConfig(**data.get("preemption", {})),
+        gaming=GamingConfig(**data.get("gaming", {})),
         claude=ClaudeConfig(**data.get("claude", {})),
         source_path=source_path,
         profile=profile,

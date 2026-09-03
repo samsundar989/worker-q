@@ -7,6 +7,7 @@ start), and why is the next job not starting yet.
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any
 
@@ -32,6 +33,116 @@ STATE_STYLES = {
     "CANCELLED": "magenta",
     "LOST": "red",
 }
+
+
+#: Keys the dashboard responds to, in the order the footer lists them.
+KEY_HELP = "j/k scroll  PgUp/PgDn page  g gaming  r/R v/V c/C reserve  0 reset  q quit"
+
+
+class KeyReader:
+    """Single keypresses, without blocking the refresh loop.
+
+    Returns None forever when stdin is not a terminal - piping `workerq top`
+    into a file or running it over a pipe must keep working, just read-only.
+    """
+
+    def __init__(self) -> None:
+        self._enabled = False
+        self._posix_state: Any = None
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def __enter__(self) -> KeyReader:
+        import sys
+
+        try:
+            if not sys.stdin.isatty():
+                return self
+        except (AttributeError, ValueError):
+            return self
+
+        if os.name == "nt":
+            try:
+                import msvcrt  # noqa: F401
+
+                self._enabled = True
+            except ImportError:  # pragma: no cover - not Windows
+                pass
+            return self
+
+        try:  # pragma: no cover - POSIX
+            import termios
+            import tty
+
+            self._posix_state = termios.tcgetattr(sys.stdin.fileno())
+            tty.setcbreak(sys.stdin.fileno())
+            self._enabled = True
+        except Exception:
+            self._posix_state = None
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if self._posix_state is not None:  # pragma: no cover - POSIX
+            import sys
+            import termios
+
+            try:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._posix_state)
+            except Exception:
+                pass
+
+    def get(self) -> str | None:
+        """The next key as a name ('up', 'pgdn') or a literal character."""
+        if not self._enabled:
+            return None
+        if os.name == "nt":
+            return self._get_windows()
+        return self._get_posix()  # pragma: no cover - POSIX
+
+    def _get_windows(self) -> str | None:
+        import msvcrt
+
+        if not msvcrt.kbhit():
+            return None
+        char = msvcrt.getwch()
+        if char in ("\x00", "\xe0"):
+            # A two-part sequence: the second character names the special key.
+            special = msvcrt.getwch() if msvcrt.kbhit() else ""
+            return {
+                "H": "up",
+                "P": "down",
+                "I": "pgup",
+                "Q": "pgdn",
+                "G": "home",
+                "O": "end",
+            }.get(special)
+        if char in ("\x03", "\x1a"):
+            return "q"
+        return char
+
+    def _get_posix(self) -> str | None:  # pragma: no cover - POSIX
+        import select
+        import sys
+
+        if not select.select([sys.stdin], [], [], 0)[0]:
+            return None
+        char = sys.stdin.read(1)
+        if char != "\x1b":
+            return "q" if char == "\x03" else char
+        # An escape sequence: read the rest if it is already buffered.
+        rest = ""
+        while select.select([sys.stdin], [], [], 0)[0] and len(rest) < 4:
+            rest += sys.stdin.read(1)
+        return {
+            "[A": "up",
+            "[B": "down",
+            "[5~": "pgup",
+            "[6~": "pgdn",
+            "[H": "home",
+            "[F": "end",
+        }.get(rest)
 
 
 def _glyphs() -> tuple[str, str, str, str]:
@@ -115,6 +226,118 @@ class Dashboard:
     def __init__(self, service: GPUQService) -> None:
         self.service = service
         self.started = time.monotonic()
+        #: First active job to draw. Scrolling exists because a busy queue is
+        #: routinely longer than the panel, and a silently truncated list is
+        #: how you miss the job you were looking for.
+        self.offset = 0
+        self.visible_rows = 12
+        self.active_count = 0
+        #: Transient feedback for the last key pressed.
+        self.message: Text | None = None
+        self.interactive = False
+
+    # -- interaction ------------------------------------------------------
+    def _notify(self, text: str, style: str = "green") -> None:
+        self.message = Text(text, style=style)
+
+    def _current_reserve(self) -> Any:
+        return self.service.backend.get_reserve()
+
+    def _apply_reserve(
+        self,
+        *,
+        ram_gb: float | None = None,
+        vram_gb: float | None = None,
+        cpus: int | None = None,
+        label: str | None = None,
+    ) -> None:
+        """Set the live reserve, carrying over whatever was not changed.
+
+        `set_reserve` fills anything unspecified from *config*, so nudging one
+        dimension has to restate the other two or they would silently snap back.
+        """
+        from workerq.core import GPUQError
+
+        current = self._current_reserve()
+        gib = 1024.0
+        try:
+            self.service.set_reserve(
+                ram_gb=current.ram_mib / gib if ram_gb is None else max(0.0, ram_gb),
+                vram_gb=current.vram_mib / gib if vram_gb is None else max(0.0, vram_gb),
+                cpus=current.cpus if cpus is None else max(0, cpus),
+                label=current.label if label is None else label,
+            )
+        except GPUQError as exc:
+            self._notify(str(exc), "red")
+            return
+        held = self._current_reserve()
+        self._notify(
+            f"held back: {held.ram_mib / gib:.0f} GiB RAM  "
+            f"{held.vram_mib / gib:.0f} GiB VRAM  {held.cpus} CPU"
+        )
+
+    def toggle_gaming(self) -> None:
+        """One key between 'the machine is mine' and 'the queue may have it'."""
+        current = self._current_reserve()
+        if current.label == "gaming":
+            self.service.clear_reserve()
+            self._notify("gaming mode off - headroom returned to the queue")
+            return
+        g = self.service.config.gaming
+        self._apply_reserve(
+            ram_gb=g.ram_gb, vram_gb=g.vram_gb, cpus=g.cpus, label="gaming"
+        )
+        if self.message is not None and self.message.style != "red":
+            self._notify(
+                f"gaming mode ON - holding {g.ram_gb:.0f} GiB RAM, "
+                f"{g.vram_gb:.0f} GiB VRAM, {g.cpus} CPU",
+                "bold green",
+            )
+
+    def handle_key(self, key: str) -> bool:
+        """Act on a keypress. False means the dashboard should exit."""
+        gib = 1024.0
+        page = max(1, self.visible_rows - 1)
+        current = None
+
+        if key in ("q", "Q"):
+            return False
+        if key in ("j", "down"):
+            self.offset += 1
+        elif key in ("k", "up"):
+            self.offset -= 1
+        elif key == "pgdn":
+            self.offset += page
+        elif key == "pgup":
+            self.offset -= page
+        elif key == "home":
+            self.offset = 0
+        elif key == "end":
+            self.offset = max(0, self.active_count - self.visible_rows)
+        elif key == "g":
+            self.toggle_gaming()
+        elif key == "0":
+            self.service.clear_reserve()
+            self._notify("reserve cleared - back to the configured headroom")
+        elif key in ("r", "R", "v", "V", "c", "C"):
+            current = self._current_reserve()
+            if key == "r":
+                self._apply_reserve(ram_gb=current.ram_mib / gib - 2)
+            elif key == "R":
+                self._apply_reserve(ram_gb=current.ram_mib / gib + 2)
+            elif key == "v":
+                self._apply_reserve(vram_gb=current.vram_mib / gib - 1)
+            elif key == "V":
+                self._apply_reserve(vram_gb=current.vram_mib / gib + 1)
+            elif key == "c":
+                self._apply_reserve(cpus=current.cpus - 1)
+            else:
+                self._apply_reserve(cpus=current.cpus + 1)
+        else:
+            return True
+
+        self.offset = max(0, min(self.offset, max(0, self.active_count - 1)))
+        return True
 
     # -- panels -----------------------------------------------------------
     def machine_panel(self) -> Panel:
@@ -182,7 +405,12 @@ class Dashboard:
         table.add_column("REQ", width=11)
         table.add_column("WHAT", overflow="ellipsis")
 
-        shown = [j for j in jobs if not j.is_terminal][:12]
+        active = [j for j in jobs if not j.is_terminal]
+        self.active_count = len(active)
+        # Clamp here as well as on keypress: the queue shrinks under you as
+        # jobs finish, and an offset past the end would show an empty panel.
+        self.offset = max(0, min(self.offset, max(0, len(active) - 1)))
+        shown = active[self.offset : self.offset + self.visible_rows]
         for job in shown:
             request: list[str] = []
             if job.requested_ram_mib:
@@ -238,6 +466,21 @@ class Dashboard:
             " · ",
             (f"{summary['counts'].get('QUEUED', 0)} queued", "yellow"),
         )
+        # Say what is off-screen. A list that silently stops at the panel edge
+        # is how you conclude a job is missing when it is merely below.
+        hidden_above = self.offset
+        hidden_below = max(0, len(active) - self.offset - len(shown))
+        if hidden_above or hidden_below:
+            header.append("   ")
+            header.append(
+                f"showing {self.offset + 1}-{self.offset + len(shown)} of {len(active)}",
+                style="bold cyan",
+            )
+            if hidden_below:
+                header.append(f"  ({hidden_below} below)", style="dim")
+        reserve = self._current_reserve()
+        if reserve.label:
+            header.append(f"   [{reserve.label}]", style="bold magenta")
         return Panel(
             Group(header, table), title="queue", border_style="blue", padding=(0, 1)
         )
@@ -309,8 +552,15 @@ class Dashboard:
             (f"{stats['cancelled']} cancelled", "dim"),
             (f"   success {stats['success_rate']:.0f}%", "dim"),
             (f"   median wait {human_duration(stats['median_wait_seconds'])}", "dim"),
-            ("      ctrl-c to exit", "dim"),
         )
+
+    def keybar(self) -> Text:
+        """The last action taken, or the keys available. Feedback wins."""
+        if self.message is not None:
+            return self.message
+        if not self.interactive:
+            return Text("ctrl-c to exit", style="dim")
+        return Text(KEY_HELP, style="dim")
 
     # -- render -----------------------------------------------------------
     def render(self) -> Layout:
@@ -320,12 +570,18 @@ class Dashboard:
             Layout(self.machine_panel(), size=8),
             Layout(self.queue_panel(jobs), name="queue"),
             Layout(name="lower", size=12),
+            Layout(self.keybar(), size=1),
             Layout(self.footer(), size=1),
         )
         layout["lower"].split_row(
             Layout(self.pressure_panel()), Layout(self.recent_panel(jobs))
         )
         return layout
+
+
+#: How often keys are polled. Short enough that scrolling feels immediate,
+#: long enough that an idle dashboard costs nothing.
+_KEY_POLL_SECONDS = 0.05
 
 
 def run_dashboard(service: GPUQService, *, interval: float = 2.0, once: bool = False) -> None:
@@ -337,11 +593,30 @@ def run_dashboard(service: GPUQService, *, interval: float = 2.0, once: bool = F
         return
 
     with Live(
-        dashboard.render(), refresh_per_second=4, screen=True, transient=False
+        dashboard.render(), refresh_per_second=8, screen=True, transient=False
     ) as live:
-        try:
-            while True:
-                time.sleep(interval)
-                live.update(dashboard.render())
-        except KeyboardInterrupt:
-            pass
+        with KeyReader() as keys:
+            dashboard.interactive = keys.enabled
+            # Fit the queue panel to the terminal: the panel is flexible, so
+            # this is the only place that knows how many rows it can hold.
+            height = getattr(live.console.size, "height", 40)
+            dashboard.visible_rows = max(3, height - 8 - 12 - 2 - 4)
+            last_refresh = 0.0
+            try:
+                while True:
+                    key = keys.get()
+                    if key is not None:
+                        if not dashboard.handle_key(key):
+                            break
+                        live.update(dashboard.render())
+                        last_refresh = time.monotonic()
+                        continue
+                    now = time.monotonic()
+                    if now - last_refresh >= interval:
+                        height = getattr(live.console.size, "height", 40)
+                        dashboard.visible_rows = max(3, height - 8 - 12 - 2 - 4)
+                        live.update(dashboard.render())
+                        last_refresh = now
+                    time.sleep(_KEY_POLL_SECONDS)
+            except KeyboardInterrupt:
+                pass
