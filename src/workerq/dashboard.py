@@ -579,6 +579,16 @@ class Dashboard:
         return layout
 
 
+def _queue_rows(height: int) -> int:
+    """How many job rows the queue panel can hold at this terminal height.
+
+    The panel is the flexible one in the layout, so nothing else knows: the
+    machine panel takes 8, the lower row 12, the keybar and footer one each,
+    and the panel's own border and header take four more.
+    """
+    return max(3, height - 8 - 12 - 2 - 4)
+
+
 #: How often keys are polled. Short enough that scrolling feels immediate,
 #: long enough that an idle dashboard costs nothing.
 _KEY_POLL_SECONDS = 0.05
@@ -589,7 +599,9 @@ def run_dashboard(service: GPUQService, *, interval: float = 2.0, once: bool = F
     if once:
         from rich.console import Console
 
-        Console().print(dashboard.render())
+        console = Console()
+        dashboard.visible_rows = _queue_rows(console.size.height)
+        console.print(dashboard.render())
         return
 
     with Live(
@@ -600,7 +612,7 @@ def run_dashboard(service: GPUQService, *, interval: float = 2.0, once: bool = F
             # Fit the queue panel to the terminal: the panel is flexible, so
             # this is the only place that knows how many rows it can hold.
             height = getattr(live.console.size, "height", 40)
-            dashboard.visible_rows = max(3, height - 8 - 12 - 2 - 4)
+            dashboard.visible_rows = _queue_rows(height)
             last_refresh = 0.0
             try:
                 while True:
@@ -614,7 +626,7 @@ def run_dashboard(service: GPUQService, *, interval: float = 2.0, once: bool = F
                     now = time.monotonic()
                     if now - last_refresh >= interval:
                         height = getattr(live.console.size, "height", 40)
-                        dashboard.visible_rows = max(3, height - 8 - 12 - 2 - 4)
+                        dashboard.visible_rows = _queue_rows(height)
                         live.update(dashboard.render())
                         last_refresh = now
                     time.sleep(_KEY_POLL_SECONDS)
