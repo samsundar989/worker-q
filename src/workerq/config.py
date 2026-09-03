@@ -119,10 +119,17 @@ class ResourcesConfig:
     #: stayed around 42% free, and the limit itself drifted from 81 to 94 GiB.
     #: Blocking there stops work for no reason.
     #:
-    #: So commit blocks outright only close to the limit, where growth may not
-    #: keep up. In the band below that it blocks only when physical memory is
-    #: short as well - the combination that actually precedes thrashing.
-    max_commit_percent: int = 97
+    #: Measured further: the limit demonstrably *grows* as commit rises (81.9
+    #: -> 87.5 GiB average across the bands on one workstation), and even in
+    #: the 98-101% band physical RAM averaged 41.5% free and never ran out. So
+    #: a high commit charge on a machine with a system-managed pagefile is not
+    #: a danger signal - it is the pagefile doing its job.
+    #:
+    #: The outright stop therefore sits where allocations genuinely start
+    #: failing rather than where growth is still catching up. Below it, commit
+    #: only blocks when physical memory is short too - the combination that
+    #: actually precedes thrashing, and the one worth refusing work over.
+    max_commit_percent: int = 99
     commit_soft_percent: int = 88
     commit_soft_free_percent: int = 25
     #: Physical memory floor. This is the primary gate: it is the thing whose

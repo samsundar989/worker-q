@@ -156,9 +156,11 @@ Tune the guard rails in `[resources]` (see `workerq resources` for current value
 [resources]
 enforce = true
 reserve_ram_gb = 8.0        # never handed out: OS, editors, agents
+reserve_vram_gb = 4.0       # the desktop itself uses 3-4 GiB
 reserve_cpus = 2
 min_host_free_percent = 10  # floor a job may not eat into
-max_commit_percent = 97     # hard stop, close to the commit limit
+max_commit_percent = 99     # hard stop; below this, commit only blocks
+                            # when physical RAM is short too
 default_ram_gb = 4.0        # charged to jobs that declare nothing
 ```
 

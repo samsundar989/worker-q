@@ -433,7 +433,7 @@ def test_commit_at_the_limit_is_still_a_hard_stop(tmp_path):
         ResourceRequest(),
         [],
         gpu=gpu(),
-        mem=mem(total_gb=64, free_gb=40, commit_percent=99),
+        mem=mem(total_gb=64, free_gb=40, commit_percent=100),
     )
     assert not decision.admit
     assert "commit charge" in (decision.reason or "")
