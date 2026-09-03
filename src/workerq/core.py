@@ -379,12 +379,14 @@ class GPUQService:
                     pass
 
             self._write_manifest(job_id)
+            # History-based advice needs the stored job, since it keys off the
+            # command signature written during enqueue.
             return SubmitResult(
                 job=job,
                 snapshot=snapshot,
                 backend_job_id=backend_job_id,
                 queue_position=self._queue_position(job_id),
-                advisories=advisories,
+                advisories=self._history_advisories(job) + advisories,
             )
 
         except BaseException as exc:
@@ -685,6 +687,46 @@ class GPUQService:
                 f"{capacity.usable_vram_mib / 1024:.1f} GiB is usable. "
                 "This job would never start."
             )
+
+    def _history_advisories(self, job: Job) -> list[str]:
+        """Compare this declaration against what the same command has used.
+
+        This is the advice that actually prevents the failure, because it is
+        specific: not "that is a lot of RAM" but "this command has peaked at
+        9.8 GiB across six runs and you asked for 28".
+        """
+        from workerq.eta import learned_peak_ram, suggested_ram_gb
+
+        declared_mib = job.requested_ram_mib
+        if not declared_mib:
+            return []
+        try:
+            peak_mib, runs, provenance = learned_peak_ram(self, job)
+        except Exception:
+            return []
+        if peak_mib is None or runs < 2:
+            return []
+
+        suggested = suggested_ram_gb(peak_mib)
+        declared_gb = declared_mib / 1024.0
+        tag = "measured" if provenance == "measured" else "estimated from telemetry"
+
+        # Under-declaring is the dangerous direction: the ledger hands out
+        # capacity this job then exceeds, and nothing stops it.
+        if declared_gb < peak_mib / 1024.0:
+            return [
+                f"this command peaked at {peak_mib / 1024.0:.1f} GiB across {runs} run(s) "
+                f"({tag}) but declares {declared_gb:.1f} GiB. Under-declaring is how a "
+                f"machine gets oversubscribed - consider --ram {suggested:.0f}."
+            ]
+        if declared_gb >= suggested * 1.5:
+            return [
+                f"this command has never used more than {peak_mib / 1024.0:.1f} GiB across "
+                f"{runs} run(s) ({tag}), but declares {declared_gb:.1f} GiB. That headroom "
+                f"is held against every other job - --ram {suggested:.0f} would still be "
+                "generous and would start sooner."
+            ]
+        return []
 
     def _admission_advisories(self, ram_mib: float | None) -> list[str]:
         """Warn about a declaration that will pass submit and then never start.
@@ -1065,6 +1107,88 @@ class GPUQService:
             "state": job.state,
             "queue_position": self._queue_position(job.id),
             "message": f"job #{job.id} moved to the front of the queue",
+        }
+
+    def set_requests(
+        self,
+        job_id: int,
+        *,
+        ram_gb: float | None = None,
+        vram_gb: float | None = None,
+        cpus: int | None = None,
+    ) -> dict[str, Any]:
+        """Correct what a queued job says it needs, without resubmitting it.
+
+        Getting a declaration wrong used to mean cancelling and submitting
+        again, which loses the source snapshot and the job's place in the
+        queue - so in practice people left a bad number alone and the job
+        waited forever. This fixes it in place.
+        """
+        job = self.get_job(job_id)
+        if job.state_enum is not JobState.QUEUED:
+            raise GPUQError(
+                f"job #{job.id} is {job.state}; only a QUEUED job's declaration can "
+                "be changed. A running job's reservation is already counted against "
+                "everything else."
+            )
+        if job.backend_job_id is None:
+            raise GPUQError(f"job #{job.id} has no backend job")
+        if ram_gb is None and vram_gb is None and cpus is None:
+            raise GPUQError("give at least one of --ram, --vram or --cpus")
+        for name, value in (("--ram", ram_gb), ("--vram", vram_gb)):
+            if value is not None and value < 0:
+                raise GPUQError(f"{name} must be >= 0")
+        if cpus is not None and cpus < 0:
+            raise GPUQError("--cpus must be >= 0")
+
+        ram_mib = None if ram_gb is None else float(ram_gb) * 1024.0
+        vram_mib = None if vram_gb is None else float(vram_gb) * 1024.0
+        # Refuse a correction that swaps one impossible number for another.
+        self._reject_impossible(ram_mib, vram_mib, cpus)
+
+        if not self.backend.set_requests(
+            job.backend_job_id, ram_mib=ram_mib, vram_mib=vram_mib, cpus=cpus
+        ):
+            raise GPUQError(
+                f"job #{job.id} could not be updated; it may have just started"
+            )
+        updates: dict[str, Any] = {}
+        if ram_mib is not None:
+            updates["requested_ram_mib"] = ram_mib
+        if vram_mib is not None:
+            updates["requested_vram_mib"] = vram_mib
+        if cpus is not None:
+            updates["requested_cpus"] = cpus
+        updated = self.db.update_job(job_id, **updates)
+        return {
+            "job_id": job_id,
+            "ram_gb": (updated.requested_ram_mib or 0) / 1024.0,
+            "vram_gb": (updated.requested_vram_mib or 0) / 1024.0,
+            "cpus": updated.requested_cpus,
+            "advisories": self._admission_advisories(updated.requested_ram_mib),
+        }
+
+    def suggest_requests(self, job_id: int) -> dict[str, Any]:
+        """What this job's own history says it should have declared."""
+        from workerq.eta import learned_peak_ram, suggested_ram_gb
+
+        job = self.get_job(job_id)
+        peak_mib, runs, provenance = learned_peak_ram(self, job)
+        declared_gb = (job.requested_ram_mib or 0) / 1024.0
+        if peak_mib is None:
+            return {
+                "job_id": job_id,
+                "declared_ram_gb": declared_gb,
+                "runs": 0,
+                "suggested_ram_gb": None,
+            }
+        return {
+            "job_id": job_id,
+            "declared_ram_gb": declared_gb,
+            "peak_ram_gb": peak_mib / 1024.0,
+            "runs": runs,
+            "provenance": provenance,
+            "suggested_ram_gb": suggested_ram_gb(peak_mib),
         }
 
     def get_reserve(self) -> dict[str, Any]:

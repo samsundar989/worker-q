@@ -22,7 +22,7 @@ from workerq.models import (
 )
 from workerq.util import ensure_dir, restrict_permissions, utcnow_iso
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 _MIGRATIONS: list[tuple[int, str]] = [
     (
@@ -153,6 +153,16 @@ _MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE jobs ADD COLUMN usage_samples INTEGER NOT NULL DEFAULT 0;
         """,
     ),
+    (
+        7,
+        """
+        -- Where a peak came from. 'measured' is this job's own process tree.
+        -- 'estimated' is inferred from machine-wide telemetry for jobs that ran
+        -- before per-job sampling existed - useful for advice, but it cannot
+        -- separate the job from anything else that was running.
+        ALTER TABLE jobs ADD COLUMN peak_source TEXT;
+        """,
+    ),
 ]
 
 _JOB_COLUMNS = (
@@ -164,7 +174,7 @@ _JOB_COLUMNS = (
     "requested_vram_mib, requested_cpus, preemptible, preemption_count, "
     "preempted_at, preempted_by, preempted_reason, description, blocks, "
     "eta_seconds, command_signature, progress_fraction, progress_note, "
-    "progress_updated_at, peak_ram_mib, peak_vram_mib, usage_samples"
+    "progress_updated_at, peak_ram_mib, peak_vram_mib, usage_samples, peak_source"
 )
 
 #: Columns callers are allowed to update through `update_job`.
@@ -205,6 +215,7 @@ _UPDATABLE = frozenset(
         "peak_ram_mib",
         "peak_vram_mib",
         "usage_samples",
+        "peak_source",
     }
 )
 

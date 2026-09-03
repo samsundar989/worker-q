@@ -61,9 +61,17 @@ different numbers, and a job can be accepted at submit and then wait for
 headroom that never arrives.
 
 `workerq resources --verify` shows what past jobs actually used against what
-they declared. Over-declaring is safe but packs badly, and a declaration well
-above real usage is the usual cause of a job that queues forever. Submitting
-now warns when a declaration has rarely been satisfiable on this machine.
+they declared, with a suggested number. For one job:
+
+```bash
+workerq requests 103 --suggest      # what its own history says it needs
+workerq requests 103 --ram 16       # fix it in place, keeping its queue position
+```
+
+Over-declaring is safe but packs badly, and a declaration well above real usage
+is the usual cause of a job that queues forever. Submitting now warns when a
+declaration has rarely been satisfiable on this machine, or when it is far above
+what the same command has historically used.
 
 ---
 

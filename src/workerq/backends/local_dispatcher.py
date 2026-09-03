@@ -234,6 +234,19 @@ class LocalDispatcherBackend:
             dispatcher_mod.META_SLOTS, self.config.core.max_concurrent_jobs
         )
 
+    def set_requests(
+        self,
+        backend_id: int,
+        *,
+        ram_mib: float | None = None,
+        vram_mib: float | None = None,
+        cpus: int | None = None,
+    ) -> bool:
+        self._ensure_store()
+        return self.store.set_requests(
+            backend_id, ram_mib=ram_mib, vram_mib=vram_mib, cpus=cpus
+        )
+
     def set_reserve(self, reserve: "res.Reserve | None") -> None:
         """Set or clear the live reserve. None restores the configured value."""
         self._ensure_store()

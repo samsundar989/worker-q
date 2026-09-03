@@ -181,17 +181,43 @@ Job processes also run below normal priority, so the desktop stays responsive
 when several share the CPUs. Turn that off with
 `scheduling.background_priority = false`.
 
-### Checking declarations against reality
+### How to pick the numbers
 
-Admission control is only as good as the numbers jobs declare, so worker-q
-measures what they actually use:
+This is the thing people get wrong, and a wrong number does not error — the job
+just waits, sometimes for hours. worker-q measures what jobs actually use, so it
+can tell you:
 
 ```bash
-workerq resources --verify
+workerq resources --verify          # declared vs actual, with a suggestion
+workerq requests 103 --suggest      # what this command's own history says
 ```
 
-Over-declaring is safe but packs badly; under-declaring is what takes the
-machine down.
+```text
+Job #103 declares 28.0 GiB RAM
+Worst of 7 past run(s): 10.2 GiB
+Suggested declaration: 16 GiB  (peak + 50% headroom)
+
+Declaring 28 GiB reserves 12 GiB more than this command has ever needed,
+which is what keeps it waiting.
+Apply it: workerq requests 103 --ram 16
+```
+
+Got it wrong? Fix it in place. The job keeps its source snapshot and its
+position in the queue:
+
+```bash
+workerq requests 103 --ram 16
+```
+
+**Declare against free memory, not installed memory.** A 64 GiB workstation may
+only ever have ~30 GiB genuinely free, because editors, browsers and other
+agents hold the rest. Admission compares your declaration against what is free,
+so a 28 GiB request on such a machine is not "half the box" — it is more than is
+ever available, and the job will never start. `workerq submit` warns when a
+declaration has rarely been satisfiable here.
+
+Over-declaring is safe but packs badly and keeps your own work waiting;
+under-declaring is what takes the machine down.
 
 ---
 

@@ -321,9 +321,14 @@ def declared_vs_observed(service: GPUQService, *, limit: int = 200) -> dict[str,
     Jobs sampled before observed-usage recording existed are skipped rather
     than counted as zero.
     """
+    from workerq.eta import suggested_ram_gb
+
     rows: list[dict[str, Any]] = []
     for job in service.db.list_jobs(limit=limit):
-        if not job.usage_samples:
+        # A running job's peak is provisional - it may not have reached full
+        # size yet - and a suggestion drawn from a partial peak is worse than
+        # none at all.
+        if job.peak_ram_mib is None or not job.is_terminal:
             continue
         declared_ram = job.requested_ram_mib
         declared_vram = job.requested_vram_mib
@@ -347,6 +352,12 @@ def declared_vs_observed(service: GPUQService, *, limit: int = 200) -> dict[str,
                     else None
                 ),
                 "samples": job.usage_samples,
+                "peak_source": job.peak_source,
+                "suggested_ram_gb": (
+                    suggested_ram_gb(job.peak_ram_mib)
+                    if job.peak_ram_mib is not None
+                    else None
+                ),
             }
         )
 
@@ -366,4 +377,57 @@ def declared_vs_observed(service: GPUQService, *, limit: int = 200) -> dict[str,
         "median_ram_ratio": median,
         "mean_overdeclared_ram_mib": (sum(waste) / len(waste)) if waste else None,
         "vram_measurable": any(r["peak_vram_mib"] is not None for r in rows),
+    }
+
+
+def backfill_peaks_from_telemetry(service: GPUQService, *, limit: int = 500) -> dict[str, Any]:
+    """Estimate past jobs' RAM peaks from machine-wide telemetry.
+
+    Per-job sampling only started recently, so without this the advice about
+    what to declare stays silent for a month while history accumulates - which
+    is exactly the period when people are still guessing.
+
+    The estimate is the worst host-RAM-in-use seen while the job ran, minus the
+    idle baseline. It cannot separate one job from another, so it is recorded as
+    `estimated` and never overwrites a `measured` peak.
+    """
+    telemetry = open_telemetry(service.config.state_dir)
+    try:
+        baseline = telemetry.conn.execute(
+            "SELECT AVG(host_total_mib - host_available_mib) FROM samples "
+            "WHERE running_job_id IS NULL"
+        ).fetchone()[0]
+    except Exception:
+        baseline = None
+    if baseline is None:
+        return {"updated": 0, "reason": "no idle telemetry to establish a baseline"}
+
+    updated = 0
+    skipped_negative = 0
+    for job in service.db.list_jobs(limit=limit):
+        if job.peak_ram_mib is not None or not job.started_at or not job.finished_at:
+            continue
+        try:
+            row = telemetry.conn.execute(
+                "SELECT MAX(host_total_mib - host_available_mib) FROM samples "
+                "WHERE running_job_id = ?",
+                (job.id,),
+            ).fetchone()
+        except Exception:
+            continue
+        if not row or row[0] is None:
+            continue
+        incremental = float(row[0]) - float(baseline)
+        if incremental <= 0:
+            # The job ran entirely inside the noise of the idle baseline. That
+            # is information, but not a peak we can stand behind.
+            skipped_negative += 1
+            continue
+        service.db.update_job(job.id, peak_ram_mib=incremental, peak_source="estimated")
+        updated += 1
+
+    return {
+        "updated": updated,
+        "baseline_mib": baseline,
+        "skipped_below_baseline": skipped_negative,
     }

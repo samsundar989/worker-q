@@ -396,3 +396,75 @@ def _coerce_fraction(value: Any) -> float | None:
     if not 0.0 <= number <= 1.0:
         return None
     return number
+
+
+# --------------------------------------------------------------------------
+# Learned resource footprint
+# --------------------------------------------------------------------------
+
+#: Headroom applied to an observed peak when suggesting a declaration. Memory
+#: use varies run to run with data, batch size and fragmentation, so a
+#: suggestion sits above the worst run seen rather than at it.
+PEAK_HEADROOM = 1.5
+#: Never suggest less than this: tiny declarations are noise, and the configured
+#: default already covers work that declares nothing.
+MIN_SUGGESTION_GB = 2.0
+
+
+def learned_peak_ram(service: GPUQService, job: Job) -> tuple[float | None, int, str]:
+    """(worst observed peak MiB, runs, provenance) for this command's shape.
+
+    The counterpart of `learned_duration`, and it answers the question people
+    actually get wrong: not "how long will this take" but "how much will it
+    need". Uses the *worst* run rather than the median - a declaration that is
+    too low is how a machine falls over, so this errs high where the duration
+    estimate errs central.
+    """
+    signature = job.command_signature or command_signature(
+        job.command, bool(job.shell_mode)
+    )
+    if not signature:
+        return None, 0, ""
+
+    cutoff = (utcnow() - timedelta(days=LEARNED_WINDOW_DAYS)).isoformat(
+        timespec="microseconds"
+    )
+    # Successful runs only, where there are any. A job cancelled after two
+    # minutes never reached steady state, and one cancelled after three hours
+    # may have been doing something else entirely - both distort a peak. Taking
+    # the worst *completed* run is the number that actually has to fit.
+    try:
+        rows = service.db.conn.execute(
+            "SELECT peak_ram_mib, peak_source FROM jobs "
+            "WHERE project = ? AND command_signature = ? AND id != ? "
+            "AND peak_ram_mib IS NOT NULL AND finished_at >= ? AND state = ? "
+            "ORDER BY id DESC LIMIT 20",
+            (job.project, signature, job.id, cutoff, JobState.SUCCEEDED.value),
+        ).fetchall()
+        if not rows:
+            rows = service.db.conn.execute(
+                "SELECT peak_ram_mib, peak_source FROM jobs "
+                "WHERE project = ? AND command_signature = ? AND id != ? "
+                "AND peak_ram_mib IS NOT NULL AND finished_at >= ? "
+                "ORDER BY id DESC LIMIT 20",
+                (job.project, signature, job.id, cutoff),
+            ).fetchall()
+    except Exception:
+        return None, 0, ""
+
+    peaks = [float(r["peak_ram_mib"]) for r in rows if r["peak_ram_mib"] is not None]
+    if not peaks:
+        return None, 0, ""
+    # Measured beats estimated: say which, so nobody treats a telemetry
+    # inference as if the job had been watched directly.
+    sources = {r["peak_source"] or "estimated" for r in rows}
+    provenance = "measured" if sources == {"measured"} else "estimated"
+    return max(peaks), len(peaks), provenance
+
+
+def suggested_ram_gb(peak_mib: float) -> float:
+    """A declaration that would comfortably hold `peak_mib`, rounded up."""
+    import math
+
+    gb = (peak_mib / 1024.0) * PEAK_HEADROOM
+    return max(MIN_SUGGESTION_GB, float(math.ceil(gb)))

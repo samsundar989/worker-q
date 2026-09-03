@@ -181,6 +181,8 @@ class Job:
     peak_ram_mib: float | None = None
     peak_vram_mib: float | None = None
     usage_samples: int = 0
+    #: 'measured' (this job's own processes) or 'estimated' (machine telemetry).
+    peak_source: str | None = None
     passthrough_json: str | None = None
     env_json: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
@@ -271,6 +273,7 @@ class Job:
             "peak_ram_mib": self.peak_ram_mib,
             "peak_vram_mib": self.peak_vram_mib,
             "usage_samples": self.usage_samples,
+            "peak_source": self.peak_source,
             "gpu_mode": self.gpu_mode,
             "snapshot_mode": self.snapshot_mode,
             "snapshot_commit": self.snapshot_commit,

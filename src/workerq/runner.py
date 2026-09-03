@@ -383,6 +383,7 @@ def run_job(
                         peak_ram_mib=peak_ram,
                         peak_vram_mib=peak_vram,
                         usage_samples=samples,
+                        peak_source="measured",
                     )
                 except Exception:
                     pass  # never let measurement take the job down

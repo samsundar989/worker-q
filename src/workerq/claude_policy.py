@@ -59,12 +59,31 @@ displace it instead of waiting:
 
     workerq submit --project <project> --ram 24 --preemptible -- <command>
 
-**Jobs run in parallel when their declared footprints fit**, so declaring
-honestly is what gets your job started sooner - and what stops the machine
-falling over. Over-declaring is safe but keeps other work waiting; under-
-declaring is how a box is taken down. Check yourself with:
+**How to pick the numbers.** This is the single thing agents get wrong, and a
+wrong number does not error - the job just waits, sometimes for hours.
 
-    workerq resources --verify        declared vs what jobs actually used
+    workerq resources --verify        declared vs actual, with a suggestion
+    workerq requests <job_id> --suggest   what this command's history says
+
+Rules of thumb, in order of preference:
+
+1. If the command has run before, use the SUGGEST column. It is the worst peak
+   across past successful runs plus 50%.
+2. If it has not, estimate the *incremental* footprint - what this process
+   adds, not what the machine uses in total. Model weights plus optimiser state
+   plus a batch, not the whole box.
+3. Round up to a sensible number and let the first run correct you.
+
+**Declare RAM against free memory, not installed memory.** A workstation with
+64 GiB may only ever have ~30 GiB free, because editors, browsers and other
+agents hold the rest. A 28 GiB declaration on such a box is not "half the
+machine", it is more than is ever available, and the job will never start.
+
+Over-declaring is safe but keeps other work waiting; under-declaring is how a
+box is taken down. If a job you queued is stuck, do not resubmit it - fix the
+declaration in place, which keeps its snapshot and queue position:
+
+    workerq requests <job_id> --ram 16
 
 If a job needs a GPU but not the whole card, `--share-gpu` lets it run beside
 another job that also opted in. It requires `--vram`, because packing is judged

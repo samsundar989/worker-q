@@ -345,6 +345,37 @@ class QueueStore:
             )
             return cur.rowcount == 1
 
+    def set_requests(
+        self,
+        backend_id: int,
+        *,
+        ram_mib: float | None = None,
+        vram_mib: float | None = None,
+        cpus: int | None = None,
+    ) -> bool:
+        """Correct a queued job's declared footprint in place.
+
+        Only QUEUED: a running job's reservation is already counted against
+        everything else, and changing it underneath the dispatcher would let
+        the ledger disagree with what is actually allocated.
+        """
+        updates: list[str] = []
+        values: list[Any] = []
+        for column, value in (("ram_mib", ram_mib), ("vram_mib", vram_mib), ("cpus", cpus)):
+            if value is not None:
+                updates.append(f"{column} = ?")
+                values.append(value)
+        if not updates:
+            return False
+        values.extend([backend_id, BACKEND_QUEUED])
+        with self.transaction() as conn:
+            cur = conn.execute(
+                f"UPDATE bjobs SET {', '.join(updates)}, wait_reason = NULL "
+                "WHERE id = ? AND state = ?",
+                tuple(values),
+            )
+            return cur.rowcount == 1
+
     def promote(self, backend_id: int) -> bool:
         """Move a queued job to the head of the dispatch order."""
         with self.transaction() as conn:

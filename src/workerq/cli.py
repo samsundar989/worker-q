@@ -1341,6 +1341,91 @@ def priority(
 
 
 @app.command()
+def requests(
+    job_id: int = typer.Argument(..., help="Queued job to correct."),
+    ram: float = typer.Option(None, "--ram", help="GiB of RAM this job really needs."),
+    vram: float = typer.Option(None, "--vram", help="GiB of VRAM this job really needs."),
+    cpus: int = typer.Option(None, "--cpus", help="CPU cores this job really needs."),
+    suggest: bool = typer.Option(
+        False, "--suggest", help="Show what this command's own history suggests."
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Correct what a queued job says it needs, without resubmitting it.
+
+    A declaration that is too high is not an error - the job simply waits for
+    headroom that may never arrive. This fixes it in place, keeping the job's
+    source snapshot and its position in the queue.
+    """
+    service = get_service()
+    service.ensure_ready()
+
+    if suggest or (ram is None and vram is None and cpus is None):
+        try:
+            data = service.suggest_requests(job_id)
+        except GPUQError as exc:
+            service.close()
+            fail(str(exc))
+            return
+        if json_output:
+            emit_json(data)
+            service.close()
+            return
+        console.print(f"[bold]Job #{job_id}[/bold] declares {data['declared_ram_gb']:.1f} GiB RAM")
+        if data["suggested_ram_gb"] is None:
+            console.print(
+                "No past run of this command has been measured yet, so there is "
+                "nothing to compare against.\n"
+                "[dim]Estimates improve once it has run: workerq resources --verify[/dim]"
+            )
+        else:
+            tag = (
+                "measured from the job's own processes"
+                if data["provenance"] == "measured"
+                else "estimated from machine-wide telemetry"
+            )
+            console.print(
+                f"Worst of {data['runs']} past run(s): "
+                f"[bold]{data['peak_ram_gb']:.1f} GiB[/bold]  [dim]({tag})[/dim]"
+            )
+            console.print(
+                f"Suggested declaration: [bold green]{data['suggested_ram_gb']:.0f} "
+                f"GiB[/bold green]  [dim](peak + 50% headroom)[/dim]"
+            )
+            if data["declared_ram_gb"] > data["suggested_ram_gb"]:
+                console.print(
+                    f"\n[yellow]Declaring {data['declared_ram_gb']:.0f} GiB reserves "
+                    f"{data['declared_ram_gb'] - data['suggested_ram_gb']:.0f} GiB more "
+                    "than this command has ever needed, which is what keeps it "
+                    "waiting.[/yellow]"
+                )
+                console.print(
+                    f"[dim]Apply it: workerq requests {job_id} "
+                    f"--ram {data['suggested_ram_gb']:.0f}[/dim]"
+                )
+        service.close()
+        return
+
+    try:
+        data = service.set_requests(job_id, ram_gb=ram, vram_gb=vram, cpus=cpus)
+    except GPUQError as exc:
+        service.close()
+        fail(str(exc))
+        return
+    if json_output:
+        emit_json(data)
+        service.close()
+        return
+    console.print(
+        f"Job #{job_id} now declares {data['ram_gb']:.1f} GiB RAM, "
+        f"{data['vram_gb']:.1f} GiB VRAM, {data['cpus']} CPU."
+    )
+    for advisory in data["advisories"]:
+        console.print(f"\n[yellow]Heads up:[/yellow] {advisory}")
+    service.close()
+
+
+@app.command()
 def reserve(
     ram: float = typer.Option(None, "--ram", help="GiB of RAM to hold back for you."),
     vram: float = typer.Option(None, "--vram", help="GiB of VRAM to hold back for you."),
@@ -1493,6 +1578,7 @@ def _render_usage_accuracy(service: GPUQService, *, json_output: bool) -> None:
     table.add_column("RAM DECL", justify="right")
     table.add_column("RAM PEAK", justify="right")
     table.add_column("USED", justify="right")
+    table.add_column("SUGGEST", justify="right")
     table.add_column("VRAM DECL", justify="right")
     table.add_column("VRAM PEAK", justify="right")
 
@@ -1514,6 +1600,11 @@ def _render_usage_accuracy(service: GPUQService, *, json_output: bool) -> None:
             _gib(row["declared_ram_mib"]),
             _gib(row["peak_ram_mib"]),
             used,
+            (
+                f"{row['suggested_ram_gb']:.0f}"
+                if row.get("suggested_ram_gb") is not None
+                else "-"
+            ),
             _gib(row["declared_vram_mib"]),
             _gib(row["peak_vram_mib"]),
         )
@@ -1531,6 +1622,10 @@ def _render_usage_accuracy(service: GPUQService, *, json_output: bool) -> None:
             f"[dim]On average {waste / 1024:.1f} GiB per job is reserved but never "
             f"touched. That headroom is what stops other jobs starting.[/dim]"
         )
+    console.print(
+        "[dim]SUGGEST is the worst peak seen plus 50%. Correct a queued job in "
+        "place with: workerq requests <id> --ram <n>[/dim]"
+    )
     if not data["vram_measurable"]:
         console.print(
             "[dim]Per-process VRAM is not reportable on this GPU (consumer cards in "
