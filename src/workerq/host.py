@@ -389,3 +389,76 @@ def summarize_pressure(
             f"{min_free_percent:.0f}% required"
         )
     return False, None
+
+
+#: Pagefile configuration changes only when someone reconfigures the machine,
+#: so this is read once and kept.
+_COMMIT_CEILING: list[float | None] = [None]
+
+
+def _configured_pagefile_max_mib() -> float | None:
+    """Total pagefile size Windows is allowed to grow to, in MiB.
+
+    Read from the registry rather than WMI: this is consulted on the admission
+    path, and a subprocess there would cost more than the check saves. Returns
+    None when the pagefile is system-managed, since then there is no declared
+    ceiling to reason about.
+    """
+    if not IS_WINDOWS:  # pragma: no cover - POSIX
+        return None
+    try:
+        import winreg
+
+        key = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management",
+        )
+        with key:
+            entries, _ = winreg.QueryValueEx(key, "PagingFiles")
+    except Exception:
+        return None
+
+    total = 0.0
+    for entry in entries or []:
+        parts = str(entry).split()
+        # "C:\pagefile.sys 16384 32768"; a system-managed file has no sizes, or
+        # zeros, and cannot be bounded here.
+        if len(parts) < 3:
+            return None
+        try:
+            maximum = float(parts[2])
+        except ValueError:
+            return None
+        if maximum <= 0:
+            return None
+        total += maximum
+    return total or None
+
+
+def commit_ceiling_mib(mem: HostMemory | None = None) -> float | None:
+    """The largest the commit limit can ever become on this machine.
+
+    The *current* limit is physical RAM plus the pagefile's *current* size, and
+    that size grows on demand. Judging whether a job fits against the current
+    limit therefore refuses work the machine could comfortably take, simply
+    because the pagefile has not been asked to grow yet. What bounds it is RAM
+    plus the pagefile's configured maximum.
+
+    Falls back to the current limit when the maximum cannot be determined - a
+    system-managed pagefile has no declared ceiling, and assuming it can grow
+    without bound is the unsafe direction.
+    """
+    mem = mem or memory()
+    if _COMMIT_CEILING[0] is None:
+        _COMMIT_CEILING[0] = _configured_pagefile_max_mib() or -1.0
+    pagefile_max = _COMMIT_CEILING[0]
+    if pagefile_max is None or pagefile_max < 0:
+        return mem.commit_limit_mib
+    total_ram = mem.total_mib
+    if total_ram is None:
+        return mem.commit_limit_mib
+    ceiling = total_ram + pagefile_max
+    # Never report less than what Windows already grants.
+    if mem.commit_limit_mib is not None:
+        return max(ceiling, mem.commit_limit_mib)
+    return ceiling

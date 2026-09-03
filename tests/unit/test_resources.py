@@ -482,3 +482,48 @@ def test_the_physical_floor_still_governs_regardless_of_commit(tmp_path):
     )
     assert not decision.admit
     assert "floor" in (decision.reason or "")
+
+
+def test_commit_is_judged_against_the_ceiling_not_the_current_limit(tmp_path, monkeypatch):
+    """The pagefile grows on demand, so the limit in force now is not the bound.
+
+    Measuring against it stranded a real job: 64% commit, 57% of RAM free, GPU
+    90% free, and the queue refused it because the pagefile had not yet been
+    asked to expand.
+    """
+    from workerq import host as host_mod
+
+    config = _default_commit_config(tmp_path)
+    # 61.6 GiB RAM, pagefile currently 19.7 GiB (limit 81.3) but allowed 32.
+    monkeypatch.setattr(host_mod, "_COMMIT_CEILING", [32768.0])
+    machine = host.HostMemory(
+        total_mib=61.6 * GIB,
+        available_mib=0.57 * 61.6 * GIB,
+        commit_limit_mib=81.3 * GIB,
+        commit_used_mib=52.0 * GIB,
+    )
+    request = ResourceRequest(ram_mib=14 * GIB, vram_mib=22 * GIB, cpus=4, gpu_count=1)
+    assert admit(config, request, [], gpu=gpu(), mem=machine).admit
+
+    # The same request with the ceiling genuinely consumed must still refuse.
+    at_the_wall = host.HostMemory(
+        total_mib=61.6 * GIB,
+        available_mib=0.45 * 61.6 * GIB,
+        commit_limit_mib=93.6 * GIB,
+        commit_used_mib=88.0 * GIB,
+    )
+    assert not admit(config, request, [], gpu=gpu(), mem=at_the_wall).admit
+
+
+def test_a_system_managed_pagefile_falls_back_to_the_current_limit(tmp_path, monkeypatch):
+    """No declared maximum means no ceiling to reason about; assume no growth."""
+    from workerq import host as host_mod
+
+    monkeypatch.setattr(host_mod, "_COMMIT_CEILING", [-1.0])
+    machine = host.HostMemory(
+        total_mib=61.6 * GIB,
+        available_mib=0.5 * 61.6 * GIB,
+        commit_limit_mib=70.0 * GIB,
+        commit_used_mib=60.0 * GIB,
+    )
+    assert host_mod.commit_ceiling_mib(machine) == pytest.approx(70.0 * GIB)

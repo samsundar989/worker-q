@@ -332,9 +332,14 @@ def admit(
     #
     # Judging that on "commit % is high AND physical RAM is low" never
     # fires, because on this failure physical RAM is never low.
+    # Judged against the *ceiling*, not the limit in force this instant. The
+    # pagefile grows on demand up to its configured maximum, so the current
+    # limit is not the bound - measuring against it refuses work the machine
+    # would accept as soon as Windows bothered to extend the file.
     headroom = None
-    if mem.commit_limit_mib is not None and mem.commit_used_mib is not None:
-        headroom = mem.commit_limit_mib - mem.commit_used_mib
+    ceiling = host.commit_ceiling_mib(mem)
+    if ceiling is not None and mem.commit_used_mib is not None:
+        headroom = ceiling - mem.commit_used_mib
     if headroom is not None:
         wants = request.ram_mib + request.vram_mib
         margin = cap.total_ram_mib * (r.commit_headroom_percent / 100.0)
@@ -342,10 +347,11 @@ def admit(
             return Decision(
                 False,
                 f"needs about {_gib(wants)} of commit (RAM + VRAM) but only "
-                f"{_gib(headroom)} is left before the system commit limit "
-                f"({_gib(mem.commit_used_mib)} of {_gib(mem.commit_limit_mib)} "
-                "used). On Windows, GPU memory is backed by commit, so VRAM "
-                "counts here even though physical RAM looks free",
+                f"{_gib(headroom)} is left below the system commit ceiling "
+                f"({_gib(mem.commit_used_mib)} committed of {_gib(ceiling)} "
+                "once the pagefile has fully grown). On Windows, GPU memory is "
+                "backed by commit, so VRAM counts here even though physical RAM "
+                "looks free",
                 detail,
             )
 

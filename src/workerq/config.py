@@ -136,7 +136,7 @@ class ResourcesConfig:
     #: headroom, because on Windows the GPU driver backs video memory with
     #: system commit and the limit stops rising once the pagefile hits its
     #: configured maximum.
-    commit_headroom_percent: int = 10
+    commit_headroom_percent: int = 5
     #: Retained so an existing config file keeps loading; superseded by the
     #: headroom check above, which fires on the failure these never caught.
     commit_soft_percent: int = 88
