@@ -424,3 +424,52 @@ def test_concurrent_snapshots_of_one_repo(git_repo: Path, tmp_path: Path):
     assert len(created) == 5
     for snap in created:
         assert (snap.path / "tracked.txt").read_text(encoding="utf-8") == "original\n"
+
+
+def test_a_racing_worktree_add_is_retried(git_repo, tmp_path, monkeypatch):
+    """Two agents submitting at once must not lose a submission to a race.
+
+    `git worktree add` writes several files under .git/worktrees/<name>/, and a
+    concurrent addition can read a half-written entry. It is transient, so the
+    submission should survive it rather than fail.
+    """
+    from workerq import snapshot as snap
+
+    calls: list[int] = []
+    real_git = snap._git
+
+    def flaky(args, **kwargs):
+        if args[:2] == ["worktree", "add"]:
+            calls.append(1)
+            if len(calls) == 1:
+                raise snap.SnapshotError(
+                    "git worktree add failed: fatal: failed to read "
+                    ".git/worktrees/job-3/commondir: No error"
+                )
+        return real_git(args, **kwargs)
+
+    monkeypatch.setattr(snap, "_git", flaky)
+    monkeypatch.setattr(snap, "_WORKTREE_BACKOFF_SECONDS", 0.0)
+
+    result = snap.create_git_snapshot(git_repo, tmp_path / "snap", job_id=3)
+    assert result.path is not None and result.path.is_dir()
+    assert len(calls) == 2, "the first attempt should have been retried once"
+
+
+def test_a_real_worktree_failure_is_not_retried_forever(git_repo, tmp_path, monkeypatch):
+    """Only the known race is retried; a genuine error must surface at once."""
+    from workerq import snapshot as snap
+
+    calls: list[int] = []
+
+    def broken(args, **kwargs):
+        if args[:2] == ["worktree", "add"]:
+            calls.append(1)
+            raise snap.SnapshotError("git worktree add failed: fatal: invalid reference")
+        return snap._git.__wrapped__(args, **kwargs) if False else _ORIGINAL(args, **kwargs)
+
+    _ORIGINAL = snap._git
+    monkeypatch.setattr(snap, "_git", broken)
+    with pytest.raises(snap.SnapshotError, match="invalid reference"):
+        snap.create_git_snapshot(git_repo, tmp_path / "snap2", job_id=4)
+    assert len(calls) == 1, "an unrelated failure must not be retried"

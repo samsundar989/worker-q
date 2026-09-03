@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -136,6 +137,39 @@ def read_index_hash(repo_root: Path) -> str | None:
 # --------------------------------------------------------------------------
 
 
+#: `git worktree add` writes .git/worktrees/<name>/ as several files. Two
+#: additions racing in the same repository can read a half-written entry and
+#: fail with "failed to read .git/worktrees/<name>/commondir". It is transient
+#: and the retry succeeds, so a submission should not die of it - on a machine
+#: where several agents submit at once this is a normal collision, not a fault.
+_WORKTREE_ATTEMPTS = 4
+_WORKTREE_BACKOFF_SECONDS = 0.25
+
+
+def _add_worktree(repo_root: Path, destination: Path, commit: str) -> None:
+    last: Exception | None = None
+    for attempt in range(_WORKTREE_ATTEMPTS):
+        try:
+            _git(
+                ["worktree", "add", "--detach", str(destination), commit],
+                cwd=repo_root,
+            )
+            return
+        except SnapshotError as exc:
+            last = exc
+            if "commondir" not in str(exc) and "worktrees" not in str(exc):
+                raise
+            # Clear the partial entry so the retry is not refused for an
+            # existing worktree, then let git settle.
+            try:
+                _git(["worktree", "prune"], cwd=repo_root)
+            except SnapshotError:
+                pass
+            if attempt + 1 < _WORKTREE_ATTEMPTS:
+                time.sleep(_WORKTREE_BACKOFF_SECONDS * (attempt + 1))
+    raise last if last else SnapshotError("git worktree add failed")
+
+
 def create_git_snapshot(
     repo_root: Path,
     destination: Path,
@@ -198,10 +232,7 @@ def create_git_snapshot(
         # Anchor the commit so `git gc` cannot collect a queued job's source.
         _git(["update-ref", ref, commit], cwd=repo_root)
 
-        _git(
-            ["worktree", "add", "--detach", str(destination), commit],
-            cwd=repo_root,
-        )
+        _add_worktree(repo_root, destination, commit)
         if not destination.is_dir():
             raise SnapshotError("git worktree add did not create the snapshot directory")
 
