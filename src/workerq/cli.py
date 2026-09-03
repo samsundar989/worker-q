@@ -1706,10 +1706,21 @@ def resources(
         f"{cap['total_vram_mib'] / 1024:.1f} GiB"
     )
     console.print(f"  CPU   {cap['usable_cpus']:6d} usable of {cap['total_cpus']}")
-    console.print(
-        f"  Commit charge now {host_info.get('commit_percent') or 0:.0f}% "
-        f"(hard stop at {data['limits']['max_commit_percent']}%)"
-    )
+    commit = data.get("commit") or {}
+    if commit.get("available_mib") is not None:
+        console.print(
+            f"  COMMIT  {commit['available_mib'] / 1024:6.1f} GiB free for jobs, of "
+            f"{commit['ceiling_mib'] / 1024:.1f} GiB "
+            f"({commit['used_mib'] / 1024:.1f} GiB committed)"
+        )
+        console.print(
+            "[dim]          RAM and VRAM both draw on this one budget[/dim]"
+        )
+    else:
+        console.print(
+            f"  Commit charge now {host_info.get('commit_percent') or 0:.0f}% "
+            f"(hard stop at {data['limits']['max_commit_percent']}%)"
+        )
     console.print()
     label = data["reserve"].get("label")
     who = f"Held back by you as '{label}'" if label else "Reserved for the OS and your editors"

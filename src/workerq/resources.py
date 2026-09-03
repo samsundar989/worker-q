@@ -371,6 +371,8 @@ def describe_capacity(config: Config, reserve: Reserve | None = None) -> dict[st
     reserve = reserve or Reserve.from_config(config)
     gpu = query_gpus(include_processes=False)
     cap = capacity(config, gpu=gpu, mem=mem, reserve=reserve)
+    ceiling = host.commit_ceiling_mib(mem)
+    margin = cap.total_ram_mib * (config.resources.commit_headroom_percent / 100.0)
     return {
         "enforced": config.resources.enforce,
         "capacity": cap.to_dict(),
@@ -382,9 +384,24 @@ def describe_capacity(config: Config, reserve: Reserve | None = None) -> dict[st
             "label": reserve.label,
             "expires_at": reserve.expires_at,
         },
+        # Commit is the one budget RAM and VRAM both draw on, so it can bind
+        # before either does. Reporting it as a headroom figure rather than
+        # only a percentage is what stops it surprising people at admission.
+        "commit": {
+            "ceiling_mib": ceiling,
+            "used_mib": mem.commit_used_mib,
+            "available_mib": (
+                None
+                if ceiling is None or mem.commit_used_mib is None
+                else max(0.0, ceiling - mem.commit_used_mib - margin)
+            ),
+            "margin_mib": margin,
+            "current_limit_mib": mem.commit_limit_mib,
+        },
         "limits": {
             "max_commit_percent": config.resources.max_commit_percent,
             "min_host_free_percent": config.resources.min_host_free_percent,
+            "commit_headroom_percent": config.resources.commit_headroom_percent,
         },
         "defaults": {
             "ram_gb": config.resources.default_ram_gb,

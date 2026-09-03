@@ -527,3 +527,87 @@ def test_a_system_managed_pagefile_falls_back_to_the_current_limit(tmp_path, mon
         commit_used_mib=60.0 * GIB,
     )
     assert host_mod.commit_ceiling_mib(machine) == pytest.approx(70.0 * GIB)
+
+
+def test_commit_is_reported_as_headroom_not_only_a_percentage(tmp_path, monkeypatch):
+    """It binds before RAM or VRAM do, so it has to be visible before it bites.
+
+    Reporting only "commit charge 64%" gave no way to see a refusal coming.
+    """
+    from workerq import host as host_mod
+
+    config = _default_commit_config(tmp_path)
+    monkeypatch.setattr(host_mod, "_COMMIT_CEILING", [32768.0])
+    monkeypatch.setattr(
+        host_mod,
+        "memory",
+        lambda: host.HostMemory(
+            total_mib=61.6 * GIB,
+            available_mib=30.0 * GIB,
+            commit_limit_mib=81.3 * GIB,
+            commit_used_mib=54.6 * GIB,
+        ),
+    )
+    data = describe_capacity(config)
+    commit = data["commit"]
+    # Ceiling is RAM + the pagefile maximum, not the limit in force now.
+    assert commit["ceiling_mib"] == pytest.approx(61.6 * GIB + 32768.0)
+    assert commit["current_limit_mib"] == pytest.approx(81.3 * GIB)
+    # Headroom is what is left after the safety margin, in absolute terms.
+    expected = commit["ceiling_mib"] - 54.6 * GIB - 61.6 * GIB * 0.05
+    assert commit["available_mib"] == pytest.approx(expected)
+
+
+def test_ram_and_vram_pools_can_both_fit_while_commit_cannot(tmp_path):
+    """Why the commit check cannot be dropped in favour of RAM/VRAM/CPU alone.
+
+    They are separate physical pools drawing on one shared commit budget, so
+    gating each independently cannot see the sum. Here both pools have room and
+    commit does not.
+    """
+    config = _default_commit_config(tmp_path)
+    running_ram, running_vram = 16 * GIB, 20 * GIB
+    candidate = ResourceRequest(ram_mib=24 * GIB, vram_mib=0.0, cpus=4)
+
+    # Commit as it stands once the running job has actually grown into its
+    # declaration: a 54.6 GiB baseline plus what that job committed.
+    machine = host.HostMemory(
+        total_mib=61.6 * GIB,
+        available_mib=40.0 * GIB,
+        commit_limit_mib=93.6 * GIB,
+        commit_used_mib=54.6 * GIB + running_ram + running_vram,
+    )
+    running = [ResourceRequest(ram_mib=running_ram, vram_mib=running_vram, cpus=3)]
+
+    cap = capacity(config, gpu=gpu(), mem=machine)
+    assert running_ram + candidate.ram_mib < cap.usable_ram_mib, "RAM pool has room"
+    assert running_vram < cap.usable_vram_mib, "VRAM pool has room"
+
+    decision = admit(config, candidate, running, gpu=gpu(), mem=machine)
+    assert not decision.admit
+    assert "commit" in (decision.reason or "")
+
+
+def test_commit_is_measured_live_not_from_declarations(tmp_path):
+    """A deliberate limitation, recorded so it is not mistaken for an oversight.
+
+    RAM and VRAM are checked against the *declared* reservations of running
+    jobs, which covers a job that has not yet grown to full size. Commit is
+    checked against what is actually committed, because adding declarations on
+    top of live usage would double-count a job that has already grown - and
+    commit headroom here is far too small to absorb that.
+
+    The residual exposure is two large jobs ramping simultaneously. The RAM and
+    VRAM ledgers bound it: they already stop two big GPU jobs starting together.
+    """
+    config = _default_commit_config(tmp_path)
+    running = [ResourceRequest(ram_mib=16 * GIB, vram_mib=20 * GIB, cpus=3)]
+    # The running job has been admitted but has not yet committed anything.
+    not_yet_grown = host.HostMemory(
+        total_mib=61.6 * GIB,
+        available_mib=40.0 * GIB,
+        commit_limit_mib=93.6 * GIB,
+        commit_used_mib=54.6 * GIB,
+    )
+    candidate = ResourceRequest(ram_mib=24 * GIB, vram_mib=0.0, cpus=4)
+    assert admit(config, candidate, running, gpu=gpu(), mem=not_yet_grown).admit
