@@ -4,6 +4,12 @@ Nothing here is implemented. This records the seams that were left in place so
 these can be added without a redesign, and the point at which each stops being
 worth building yourself.
 
+> **Stage 3 has since been designed in full.** See
+> [multi-node.md](multi-node.md). The conclusion below - that a second machine
+> over SSH is workable and that two hosts is the ceiling - stands unchanged;
+> what that document adds is the answer to each of the requirements Stage 3
+> lists as the reason not to.
+
 ## The seam
 
 Everything execution-related sits behind one protocol,
@@ -105,7 +111,11 @@ about two machines, because it quietly requires:
 - placement policy across heterogeneous GPUs.
 
 That list is a distributed scheduler. Two hosts is the honest ceiling for
-hand-rolling it.
+hand-rolling it - which is exactly the number [multi-node.md](multi-node.md)
+targets. Its short answers to the list above: the remote host runs a *complete*
+worker-q rather than an exec agent, so snapshots are materialised locally from a
+thin git bundle, logs and process supervision never cross the link, and a
+dropped connection leaves a job running rather than ambiguous.
 
 ### What routing needs
 
