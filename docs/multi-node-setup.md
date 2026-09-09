@@ -703,9 +703,12 @@ machines together.**
 > WORKER   config get scheduling.backfill_max_hold_seconds -> error: unknown key
 > ```
 >
-> This is harmless today — nothing crosses the link yet — but it must be
-> resolved **before** dispatch lands, and it must be resolved at a *committed*
-> point, not by shipping the primary's uncommitted branch. See
+> **Resolved 2026-09-09.** The branch was merged to `main` and the version
+> bumped to **1.3.0**, so `--version` is meaningful again for this gap. Bring
+> the worker up with the upgrade steps below; after it, both machines must
+> report `workerq 1.3.0`. That fixes *this* skew but not the general problem —
+> the next unbumped commit reopens it, which is why the durable answer is a
+> protocol version. See
 > [multi-node.md §8.2](multi-node.md#82-version-skew--and-why---version-cannot-detect-it)
 > for why the fix is a protocol version and a build commit rather than a
 > version string.

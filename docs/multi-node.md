@@ -789,47 +789,77 @@ is written by the runner and never consulted by the scheduler. This is a
 pre-existing bug, but a two-node queue displaces jobs more often, so it should
 be fixed before or alongside this work rather than after.
 
-### 8.6 Write targets diverge silently
+### 8.6 Not all passthrough is alike, and one kind diverges silently
 
 The eligibility check in [§5.1](#51-eligibility-then-fit) verifies that each
-declared `--passthrough` path **exists** on the candidate node. For read-only
-inputs that is exactly right. For paths a job *writes to*, existence is what
-makes it dangerous.
-
-biohub is the concrete case. Its `.gpuq.toml` declares `runs/records`
-("experiment records written by runs") and its header instructs jobs to write
-submissions to an **absolute** path under the live repo:
+declared `--passthrough` path **exists** on the candidate node. Running that
+check by hand against the prepared worker, 2026-09-09, gave a result worth
+recording before any code depends on the assumption it overturns:
 
 ```text
---out C:/Users/samsu/Documents/biohub/outputs/submission.csv
+kaggriculture     1 of  9 passthrough paths present
+arc-whest         1 of 29 present
+biohub            4 of 10 present
 ```
 
-Repos live at `C:\Users\samsu\Documents\<project>` on **both** machines. So
-that absolute path resolves on the worker too — to the worker's own disk. A
-biohub job dispatched there would run correctly, report `SUCCEEDED`, and write
-its submission to a machine the user is not looking at. Nothing fails; the
-result is simply somewhere else.
+**None of the three projects was dispatchable**, despite all three having been
+staged, built and smoke-tested on the worker. The smoke tests passed because the
+worker's clones are behind the primary and do not contain `.gpuq.toml`, so no
+passthrough was declared and the jobs happened not to need any. The moment the
+primary dispatches, it applies *its* `.gpuq.toml`, and the truth appears.
 
-This is worse than the undeclared-data problem in
-[§12](#12-open-questions), because that one fails loudly. This one succeeds
-wrongly, and `runs/records` compounds it: two machines appending experiment
-records to their own local copies produce two divergent histories that are
-never reconciled.
+That is the check earning its place. But sizing what was missing showed the
+deeper point: **treating every passthrough entry the same is what makes the
+number look frightening.** They fall into four kinds, and only one of them
+should ever be copied.
 
-The fix is to stop treating every passthrough entry the same. `.gpuq.toml`
-should distinguish inputs from outputs:
+| Kind | Example | What to do | Cost if you get it wrong |
+| --- | --- | --- | --- |
+| **Environment** | `.venv`, `.venv-gpu` (2.9 GB) | **Build on the worker.** Windows venvs hardcode paths; wheels differ by driver and arch. | Copying it appears to work and then fails obscurely |
+| **Regenerable cache** | `.cache` (12.3 GB), `weights_P01.f32` (3.0 GB), `runs/cache` | **Let the worker rebuild it.** | A cache derived on a 5090 is not obviously valid for a 3080 Ti |
+| **Real input** | truth `.npz`, `models/clean`, benchmark tapes | **Copy.** Usually small. | The job cannot run |
+| **Write target** | `runs`, `runs/records`, `outputs`, `benchmarks/ablations` | **Reconcile — see below.** | Silent divergence |
+
+Applying that classification collapses the staging cost from about 22 GB across
+the two projects to **roughly 1 GB of genuine inputs**. `arc-whest`'s 29 entries
+are 3 venvs to build, one 3 GB regenerable cache, and ~0.7 GB of truth arrays —
+about two minutes of copying, not nineteen.
+
+#### The write-target problem is universal here, not a biohub quirk
+
+All three projects write through a passthrough, and each `.gpuq.toml` says so in
+its own words — kaggriculture calls `runs` "league/trace/search OUTPUT; the
+junction makes a job's results land in the real repository", and arc-whest warns
+that "a job that WRITES through one writes into the real repository".
+
+On one machine that is exactly right, and it is why the junction exists. Across
+two machines it is a silent correctness bug:
+
+- **`runs/records` and `runs`** — two machines appending their own results to
+  their own local copies produce two divergent histories that nothing
+  reconciles.
+- **Absolute output paths.** biohub's `.gpuq.toml` instructs jobs to write to
+  `C:/Users/samsu/Documents/biohub/outputs/submission.csv`. Repos live under
+  `C:\Users\samsu\Documents\<project>` on **both** machines, so that path
+  resolves on the worker too — to the worker's disk. The job runs correctly,
+  reports `SUCCEEDED`, and leaves its output on a machine nobody is looking at.
+
+That second failure is worse than a missing dataset, because a missing dataset
+fails loudly and this succeeds wrongly.
+
+So `.gpuq.toml` must distinguish inputs from outputs:
 
 ```toml
 [snapshot]
-passthrough = [".venv", "data/train", "models/clean"]   # read: must exist on the node
-outputs     = ["runs/records", "outputs"]               # written: must be reconciled
+passthrough = [".venv", "experiments/packed/D11_truth_256x32.npz"]  # read
+outputs     = ["runs", "runs/records", "outputs"]                   # written back
 ```
 
 and worker-q's rule becomes: **a job that declares outputs either runs on the
-primary, or has those outputs pulled back on completion.** Until that exists,
-projects with write targets must be pinned local — which for biohub costs
-little, since its large training runs cannot fit a 12 GiB card anyway.
-
+primary, or has those outputs pulled back on completion.** Because every project
+here has write targets, this is not a refinement to add later — it is a
+prerequisite for dispatching anything, which is why it is now
+[Phase 4b](#phase-4b--output-reconciliation) rather than a footnote.
 ---
 
 ## 9. CLI surface
@@ -947,6 +977,21 @@ resolves there. No scheduling involved.
 explicit `--node`. All the plumbing — submit, state mapping, logs, cancel,
 reconcile — exercised with a human choosing the machine. Automatic placement is
 still off.
+
+### Phase 4b — output reconciliation
+
+Promoted out of a footnote by the finding in [§8.6](#86-not-all-passthrough-is-alike-and-one-kind-diverges-silently):
+every project staged so far writes through a passthrough, so without this there
+is nothing that can safely be dispatched at all.
+
+- `[snapshot] outputs` in `.gpuq.toml`, read alongside `passthrough`.
+- A job declaring outputs is pinned local until its outputs can be returned.
+- On completion, the declared output paths are copied back from the worker
+  before the job is marked terminal — a job is not `SUCCEEDED` until its
+  results are where the submitter can see them.
+- An **absolute** output path that resolves on both machines is refused at
+  submit time with an explicit message. Silently writing to the wrong machine
+  is the one failure this design must not ship.
 
 ### Phase 5 — automatic placement
 
