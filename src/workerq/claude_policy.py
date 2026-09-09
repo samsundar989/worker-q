@@ -174,6 +174,81 @@ running the command directly.
 
 Small CPU-only commands and genuinely lightweight tests may run directly.
 
+## There is a second machine, and worker-q may use it
+
+Jobs can run on either machine. You do not choose, and you do not need to think
+about it: submit exactly as above and worker-q decides. Everything below is so
+you can read what it decided, not so you can drive it.
+
+**Nothing about how you submit changes.** Same command, same declarations. The
+`--ram/--vram/--cpus` you declare are judged against whichever machine the job
+lands on, so declaring honestly matters more than before, not less: a job that
+over-declares RAM is refused by the smaller machine and loses access to it
+entirely.
+
+The two machines are not equals:
+
+    SAM_MEGA_PC     RTX 5090 32 GiB    64 GiB RAM   (this one)
+    3080ti          RTX 3080 Ti 12 GiB 16 GiB RAM   about 11 GiB VRAM usable
+
+So a job wanting more than ~11 GiB of VRAM or ~13 GiB of RAM can only ever run
+here. That is not a failure, and `status` says so rather than leaving it
+mysterious.
+
+**When work moves.** Only when moving it lets a *different* job start sooner.
+If a job can run here and nothing is waiting behind it, it stays here - this
+machine is faster, and moving it would buy nothing.
+
+### Reading where a job went
+
+    workerq status                 a NODE column: "local" or the node's name
+    workerq top                    a row per machine, live
+    workerq node list              both machines, their memory and health
+    workerq logs <id> --follow     works the same wherever the job runs
+
+Logs and any declared output paths are brought back automatically when a remote
+job ends, so `workerq logs <id>` is always the right command and you never need
+to go looking on the other machine.
+
+### Pinning, when you really mean it
+
+    workerq submit --node local ...      keep it here
+    workerq submit --node 3080ti ...     insist on the worker
+
+Prefer not to. A pin overrides a decision worker-q makes with more information
+than you have, and `--node local` on work that could travel is how the queue
+silently loses its second machine. Pin when a job genuinely must be on one
+machine, not to be safe.
+
+A pin that cannot be honoured fails **at submit time** with the reason, rather
+than waiting in the queue.
+
+### Two things that stop a job travelling
+
+Both are about the job, not the machine, and both are worth fixing rather than
+working around.
+
+**Writing to an absolute path inside the repository.** Repos live at the same
+path on both machines, so `--out C:/Users/samsu/Documents/<project>/artifacts/x`
+resolves on either - and the job would succeed while leaving its results on a
+machine nobody is looking at. worker-q refuses this rather than let it happen.
+The fix is a path *relative* to the repository, declared in `.gpuq.toml`:
+
+    [snapshot]
+    outputs = ["artifacts", "runs/records"]
+
+Declared outputs are copied home when the job finishes. Reading an absolute
+path is fine and is not affected - only writing.
+
+**Data that is not on the other machine.** A job may only be placed where every
+`--passthrough` path it declares exists. Check with:
+
+    workerq node stage 3080ti --repo <path>
+
+which lists exactly what is missing. Declare passthrough in `.gpuq.toml` rather
+than repeating flags, since that file travels with the snapshot and both
+machines then agree without anyone remembering.
+
 Notes for this machine:
 - A queued job runs the source exactly as it was at submission time, so you may
   keep editing the repository immediately after submitting.

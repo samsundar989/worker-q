@@ -35,9 +35,13 @@ The four things worth knowing:
    and may be admitted when it should have waited.
 2. **Jobs outlive your terminal.** Close the shell, close the editor, the job
    keeps running and the logs stay readable from any new shell.
-3. **A queued job runs the source as it was at submission time.** Keep editing
+3. **A job may run on another machine.** If more than one is registered,
+   worker-q decides which; you submit the same way either way, and `workerq
+   status` shows a NODE column saying where it went. See
+   [More than one machine](#more-than-one-machine).
+4. **A queued job runs the source as it was at submission time.** Keep editing
    the repo the moment you have submitted; the job is unaffected.
-4. **worker-q never runs your command directly.** If the queue is unreachable,
+5. **worker-q never runs your command directly.** If the queue is unreachable,
    submission fails loudly and tells you to run `workerq doctor`.
 
 ---
@@ -446,6 +450,94 @@ device list.
 
 ---
 
+## More than one machine
+
+Register another machine and worker-q will use it. **Nothing about how you
+submit changes** — same command, same declarations — and that is the point:
+
+```bash
+workerq node add 3080ti --address desktop-unr95nb --user samsu
+workerq node check 3080ti          # reachable? compatible? clock sane?
+workerq node list                  # both machines, live
+```
+
+A job runs on the other machine only when moving it lets a *different* job
+start sooner. If a job can run here and nothing is waiting behind it, it stays
+here — the local machine is usually faster, and moving it would buy nothing.
+That rule is about contention, not about which machine is emptier.
+
+Your declarations are judged against whichever machine the job lands on, so
+declaring honestly matters more than before: a job that over-declares RAM is
+refused by the smaller machine and loses access to it entirely.
+
+### Seeing where work went
+
+```bash
+workerq status                 # a NODE column: "local" or the node's name
+workerq top                    # a row per machine, live
+workerq logs <id> --follow     # identical wherever the job runs
+```
+
+Logs and declared outputs are fetched back when a remote job ends, so you never
+go looking on the other machine.
+
+### Pinning
+
+```bash
+workerq submit --node local  ...   # keep it here
+workerq submit --node 3080ti ...   # insist on the worker
+```
+
+Prefer not to. A pin overrides a decision made with more information than you
+have. A pin that cannot be honoured fails at **submit** time with the reason,
+rather than waiting silently in the queue.
+
+### What has to be true for a job to travel
+
+**Its data must be there.** A job is only placed where every `--passthrough`
+path it declares exists. Environments are built on each machine, never copied;
+regenerable caches are left to regenerate; only real inputs are staged.
+
+```bash
+workerq node stage 3080ti --repo C:\path\to\project   # lists what is missing
+workerq node stage 3080ti --repo ... --clone            # clone it there first
+```
+
+**It must not write to an absolute path inside the repository.** Repos sit at
+the same path on both machines, so `--out C:/Users/you/Documents/proj/out.csv`
+resolves on either — and the job would succeed while leaving its results on a
+machine nobody is looking at. worker-q refuses that rather than let it happen.
+Use a path relative to the repo and declare it:
+
+```toml
+# .gpuq.toml
+[snapshot]
+passthrough = [".venv", "data/train"]    # read: must exist on the node
+outputs     = ["artifacts", "runs"]      # written: copied home when the job ends
+```
+
+Reading an absolute path is fine and unaffected. Only writing is refused.
+
+### Taking a machine out of service
+
+```bash
+workerq node drain 3080ti     # stop placing there; running jobs finish
+workerq node enable 3080ti    # start using it again
+```
+
+`drain` deliberately does not cancel anything — the usual reason to drain is
+that you want the current work to finish.
+
+To turn placement off entirely while keeping the node registered:
+
+```bash
+workerq config set scheduling.auto_placement false
+```
+
+The full design, including what it deliberately does not do, is in
+[docs/multi-node.md](docs/multi-node.md); preparing a worker machine is
+[docs/multi-node-setup.md](docs/multi-node-setup.md).
+
 ## Source snapshots
 
 The problem this solves: you submit job #42, then keep editing. Without
@@ -747,6 +839,13 @@ See [docs/architecture.md](docs/architecture.md),
 | `workerq promote ID` | Move a queued job to the front. |
 | `workerq bump ID LEVEL` | Raise one job's priority; may displace running work. |
 | `workerq wait ID` | Block until a job finishes; exits with its exit code. |
+| `workerq submit --node NAME` | Pin a job to one machine (`local` keeps it here). |
+| `workerq node add NAME --address HOST` | Register another machine. |
+| `workerq node list` | Every machine, with live memory and health. |
+| `workerq node check [NAME]` | Reachable, compatible, clock sane? Exits non-zero if not. |
+| `workerq node stage NAME --repo PATH [--clone]` | What a project still needs on that machine. |
+| `workerq node drain NAME` / `enable NAME` | Stop / resume placing work there. |
+| `workerq node rm NAME` | Unregister a machine. |
 | `workerq eta ID DURATION` | Set or correct a job's expected wall time. |
 | `workerq describe ID [TEXT] [--blocks W]` | Say what a job is and what waits on it. |
 | `workerq priority [PROJECT LEVEL]` | Show/set a project's default priority. |

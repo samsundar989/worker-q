@@ -1428,6 +1428,7 @@ class Dispatcher:
                     code = 0 if state == "SUCCEEDED" else 1
                 self._collect_remote_log(node, row, entry)
                 collected = self._collect_remote_outputs(node, row)
+                self._drop_remote_worktree(node, row)
                 self.store.finish(backend_id, exit_code=int(code))
                 if collected:
                     self.log(f"job {backend_id}: {collected}")
@@ -1485,6 +1486,41 @@ class Dispatcher:
             f"collected {result['collected']} output file(s) from {node.name} "
             f"({result['bytes']} bytes)"
         )
+
+    def _drop_remote_worktree(self, node: Any, row: dict[str, Any]) -> None:
+        """Remove the worktree this job ran in, once its results are home.
+
+        Ordered after log and output collection for the obvious reason, and it
+        exists because these trees live under the *project* repository rather
+        than worker-q's state directory - so the node's own `cleanup`, which
+        only knows about its state directory, would never reach them. Without
+        this every dispatched job leaves one behind for good.
+
+        `staging.remove_worktree` detaches junctions before removing anything;
+        that ordering is not optional here, since the tree is full of links
+        into live data.
+        """
+        from workerq import staging
+
+        raw = row.get("remote_spec_json")
+        if not raw:
+            return
+        try:
+            spec = json.loads(raw)
+            repo_root = Path(spec["repo_root"])
+            job_id = int(spec.get("origin_job_id") or row["id"])
+        except (TypeError, ValueError, KeyError):
+            return
+        try:
+            if not staging.remove_worktree(node, repo_root, job_id):
+                # Leaking a worktree costs disk; forcing the issue could cost
+                # the dataset it links to.
+                self.log(
+                    f"job {row['id']}: left its worktree on {node.name} - "
+                    "a junction could not be detached safely"
+                )
+        except Exception as exc:
+            self.log(f"job {row['id']}: could not remove its worktree on {node.name}: {exc}")
 
     def _collect_remote_log(self, node: Any, row: dict[str, Any], entry: dict[str, Any]) -> None:
         """Bring a finished remote job's log home.
