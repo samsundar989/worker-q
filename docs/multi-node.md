@@ -1226,6 +1226,40 @@ Still open: surfacing *"running but its node is unreachable"* in `status`. The
 job is safe and the state is correct; it simply looks like any other running
 job until you check `workerq node list`.
 
+### Phase 1 — monitoring, completed alongside
+
+`status` and `top` both show the other machine:
+
+```text
+VRAM    █▌──────────────────────   6.3%  2.0 / 31.8 GiB  util 7%
+RAM     ███████████▉────────────  49.9%  30.7 / 61.6 GiB
+Commit  ████████████▎───────────  51.2%  47.9 / 93.6 GiB
+Usable  54 GiB RAM · 14 CPU · 31 GiB VRAM
+3080ti  █▎──────────────────────   5.6%  ram 7.4/15.9G · 0 job
+```
+
+Nothing on a render path does I/O. The dispatcher polls each node on a
+background thread and publishes what it saw into the queue meta table; `top`,
+`status` and `node list` read it from there. That is the mechanism the reserve
+and slot count already use — the queue database is the channel — and it is
+forced here by arithmetic: the dashboard redraws about once a second and an SSH
+round trip costs ~540 ms, so polling on the render path would stall it for half
+of every frame.
+
+Polling cannot live in the dispatch tick either. At 540 ms against a 0.25 s
+loop it would stall cancellation and reaping a fifth of the time. But
+publishing *must* stay on the main loop, because a SQLite connection belongs to
+the thread that created it — writing from the poller raised, the exception was
+swallowed, and reports silently never appeared.
+
+### Phase 7 — node-aware learning ⛔ not started
+
+`eta.py` still pools durations across machines, so a 3080 Ti run and a 5090 run
+of the same command feed one estimate that is right for neither — see
+[§8.1](#81-eta-and-suggest-are-silently-node-blind). `jobs.node` now records
+where each job ran, which is the input this needs; the work is to key duration
+history by it while leaving peak RAM pooled.
+
 ### Phase 7 — node-aware learning
 
 The ETA/SUGGEST corrections of [§8.1](#81-eta-and-suggest-are-silently-node-blind).
