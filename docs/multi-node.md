@@ -952,13 +952,26 @@ This ships real value on its own — one dashboard for both machines — at
 essentially zero risk, and it exercises the transport, the report format, the
 staleness handling and the version check before anything depends on them.
 
-### Phase 2 — node-agnostic admission
+### Phase 2 — node-agnostic admission ✅ done
 
 The `NodeSnapshot` refactor of [§5.2](#52-making-admit-node-agnostic). Pure
-refactor: no behaviour change, no new commands. Its deliverable is a unit test
-that admits and refuses jobs against a *described* machine rather than the one
-running the test — which is also the first time this logic becomes testable
-without depending on the developer's live free memory.
+refactor: no behaviour change, no new commands.
+
+`resources.NodeSnapshot` carries the four readings `admit()` used to take for
+itself — host memory, GPU inventory, CPU count and the commit ceiling — plus
+the reserve and a node name. `capacity()` and `admit()` take an optional
+`node=`; every existing caller still passes `gpu=`/`mem=`/`reserve=` and gets
+a locally-built snapshot, which is what kept the diff to one module.
+
+The deliverable is six tests in `tests/unit/test_resources.py` that admit and
+refuse against *described* machines — the real 5090 and 3080 Ti — rather than
+whichever host runs the suite. They pin the behaviours placement depends on:
+a 0-VRAM job is admitted on either machine; a 20 GiB job is refused on the
+smaller card with VRAM named in the reason; identical running load fills the
+worker while the primary still has room; and a machine with no pagefile
+refuses on commit what the same machine with 48 GiB accepts. None of those
+questions could be asked before, and the last one could not even be simulated,
+because the ceiling came from the local registry.
 
 ### Phase 3 — source and environment staging
 

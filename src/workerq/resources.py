@@ -156,19 +156,97 @@ def cpu_count() -> int:
     return os.cpu_count() or 1
 
 
+@dataclass(frozen=True)
+class NodeSnapshot:
+    """Everything admission needs to know about *a* machine.
+
+    `admit()` used to reach for `host.memory()`, `os.cpu_count()` and the local
+    registry's pagefile maximum. That is correct for the machine it runs on and
+    impossible for any other, so a second node could never be reasoned about.
+
+    Collecting those four readings into one value changes nothing locally - the
+    local snapshot is built from the same calls in the same order - but it lets
+    the primary predict, with this exact function, whether a job would be
+    admitted on a machine it is not running on. The remote node then re-runs
+    the same check against its own live numbers before starting anything, so a
+    stale prediction fails safe: the node refuses and the job is placed again.
+
+    It also makes admission testable against a *described* machine rather than
+    whichever one happens to run the test suite.
+    """
+
+    mem: host.HostMemory
+    gpu: GpuInfo | None
+    cpus: int
+    #: RAM plus the pagefile's configured maximum. `None` when it cannot be
+    #: determined, which callers must not confuse with zero.
+    commit_ceiling_mib: float | None
+    reserve: Reserve
+    #: Identifies the machine in wait reasons. "local" is this host.
+    name: str = "local"
+
+    @classmethod
+    def local(
+        cls,
+        config: Config,
+        *,
+        gpu: GpuInfo | None = None,
+        mem: host.HostMemory | None = None,
+        reserve: Reserve | None = None,
+    ) -> NodeSnapshot:
+        mem = mem or host.memory()
+        return cls(
+            mem=mem,
+            gpu=gpu,
+            cpus=cpu_count(),
+            commit_ceiling_mib=host.commit_ceiling_mib(mem),
+            reserve=reserve or Reserve.from_config(config),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "cpus": self.cpus,
+            "commit_ceiling_mib": self.commit_ceiling_mib,
+            "host": self.mem.to_dict(),
+            "reserve": self.reserve.to_dict(),
+        }
+
+
+def _resolve_node(
+    config: Config,
+    node: NodeSnapshot | None,
+    gpu: GpuInfo | None,
+    mem: host.HostMemory | None,
+    reserve: Reserve | None,
+) -> NodeSnapshot:
+    """Accept either an explicit snapshot or the legacy loose arguments.
+
+    Every existing caller passes `gpu=`/`mem=`/`reserve=`; keeping that working
+    is what makes this a refactor rather than a rewrite.
+    """
+    if node is not None:
+        return node
+    return NodeSnapshot.local(config, gpu=gpu, mem=mem, reserve=reserve)
+
+
 def capacity(
     config: Config,
     gpu: GpuInfo | None = None,
     mem: host.HostMemory | None = None,
     reserve: Reserve | None = None,
+    *,
+    node: NodeSnapshot | None = None,
 ) -> Capacity:
-    mem = mem or host.memory()
-    reserve = reserve or Reserve.from_config(config)
+    node = _resolve_node(config, node, gpu, mem, reserve)
+    mem = node.mem
+    reserve = node.reserve
+    gpu = node.gpu
 
     total_ram = mem.total_mib or 0.0
     usable_ram = max(0.0, total_ram - reserve.ram_mib)
 
-    total_cpus = cpu_count()
+    total_cpus = node.cpus
     usable_cpus = max(1, total_cpus - reserve.cpus)
 
     total_vram = 0.0
@@ -207,20 +285,28 @@ def admit(
     gpu: GpuInfo | None = None,
     mem: host.HostMemory | None = None,
     reserve: Reserve | None = None,
+    node: NodeSnapshot | None = None,
 ) -> Decision:
-    """Can this request start right now?
+    """Can this request start right now, on this machine?
 
     Returns a `Decision` whose `reason` is written verbatim into the job's
     wait reason, so `workerq status` always explains why something is not running
     instead of appearing mysteriously stuck.
+
+    Pass `node` to ask the question about a machine other than this one - the
+    primary uses it to predict placement on a remote worker. Everything else
+    behaves identically; the node only supplies the readings this function used
+    to take itself.
     """
     r = config.resources
     if not r.enforce:
         return Decision(True, detail={"enforced": False})
 
-    mem = mem or host.memory()
-    reserve = reserve or Reserve.from_config(config)
-    cap = capacity(config, gpu=gpu, mem=mem, reserve=reserve)
+    node = _resolve_node(config, node, gpu, mem, reserve)
+    mem = node.mem
+    reserve = node.reserve
+    gpu = node.gpu
+    cap = capacity(config, node=node)
     reserved = sum_reservations(running)
     # A non-default reserve is the owner reclaiming the machine. When that is
     # why a job cannot start, the wait reason has to say so - otherwise the
@@ -337,7 +423,7 @@ def admit(
     # limit is not the bound - measuring against it refuses work the machine
     # would accept as soon as Windows bothered to extend the file.
     headroom = None
-    ceiling = host.commit_ceiling_mib(mem)
+    ceiling = node.commit_ceiling_mib
     if ceiling is not None and mem.commit_used_mib is not None:
         headroom = ceiling - mem.commit_used_mib
     if headroom is not None:
@@ -367,11 +453,12 @@ def describe_capacity(config: Config, reserve: Reserve | None = None) -> dict[st
     """
     from workerq.gpu import query_gpus
 
-    mem = host.memory()
-    reserve = reserve or Reserve.from_config(config)
     gpu = query_gpus(include_processes=False)
-    cap = capacity(config, gpu=gpu, mem=mem, reserve=reserve)
-    ceiling = host.commit_ceiling_mib(mem)
+    node = NodeSnapshot.local(config, gpu=gpu, reserve=reserve)
+    mem = node.mem
+    reserve = node.reserve
+    cap = capacity(config, node=node)
+    ceiling = node.commit_ceiling_mib
     margin = cap.total_ram_mib * (config.resources.commit_headroom_percent / 100.0)
     return {
         "enforced": config.resources.enforce,

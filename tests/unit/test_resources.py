@@ -14,6 +14,7 @@ from workerq import host
 from workerq.config import Config, CoreConfig, ResourcesConfig
 from workerq.gpu import GpuDevice, GpuInfo
 from workerq.resources import (
+    NodeSnapshot,
     Decision,
     Reserve,
     ResourceRequest,
@@ -629,3 +630,155 @@ def test_commit_is_measured_live_not_from_declarations(tmp_path):
     )
     candidate = ResourceRequest(ram_mib=24 * GIB, vram_mib=0.0, cpus=4)
     assert admit(config, candidate, running, gpu=gpu(), mem=not_yet_grown).admit
+
+
+# ---------------------------------------------------------------------------
+# Admission against a machine other than this one (multi-node, phase 2)
+# ---------------------------------------------------------------------------
+#
+# Placement on a second machine needs the answer to "would this job be admitted
+# *there*". Before NodeSnapshot, admit() read this host's memory, CPU count and
+# pagefile maximum directly, so the question could not be asked at all - and
+# these tests could not be written, because they would have measured whichever
+# machine ran the suite.
+
+
+def node_snapshot(
+    config,
+    *,
+    name: str,
+    ram_gb: float,
+    free_gb: float,
+    vram_gb: float,
+    cpus: int,
+    pagefile_gb: float,
+    reserve: Reserve,
+) -> NodeSnapshot:
+    """A described machine. Nothing here touches the host running the test."""
+    return NodeSnapshot(
+        mem=host.HostMemory(
+            total_mib=ram_gb * GIB,
+            available_mib=free_gb * GIB,
+            commit_limit_mib=(ram_gb + 8.0) * GIB,
+            commit_used_mib=(ram_gb - free_gb) * GIB,
+        ),
+        gpu=gpu(total_gb=vram_gb, free_gb=vram_gb - 1.0),
+        cpus=cpus,
+        commit_ceiling_mib=(ram_gb + pagefile_gb) * GIB,
+        reserve=reserve,
+        name=name,
+    )
+
+
+def primary(config) -> NodeSnapshot:
+    """SAM_MEGA_PC: RTX 5090 32 GiB, 64 GiB RAM, 96 GiB pagefile maximum."""
+    return node_snapshot(
+        config, name="sam-mega-pc", ram_gb=64.0, free_gb=33.0, vram_gb=32.0,
+        cpus=16, pagefile_gb=96.0,
+        reserve=Reserve(ram_mib=8.0 * GIB, vram_mib=4.0 * GIB, cpus=2),
+    )
+
+
+def worker(config) -> NodeSnapshot:
+    """DESKTOP-UNR95NB: RTX 3080 Ti 12 GiB, 16 GiB RAM, 48 GiB pagefile."""
+    return node_snapshot(
+        config, name="desktop-unr95nb", ram_gb=16.0, free_gb=13.0, vram_gb=12.0,
+        cpus=16, pagefile_gb=48.0,
+        reserve=Reserve(ram_mib=3.0 * GIB, vram_mib=1.0 * GIB, cpus=1),
+    )
+
+
+def test_capacity_describes_the_named_node_not_the_test_runner(tmp_path):
+    config = make_config(tmp_path)
+
+    big = capacity(config, node=primary(config))
+    small = capacity(config, node=worker(config))
+
+    assert big.total_ram_mib == 64.0 * GIB
+    assert big.usable_vram_mib == (32.0 - 4.0) * GIB
+    assert small.total_ram_mib == 16.0 * GIB
+    assert small.usable_vram_mib == (12.0 - 1.0) * GIB
+    # The worker keeps more of its CPUs, because a dedicated box reserves one
+    # rather than two.
+    assert small.usable_cpus == 15
+    assert big.usable_cpus == 14
+
+
+def test_a_small_job_is_admitted_on_either_machine(tmp_path):
+    """The 49% of this queue that declares no VRAM at all."""
+    config = make_config(tmp_path)
+    job = request(ram_gb=3.0, cpus=2, vram_gb=0.0)
+
+    assert admit(config, job, [], node=primary(config)).admit
+    assert admit(config, job, [], node=worker(config)).admit
+
+
+def test_a_large_vram_job_is_refused_on_the_smaller_card(tmp_path):
+    """A 20 GiB job is 5090-only, and the refusal must say so."""
+    config = make_config(tmp_path)
+    job = request(ram_gb=8.0, vram_gb=20.0)
+
+    assert admit(config, job, [], node=primary(config)).admit
+
+    refused = admit(config, job, [], node=worker(config))
+    assert not refused.admit
+    assert "VRAM" in (refused.reason or "")
+
+
+def test_the_worker_fills_before_the_primary_does(tmp_path):
+    """Identical running load, different verdicts - the whole point of placement.
+
+    Two 5 GiB-VRAM jobs already running leaves the 3080 Ti unable to take a
+    third while the 5090 still can, which is what makes "spill under
+    contention" a decision rather than a coin toss.
+    """
+    config = make_config(tmp_path)
+    running = [request(ram_gb=2.0, vram_gb=5.0), request(ram_gb=2.0, vram_gb=5.0)]
+    job = request(ram_gb=2.0, vram_gb=5.0)
+
+    assert admit(config, job, running, node=primary(config)).admit
+    assert not admit(config, job, running, node=worker(config)).admit
+
+
+def test_commit_ceiling_is_read_from_the_node_not_the_local_registry(tmp_path):
+    """VRAM is commit-backed, so the pagefile maximum decides what fits.
+
+    The same described machine with a small pagefile refuses a job that it
+    accepts with a large one. Nothing here can be answered by reading the
+    registry of whichever host runs the suite.
+    """
+    config = make_config(tmp_path, min_host_free_percent=5, max_commit_percent=99)
+    reserve = Reserve(ram_mib=3.0 * GIB, vram_mib=1.0 * GIB, cpus=1)
+    job = request(ram_gb=6.0, vram_gb=10.0)  # ~16 GiB of commit
+
+    generous = node_snapshot(
+        config, name="worker-big-pagefile", ram_gb=16.0, free_gb=13.0,
+        vram_gb=12.0, cpus=16, pagefile_gb=48.0, reserve=reserve,
+    )
+    starved = node_snapshot(
+        config, name="worker-no-pagefile", ram_gb=16.0, free_gb=13.0,
+        vram_gb=12.0, cpus=16, pagefile_gb=0.0, reserve=reserve,
+    )
+
+    assert admit(config, job, [], node=generous).admit
+    refused = admit(config, job, [], node=starved)
+    assert not refused.admit
+    assert "commit" in (refused.reason or "").lower()
+
+
+def test_snapshot_argument_and_loose_arguments_agree(tmp_path):
+    """The refactor must not have changed what the local path decides."""
+    config = make_config(tmp_path)
+    machine, card = mem(), gpu()
+    reserve = Reserve.from_config(config)
+    job = request(ram_gb=10.0, vram_gb=8.0, cpus=2)
+
+    loose = admit(config, job, [], gpu=card, mem=machine, reserve=reserve)
+    explicit = admit(
+        config,
+        job,
+        [],
+        node=NodeSnapshot.local(config, gpu=card, mem=machine, reserve=reserve),
+    )
+    assert loose.admit == explicit.admit
+    assert loose.reason == explicit.reason
