@@ -138,8 +138,26 @@ def test_invalid_priority_on_submit_is_rejected(svc: GPUQService, git_repo: Path
         )
 
 
-def test_raising_a_project_reranks_its_queued_jobs(svc: GPUQService, git_repo: Path):
+def test_raising_a_project_reranks_its_queued_jobs(
+    svc: GPUQService, git_repo: Path, waiter
+):
     """Marking a project urgent must affect work already waiting."""
+    # Occupy the one slot with unrelated work, so the two jobs under test are
+    # still queued when the re-rank runs. Without this the dispatcher may start
+    # the first of them, and what the test then measures is how fast the tick
+    # loop happened to be rather than whether re-ranking works.
+    blocker = svc.submit(
+        SubmitRequest(
+            command=["python", "-c", "import time; time.sleep(60)"],
+            cwd=str(git_repo),
+            project="slot-blocker",
+            gpus=0,
+        )
+    ).job
+    assert waiter(
+        lambda: svc.db.get_job(blocker.id).state == JobState.RUNNING.value
+    ), "the blocker never started, so the slot is not actually occupied"
+
     first = svc.submit(
         SubmitRequest(command=["python", "1"], cwd=str(git_repo), gpus=0)
     ).job

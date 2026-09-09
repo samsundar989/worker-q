@@ -90,6 +90,10 @@ def test_a_job_that_cannot_fit_does_not_block_one_that_can(
         min_host_free_percent=0,
         max_commit_percent=100,
         commit_soft_percent=100,
+        # Also neutralise the absolute commit-headroom gate, or this measures
+        # how close the host happens to be to its commit ceiling rather than
+        # whether backfill works.
+        commit_headroom_percent=0,
     )
     live_service.config.save()
     live_service.backend.shutdown(timeout=20)

@@ -30,6 +30,12 @@ def _enable(service: GPUQService, **kwargs) -> None:
         reserve_cpus=0,
         max_commit_percent=100,
         min_host_free_percent=0,
+        # The percentage stops above are not the only commit gate: admission
+        # also refuses a job that does not fit in the absolute headroom below
+        # the commit ceiling. Leaving that at its default made these tests fail
+        # on a machine that happened to be near its ceiling, which is a property
+        # of the host rather than of the scheduling being tested.
+        commit_headroom_percent=0,
     )
     defaults.update(kwargs)
     service.config.resources = ResourcesConfig(**defaults)

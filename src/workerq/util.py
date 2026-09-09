@@ -101,6 +101,30 @@ def ensure_dir(path: Path) -> Path:
     return path
 
 
+#: Cap for the dispatcher's own logs. One previous generation is kept, so the
+#: pair costs at most twice this on disk.
+LOG_ROTATE_BYTES = 16 * 1024 * 1024
+
+
+def rotate_if_large(path: Path, *, limit: int = LOG_ROTATE_BYTES) -> bool:
+    """Move `path` aside once it exceeds `limit`, keeping one generation.
+
+    The dispatcher logs were never rotated and grew to 60 MiB each, which is
+    both a disk cost and a forensic one: the useful lines end up buried under
+    hundreds of thousands of repetitions. Best-effort, and never raises - losing
+    a log rotation must not take the daemon down.
+    """
+    try:
+        if not path.exists() or path.stat().st_size < limit:
+            return False
+        previous = path.with_suffix(path.suffix + ".1")
+        previous.unlink(missing_ok=True)
+        path.rename(previous)
+        return True
+    except OSError:
+        return False
+
+
 def is_within(child: Path, parent: Path) -> bool:
     """True when `child` is `parent` or a descendant. Used to guard deletion."""
     try:

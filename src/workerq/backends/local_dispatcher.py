@@ -30,7 +30,7 @@ from workerq.backends.base import (
 from workerq.backends import dispatcher as dispatcher_mod
 from workerq.backends.queue_store import QueueStore, row_to_backend_job
 from workerq.config import Config
-from workerq.util import age_seconds, ensure_dir
+from workerq.util import age_seconds, ensure_dir, rotate_if_large
 from workerq.winproc import (
     ExclusiveLock,
     detached_creationflags,
@@ -138,6 +138,9 @@ class LocalDispatcherBackend:
         if env.get("CUDA_VISIBLE_DEVICES", None) == "":
             env.pop("CUDA_VISIBLE_DEVICES", None)
 
+        # Appended to by every daemon this profile ever starts, so without this
+        # it is the one log that grows without bound.
+        rotate_if_large(stdout_path)
         try:
             handle = open(stdout_path, "a", encoding="utf-8", errors="replace")
         except OSError:
