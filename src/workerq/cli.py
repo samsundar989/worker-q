@@ -2538,6 +2538,83 @@ def node_check(
     raise typer.Exit(0 if ok_all else 1)
 
 
+@node_app.command("stage")
+def node_stage(
+    name: str = typer.Argument(..., help="Node to stage onto."),
+    repo: str = typer.Option(None, "--repo", "-r", help="Repository to stage. Defaults to the one you are standing in."),
+    clone: bool = typer.Option(False, "--clone", help="Clone it there if missing. The node clones from origin, over its own connection - never across the link."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Check (and optionally create) a project's clone on a node.
+
+    Reports every `--passthrough` path the project declares and whether it
+    exists there, because that is what decides whether a job may be placed on
+    that machine. Exits non-zero when the node is not ready.
+    """
+    from workerq import staging
+    from workerq.snapshot import find_repo_root, load_project_passthrough
+
+    config = load_config()
+    node = _node_or_fail(config, name)
+
+    start = Path(repo).expanduser() if repo else Path.cwd()
+    repo_root = find_repo_root(start)
+    if repo_root is None:
+        fail(f"{start} is not inside a git repository")
+
+    declared = load_project_passthrough(repo_root)
+    try:
+        status = staging.inspect_repo(node, repo_root, declared)
+        if not status.exists and clone:
+            if not json_output:
+                console.print(f"cloning {repo_root.name} on {node.name}...")
+            status = staging.clone_repo(node, repo_root)
+            status = staging.inspect_repo(node, repo_root, declared)
+    except staging.StagingError as exc:
+        fail(str(exc))
+        return
+
+    if json_output:
+        emit_json(status.to_dict())
+        raise typer.Exit(0 if status.ready else 1)
+
+    console.print(f"[bold]{status.project}[/bold] on [bold]{node.name}[/bold]")
+    console.print(f"  path      {status.remote_path}")
+    if status.error:
+        console.print(f"  [red]error     {status.error}[/red]")
+        raise typer.Exit(1)
+    if not status.exists:
+        console.print("  [yellow]not cloned there yet[/yellow]")
+        console.print(f"\n  Run [bold]workerq node stage {name} --clone[/bold]")
+        raise typer.Exit(1)
+
+    console.print(f"  branch    {status.branch}  ({(status.head or '')[:9]})")
+    console.print(f"  origin    {status.origin}")
+
+    if not declared:
+        console.print(
+            f"\n  [{theme.MUTED}]No passthrough declared in .gpuq.toml. If jobs "
+            "here need a gitignored path\n  (a .venv, a dataset) they will fail "
+            "on the node - declare it so this check can see it.[/]"
+        )
+    else:
+        present = sum(1 for ok in status.passthrough.values() if ok)
+        console.print(f"\n  passthrough  {present} of {len(declared)} present")
+        for entry, ok in status.passthrough.items():
+            mark = Text("  ok ", style="green") if ok else Text("MISS", style="bold red")
+            console.print(f"    {mark} {entry}")
+
+    if status.ready:
+        console.print(f"\n[bold green]ready[/bold green] - jobs for {status.project} can be placed on {name}")
+    else:
+        console.print(
+            f"\n[yellow]not ready[/yellow] - {len(status.missing)} path(s) missing on "
+            f"{name}. Until they exist there, placement will\n"
+            f"refuse this project rather than fail the job."
+        )
+    raise typer.Exit(0 if status.ready else 1)
+
+
 @app.command("_node-report", hidden=True)
 def internal_node_report(
     json_output: bool = typer.Option(True, "--json", help="Machine-readable output."),

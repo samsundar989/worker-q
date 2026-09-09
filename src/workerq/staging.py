@@ -128,19 +128,110 @@ def have_object(repo_root: Path, oid: str) -> bool:
 # --------------------------------------------------------------------------
 
 
+def normalise_origin(url: str | None) -> str | None:
+    """Compare remotes by identity, not by spelling.
+
+    `git@github.com:me/x.git` and `https://github.com/me/x` are the same
+    repository, and which one a clone happens to use is not something the
+    scheduler should care about.
+    """
+    if not url:
+        return None
+    text = url.strip().rstrip("/")
+    text = re.sub(r"\.git$", "", text)
+    text = re.sub(r"^ssh://", "", text)
+    text = re.sub(r"^https?://", "", text)
+    text = re.sub(r"^git@", "", text)
+    text = text.replace(":", "/", 1) if "@" not in text and ":" in text else text
+    return text.lower()
+
+
+#: node name -> {directory name: normalised origin}. Repositories are not
+#: cloned often, so one scan per process is plenty.
+_REPO_INDEX: dict[str, dict[str, str]] = {}
+
+
+def index_repos(node: NodeConfig, *, refresh: bool = False) -> dict[str, str]:
+    """Every repository under the node's repo root, by its origin.
+
+    One SSH call for the whole directory, because the connection is the cost.
+    """
+    if not refresh and node.name in _REPO_INDEX:
+        return _REPO_INDEX[node.name]
+
+    script = (
+        "powershell -NoProfile -Command \""
+        "Get-ChildItem -Path '{root}' -Directory -ErrorAction SilentlyContinue | "
+        "ForEach-Object {{ $u = git -C $_.FullName remote get-url origin 2>$null; "
+        "if ($u) {{ '{{0}}|{{1}}' -f $_.Name, $u.Trim() }} }}\""
+    ).format(root=node.repo_root)
+    result = nodes.run_remote(node, script, timeout=max(node.timeout_seconds, 60.0))
+
+    index: dict[str, str] = {}
+    if result.ok:
+        for line in result.stdout.splitlines():
+            if "|" not in line:
+                continue
+            name, _, url = line.partition("|")
+            normalised = normalise_origin(url)
+            if normalised:
+                index[name.strip()] = normalised
+    _REPO_INDEX[node.name] = index
+    return index
+
+
 def remote_repo_path(node: NodeConfig, repo_root: Path) -> str:
     """Where `repo_root` lives on `node`.
 
-    Only the parent directory has to be agreed: worker-q materialises snapshots
+    Two machines need not agree on the directory name, and here they do not:
+    this repository is `gpu-queue` on the primary and `worker-q` on the worker.
+    So identity is the **origin URL**, with the directory name as a fast path
+    and as the fallback for a repo that has no origin.
+
+    Only the parent directory has to be agreed. worker-q materialises snapshots
     under its own state directory and derives `execution_cwd` relative to the
-    repo root, so the absolute paths need not match between machines.
+    repo root, so the absolute paths never have to match.
     """
+    wanted = normalise_origin(origin_url(repo_root))
+    if wanted:
+        index = index_repos(node)
+        # Prefer the same name when it is also the same repository, so a
+        # machine holding two clones of one repo behaves predictably.
+        if index.get(repo_root.name) == wanted:
+            return f"{node.repo_root}\\{repo_root.name}"
+        for name, origin in index.items():
+            if origin == wanted:
+                return f"{node.repo_root}\\{name}"
     return f"{node.repo_root}\\{repo_root.name}"
 
 
 def _q(path: str) -> str:
     """Quote a Windows path for cmd.exe."""
     return f'"{path}"' if " " in path else path
+
+
+#: node name -> {literal text: expanded text}
+_EXPANDED: dict[str, dict[str, str]] = {}
+
+
+def expand_remote(node: NodeConfig, text: str) -> str:
+    """Resolve `%VAR%` against the node's environment.
+
+    Needed because the two channels behave differently: a command sent over SSH
+    runs through `cmd.exe`, which expands `%TEMP%`, but **scp talks to the sftp
+    subsystem**, which does not - it took the literal string `%TEMP%\\...` as a
+    directory name and failed to find it. Anything that will be handed to scp
+    has to be a real path before it leaves here.
+    """
+    if "%" not in text:
+        return text
+    cache = _EXPANDED.setdefault(node.name, {})
+    if text in cache:
+        return cache[text]
+    result = nodes.run_remote(node, f"echo {text}")
+    expanded = result.out.splitlines()[0].strip() if result.ok and result.out else text
+    cache[text] = expanded
+    return expanded
 
 
 def inspect_repo(
@@ -290,9 +381,10 @@ def ship_snapshot(
                 raise
             already = True
 
-        remote_bundle = f"{REMOTE_STAGE_DIR}\\job-{job_id:06d}.bundle"
+        stage_dir = expand_remote(node, REMOTE_STAGE_DIR)
+        remote_bundle = f"{stage_dir}\\job-{job_id:06d}.bundle"
         if not already:
-            prep = nodes.run_remote(node, f"mkdir {_q(REMOTE_STAGE_DIR)} 2>nul & exit /b 0")
+            prep = nodes.run_remote(node, f"mkdir {_q(stage_dir)} 2>nul & exit /b 0")
             if not prep.ok:
                 raise StagingError(f"could not prepare staging dir: {prep.error}")
             sent = nodes.copy_to_node(node, local_bundle, remote_bundle)

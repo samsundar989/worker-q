@@ -1017,16 +1017,38 @@ refuses on commit what the same machine with 48 GiB accepts. None of those
 questions could be asked before, and the last one could not even be simulated,
 because the ceiling came from the local registry.
 
-### Phase 3 — source and environment staging
+### Phase 3 — source and environment staging ✅ shipping done
 
 `workerq node stage`, delta-bundle creation, remote unbundle and worktree
-materialisation, passthrough verification, and — per
-[§6.1](#61-the-snapshot-ships-source-not-environment) — environment
-provisioning, so a staged repo is one whose jobs can actually run.
+materialisation, passthrough verification. Environment provisioning (per
+[§6.1](#61-the-snapshot-ships-source-not-environment)) is still manual.
 
-Testable standalone: stage a repo, ship a snapshot, assert the worker's
-worktree matches the primary's commit hash and that the declared interpreter
-resolves there. No scheduling involved.
+**Proven against the real pair.** A snapshot of this repository was shipped to
+the worker and materialised: **7,536 bytes, 4.1 seconds**, and the worktree
+came out at exactly the primary's commit. The economic claim in
+[§6](#6-getting-the-source-there) is therefore measured rather than assumed —
+7.5 KB instead of the 67 MB the repository would otherwise cost.
+
+Three things the real machine corrected:
+
+- **Directory names differ between machines.** This repository is `gpu-queue`
+  on the primary and `worker-q` on the worker, so deriving the remote path from
+  the local basename was wrong on the very first repo it met. Identity is the
+  **origin URL**, normalised so `git@github.com:me/x.git` and
+  `https://github.com/me/x` are one repository; the directory name is only a
+  fast path and the fallback for a repo with no origin.
+- **scp does not expand `%TEMP%`.** A command sent over SSH runs through
+  `cmd.exe` and expands it, but scp talks to the sftp subsystem, which took the
+  literal `%TEMP%\...` as a directory name. Anything handed to scp is resolved
+  to a real path first.
+- **A node that already has the commit is a result, not a failure.** Re-placing
+  a job onto a node that ran it before produces an empty bundle, which git
+  reports as an error; staging treats it as "already present" and skips
+  straight to the worktree.
+
+Cleanup uses `git worktree remove`, never a recursive delete — passthrough
+entries are junctions to live data, and following one would destroy a dataset
+the primary cannot see and did not put there.
 
 ### Phase 4 — dispatch, pinned only
 
