@@ -22,7 +22,7 @@ from workerq.models import (
 )
 from workerq.util import ensure_dir, restrict_permissions, utcnow_iso
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 _MIGRATIONS: list[tuple[int, str]] = [
     (
@@ -163,6 +163,18 @@ _MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE jobs ADD COLUMN peak_source TEXT;
         """,
     ),
+    (
+        8,
+        """
+        -- Where a VRAM peak came from, separately from the RAM one, because on
+        -- this platform they cannot come from the same place. 'measured' is a
+        -- true per-process reading. 'device_delta' is the rise in whole-card
+        -- usage while this job owned the card alone, which is the only figure
+        -- obtainable under WDDM and is spoiled by anything else touching the
+        -- GPU. NULL means no VRAM figure was recorded at all.
+        ALTER TABLE jobs ADD COLUMN vram_source TEXT;
+        """,
+    ),
 ]
 
 _JOB_COLUMNS = (
@@ -174,7 +186,8 @@ _JOB_COLUMNS = (
     "requested_vram_mib, requested_cpus, preemptible, preemption_count, "
     "preempted_at, preempted_by, preempted_reason, description, blocks, "
     "eta_seconds, command_signature, progress_fraction, progress_note, "
-    "progress_updated_at, peak_ram_mib, peak_vram_mib, usage_samples, peak_source"
+    "progress_updated_at, peak_ram_mib, peak_vram_mib, usage_samples, peak_source, "
+    "vram_source"
 )
 
 #: Columns callers are allowed to update through `update_job`.
@@ -213,6 +226,7 @@ _UPDATABLE = frozenset(
         "progress_note",
         "progress_updated_at",
         "peak_ram_mib",
+        "vram_source",
         "peak_vram_mib",
         "usage_samples",
         "peak_source",

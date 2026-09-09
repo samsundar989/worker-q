@@ -321,7 +321,7 @@ def declared_vs_observed(service: GPUQService, *, limit: int = 200) -> dict[str,
     Jobs sampled before observed-usage recording existed are skipped rather
     than counted as zero.
     """
-    from workerq.eta import suggested_ram_gb
+    from workerq.eta import suggested_ram_gb, suggested_vram_gb
 
     rows: list[dict[str, Any]] = []
     for job in service.db.list_jobs(limit=limit):
@@ -353,6 +353,12 @@ def declared_vs_observed(service: GPUQService, *, limit: int = 200) -> dict[str,
                 ),
                 "samples": job.usage_samples,
                 "peak_source": job.peak_source,
+                "vram_source": job.vram_source,
+                "suggested_vram_gb": (
+                    suggested_vram_gb(job.peak_vram_mib)
+                    if job.peak_vram_mib is not None
+                    else None
+                ),
                 "suggested_ram_gb": (
                     suggested_ram_gb(job.peak_ram_mib)
                     if job.peak_ram_mib is not None
@@ -371,12 +377,25 @@ def declared_vs_observed(service: GPUQService, *, limit: int = 200) -> dict[str,
         for r in rows
         if r["declared_ram_mib"] and r["peak_ram_mib"] is not None
     ]
+    vram_waste = [
+        r["declared_vram_mib"] - r["peak_vram_mib"]
+        for r in rows
+        if r["declared_vram_mib"] and r["peak_vram_mib"] is not None
+    ]
     return {
         "jobs": rows,
         "measured": len(rows),
         "median_ram_ratio": median,
         "mean_overdeclared_ram_mib": (sum(waste) / len(waste)) if waste else None,
         "vram_measurable": any(r["peak_vram_mib"] is not None for r in rows),
+        # True when the only VRAM figures available came from whole-card deltas
+        # rather than per-process readings, which the display must say out loud.
+        "vram_from_device_delta": bool(rows)
+        and any(r["vram_source"] == "device_delta" for r in rows)
+        and not any(r["vram_source"] == "measured" for r in rows),
+        "mean_overdeclared_vram_mib": (
+            (sum(vram_waste) / len(vram_waste)) if vram_waste else None
+        ),
     }
 
 

@@ -8,9 +8,12 @@ start), and why is the next job not starting yet.
 from __future__ import annotations
 
 import os
+import sys
 import time
+from functools import lru_cache
 from typing import Any
 
+from rich import box
 from rich.console import Group
 from rich.layout import Layout
 from rich.live import Live
@@ -22,21 +25,26 @@ from workerq import __version__, host
 from workerq.core import GPUQService
 from workerq.models import JobState
 from workerq.resources import capacity
+from workerq.theme import ACCENT, CHROME, MUTED, STATE_STYLES
 from workerq.util import human_duration, truncate
 
-STATE_STYLES = {
-    "RUNNING": "bold green",
-    "QUEUED": "yellow",
-    "PREPARING": "cyan",
-    "SUCCEEDED": "green",
-    "FAILED": "bold red",
-    "CANCELLED": "magenta",
-    "LOST": "red",
-}
 
 
-#: Keys the dashboard responds to, in the order the footer lists them.
-KEY_HELP = "j/k scroll  PgUp/PgDn page  g gaming  r/R v/V c/C reserve  0 reset  q quit"
+#: Keys the dashboard responds to, in the order the keybar lists them.
+KEY_GROUPS = (
+    "j/k arrows select",
+    "PgUp/PgDn page",
+    "Home/End",
+    "g gaming",
+    "r/R v/V c/C reserve",
+    "0 reset",
+    "q quit",
+)
+
+
+def key_help() -> str:
+    """The keybar, grouped by what each set of keys is for."""
+    return f" {_glyphs()['sep']} ".join(KEY_GROUPS)
 
 
 class KeyReader:
@@ -55,8 +63,6 @@ class KeyReader:
         return self._enabled
 
     def __enter__(self) -> KeyReader:
-        import sys
-
         try:
             if not sys.stdin.isatty():
                 return self
@@ -85,7 +91,6 @@ class KeyReader:
 
     def __exit__(self, *exc: object) -> None:
         if self._posix_state is not None:  # pragma: no cover - POSIX
-            import sys
             import termios
 
             try:
@@ -109,7 +114,11 @@ class KeyReader:
         char = msvcrt.getwch()
         if char in ("\x00", "\xe0"):
             # A two-part sequence: the second character names the special key.
-            special = msvcrt.getwch() if msvcrt.kbhit() else ""
+            # Read it unconditionally. Gating on kbhit() loses the race when
+            # the console has not yet flushed the second half, and the orphan
+            # then arrives on the next poll as a bare "H" or "P" - which is
+            # how an arrow key becomes a keypress that does nothing.
+            special = msvcrt.getwch()
             return {
                 "H": "up",
                 "P": "down",
@@ -124,7 +133,6 @@ class KeyReader:
 
     def _get_posix(self) -> str | None:  # pragma: no cover - POSIX
         import select
-        import sys
 
         if not select.select([sys.stdin], [], [], 0)[0]:
             return None
@@ -145,35 +153,121 @@ class KeyReader:
         }.get(rest)
 
 
-def _glyphs() -> tuple[str, str, str, str]:
-    """Meter characters the current output encoding can actually represent."""
-    encoding = getattr(__import__("sys").stdout, "encoding", None) or "utf-8"
-    for candidate in (("█", "░", "─", "↳"), ("#", "-", "-", ">")):
+#: Drawing characters, richest first. Console encodings on Windows still
+#: range from UTF-8 to cp437, and a meter made of mojibake is worse than a
+#: plainer one, so each set is tried whole before it is used.
+_GLYPH_SETS: tuple[dict[str, str], ...] = (
+    {
+        "full": "█",
+        "track": "─",
+        "rule": "─",
+        "arrow": "↳",
+        "dot": "●",
+        "sep": "·",
+        "mark": "▸",
+        # Eighth-width blocks, so a meter resolves pressure finer than a cell.
+        "partial": " ▏▎▍▌▋▊▉",
+    },
+    {
+        "full": "#",
+        "track": "-",
+        "rule": "-",
+        "arrow": ">",
+        "dot": "*",
+        "sep": "|",
+        "mark": ">",
+        "partial": " ",
+    },
+)
+
+
+@lru_cache(maxsize=1)
+def _glyphs() -> dict[str, str]:
+    """The richest drawing set this terminal's encoding can represent.
+
+    Cached: it is consulted once per table row, and the answer cannot change
+    while the process runs.
+    """
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    for candidate in _GLYPH_SETS:
         try:
-            "".join(candidate).encode(encoding)
+            "".join(candidate.values()).encode(encoding)
             return candidate
         except (UnicodeEncodeError, LookupError):
             continue
-    return ("#", "-", "-", ">")
+    return _GLYPH_SETS[-1]
+
+
+def _meter_style(fraction: float) -> str:
+    """Colour by pressure. Only the danger band is bold - if everything
+    shouts, the one meter that matters does not stand out."""
+    if fraction >= 0.90:
+        return "bold red"
+    if fraction >= 0.75:
+        return "yellow"
+    return "green"
 
 
 def _bar(used: float | None, total: float | None, width: int = 24) -> Text:
     """A meter that turns colour as pressure rises."""
-    full, empty, rule, _ = _glyphs()
+    g = _glyphs()
     if not total or used is None:
-        return Text(rule * width + "  n/a", style="dim")
+        return Text(g["rule"] * width + "  n/a", style=CHROME)
     fraction = max(0.0, min(1.0, used / total))
-    filled = int(round(fraction * width))
-    if fraction >= 0.90:
-        style = "bold red"
-    elif fraction >= 0.75:
-        style = "yellow"
-    else:
-        style = "green"
-    bar = Text(full * filled, style=style)
-    bar.append(empty * (width - filled), style="dim")
+    style = _meter_style(fraction)
+
+    # Sub-cell resolution: a partial block for the remainder, so 61% and 65%
+    # are not the same picture on a 24-cell meter.
+    exact = fraction * width
+    filled = min(width, int(exact))
+    partial = g["partial"]
+    tail = partial[int((exact - filled) * len(partial))] if filled < width else ""
+
+    bar = Text(g["full"] * filled, style=style)
+    if tail.strip():
+        bar.append(tail, style=style)
+    bar.append(g["track"] * (width - filled - len(tail.strip())), style=CHROME)
     bar.append(f"  {fraction * 100:5.1f}%", style=style)
     return bar
+
+
+def _panel(body: Any, title: str) -> Panel:
+    """Every panel, drawn the same way.
+
+    Rounded and dim rather than square and blue: the borders are scaffolding,
+    and at four panels a screen they should be almost invisible.
+    """
+    return Panel(
+        body,
+        title=Text(title, style=MUTED),
+        title_align="left",
+        border_style=CHROME,
+        box=box.ROUNDED,
+        padding=(0, 1),
+    )
+
+
+def _table(**kwargs: Any) -> Table:
+    """A borderless table with quiet headings, so rows read as a list."""
+    return Table(
+        box=None,
+        pad_edge=False,
+        expand=True,
+        header_style=MUTED,
+        **kwargs,
+    )
+
+
+def _state_cell(state: str) -> Text:
+    """A status dot and a lower-case word.
+
+    Shouting UPPERCASE at every row spends emphasis on the one column that
+    never changes; the dot carries the colour and scans faster than the text.
+    """
+    style = STATE_STYLES.get(state, "")
+    cell = Text(f"{_glyphs()['dot']} ", style=style)
+    cell.append(state.lower(), style=style)
+    return cell
 
 
 def _gib(mib: float | None) -> str:
@@ -217,7 +311,7 @@ def _what_cell(job: Any) -> Text:
     if job.description:
         cell = Text(truncate(job.description, 52))
         if job.blocks:
-            cell.append(f"  ▸ blocks {truncate(job.blocks, 24)}", style="dim")
+            cell.append(f"  {_glyphs()['mark']} blocks {truncate(job.blocks, 24)}", style=MUTED)
         return cell
     return Text(truncate(job.display_command, 60), style="dim")
 
@@ -230,11 +324,19 @@ class Dashboard:
         #: routinely longer than the panel, and a silently truncated list is
         #: how you miss the job you were looking for.
         self.offset = 0
+        #: The highlighted job, as an index into the active list. Keys move
+        #: this and the viewport follows, so the row you are reading stays put
+        #: instead of sliding out from under you as the list scrolls.
+        self.selected = 0
         self.visible_rows = 12
         self.active_count = 0
         #: Transient feedback for the last key pressed.
         self.message: Text | None = None
         self.interactive = False
+        #: Lines the machine panel drew last frame. It varies with the number
+        #: of GPUs, and the layout must not reserve space that nothing fills:
+        #: blank rows above a full queue are rows the queue could have used.
+        self.machine_rows = 4
 
     # -- interaction ------------------------------------------------------
     def _notify(self, text: str, style: str = "green") -> None:
@@ -303,17 +405,21 @@ class Dashboard:
         if key in ("q", "Q"):
             return False
         if key in ("j", "down"):
-            self.offset += 1
+            self.selected += 1
         elif key in ("k", "up"):
-            self.offset -= 1
+            self.selected -= 1
         elif key == "pgdn":
+            # Move the viewport too, so the cursor keeps its place on screen
+            # rather than walking to the bottom edge and sticking there.
+            self.selected += page
             self.offset += page
         elif key == "pgup":
+            self.selected -= page
             self.offset -= page
         elif key == "home":
-            self.offset = 0
+            self.selected = 0
         elif key == "end":
-            self.offset = max(0, self.active_count - self.visible_rows)
+            self.selected = self.active_count - 1
         elif key == "g":
             self.toggle_gaming()
         elif key == "0":
@@ -336,18 +442,36 @@ class Dashboard:
         else:
             return True
 
-        self.offset = max(0, min(self.offset, max(0, self.active_count - 1)))
+        self._follow_selection(self.active_count)
         return True
+
+    def _follow_selection(self, count: int) -> None:
+        """Keep the highlighted row on screen, and the screen full.
+
+        The viewport may not start later than the last full page: scrolling
+        into empty space below the final job is what made paging feel broken,
+        because the panel emptied out while the counter still claimed rows.
+        """
+        self.selected = max(0, min(self.selected, max(0, count - 1)))
+        last_top = max(0, count - self.visible_rows)
+        if self.selected < self.offset:
+            self.offset = self.selected
+        elif self.selected >= self.offset + self.visible_rows:
+            self.offset = self.selected - self.visible_rows + 1
+        self.offset = max(0, min(self.offset, last_top))
 
     # -- panels -----------------------------------------------------------
     def machine_panel(self) -> Panel:
         gpu = self.service.gpu_info()
         mem = host.memory()
         cap = capacity(self.service.config, gpu=gpu, mem=mem)
+        sep = _glyphs()["sep"]
         rows = Table.grid(padding=(0, 1))
-        rows.add_column(style="dim", width=10)
-        rows.add_column(width=34)
-        rows.add_column()
+        rows.add_column(style=MUTED, width=10, no_wrap=True)
+        rows.add_column(width=34, no_wrap=True)
+        # Must not wrap: the panel is sized from the row count, so a detail
+        # that spilled onto a second line pushed the last row off the bottom.
+        rows.add_column(overflow="ellipsis", no_wrap=True)
 
         if gpu.available and gpu.devices:
             for device in gpu.devices:
@@ -363,7 +487,7 @@ class Dashboard:
                     ),
                 )
         else:
-            rows.add_row("VRAM", Text("no NVIDIA GPU", style="dim"), gpu.error or "")
+            rows.add_row("VRAM", Text("no NVIDIA GPU", style=CHROME), gpu.error or "")
 
         rows.add_row(
             "RAM",
@@ -384,34 +508,75 @@ class Dashboard:
         rows.add_row(
             "Usable",
             Text(
-                f"{cap.usable_ram_mib / 1024:.0f} GiB RAM · {cap.usable_cpus} CPU · "
-                f"{cap.usable_vram_mib / 1024:.0f} GiB VRAM",
-                style="dim",
+                f"{cap.usable_ram_mib / 1024:.0f} GiB RAM {sep} {cap.usable_cpus} CPU "
+                f"{sep} {cap.usable_vram_mib / 1024:.0f} GiB VRAM",
+                style=MUTED,
             ),
             Text("(after reserved headroom)", style="dim"),
         )
-        return Panel(rows, title="machine", border_style="blue", padding=(0, 1))
+        self.machine_rows = rows.row_count
+        return _panel(rows, "machine")
+
+    def _fit(self, active: list[Any]) -> tuple[list[Any], dict[int, str]]:
+        """The jobs that fit in the panel, and why any of them are waiting.
+
+        A queued job draws a second line naming what it is short of, so a
+        fixed job count overflows the panel: the list spills past the border
+        and the "showing x-y of n" counter promises rows you cannot see.
+        Budget in lines instead, and report what was actually drawn.
+        """
+        memo: dict[int, str | None] = {}
+
+        def wait_reason(job: Any) -> str | None:
+            if job.state != JobState.QUEUED.value:
+                return None
+            if job.id not in memo:
+                memo[job.id] = self.service.queue_wait_reason(job)
+            return memo[job.id]
+
+        while True:
+            shown: list[Any] = []
+            reasons: dict[int, str] = {}
+            lines = 0
+            for job in active[self.offset :]:
+                reason = wait_reason(job)
+                cost = 2 if reason else 1
+                if shown and lines + cost > self.visible_rows:
+                    break
+                shown.append(job)
+                if reason:
+                    reasons[job.id] = reason
+                lines += cost
+            # Wait-reason lines can push the highlighted row past the bottom.
+            # Scroll on until it is back on screen; the selection is the one
+            # thing the panel must never hide.
+            if self.selected < self.offset + len(shown) or self.offset >= len(active) - 1:
+                return shown, reasons
+            self.offset += 1
 
     def queue_panel(self, jobs: list[Any]) -> Panel:
         summary = self.service.status_summary()
         forecast = self.service.forecast(jobs)
-        table = Table(box=None, pad_edge=False, expand=True)
-        table.add_column("ID", justify="right", style="bold", width=5)
-        table.add_column("STATE", width=9)
-        table.add_column("PRI", width=8)
-        table.add_column("PROJECT", width=14, overflow="ellipsis")
-        table.add_column("TIME", justify="right", width=8)
-        table.add_column("ETA", width=17)
-        table.add_column("REQ", width=11)
-        table.add_column("WHAT", overflow="ellipsis")
+        table = _table()
+        table.add_column("ID", justify="right", style=MUTED, width=5)
+        table.add_column("STATE", width=11, no_wrap=True)
+        table.add_column("PRI", width=8, no_wrap=True)
+        table.add_column("PROJECT", width=14, overflow="ellipsis", no_wrap=True)
+        table.add_column("TIME", justify="right", width=8, no_wrap=True)
+        table.add_column("ETA", width=17, no_wrap=True)
+        table.add_column("REQ", width=11, no_wrap=True)
+        # The only elastic column: it absorbs the width the others do not
+        # need, and truncates rather than wrapping a job onto a second line.
+        table.add_column("WHAT", overflow="ellipsis", no_wrap=True, ratio=1, min_width=16)
 
         active = [j for j in jobs if not j.is_terminal]
         self.active_count = len(active)
         # Clamp here as well as on keypress: the queue shrinks under you as
         # jobs finish, and an offset past the end would show an empty panel.
-        self.offset = max(0, min(self.offset, max(0, len(active) - 1)))
-        shown = active[self.offset : self.offset + self.visible_rows]
-        for job in shown:
+        self._follow_selection(len(active))
+        shown, reasons = self._fit(active)
+        for index, job in enumerate(shown, start=self.offset):
+            row_style = "reverse" if index == self.selected else ""
             request: list[str] = []
             if job.requested_ram_mib:
                 request.append(f"{job.requested_ram_mib / 1024:.0f}G")
@@ -426,44 +591,44 @@ class Dashboard:
             )
             table.add_row(
                 str(job.id),
-                Text(job.state, style=STATE_STYLES.get(job.state, "")),
+                _state_cell(job.state),
                 job.priority,
                 job.project,
                 age,
                 _eta_cell(job, forecast.get(job.id)),
                 " ".join(request) or "-",
                 _what_cell(job),
+                style=row_style,
             )
-            if job.state == JobState.QUEUED.value:
-                reason = self.service.queue_wait_reason(job)
-                if reason:
-                    table.add_row(
-                        "",
-                        "",
-                        "",
-                        "",
-                        "",
-                        "",
-                        "",
-                        Text(f"{_glyphs()[3]} {reason}", style="yellow"),
-                    )
+            reason = reasons.get(job.id)
+            if reason:
+                table.add_row(
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    Text(f"{_glyphs()['arrow']} {reason}", style="yellow"),
+                    style=row_style,
+                )
 
-        if not shown:
-            table.add_row("", Text("idle", style="dim"), "", "", "", "", "", "")
 
         daemon = (
             Text("running", style="green")
             if summary["daemon_running"]
             else Text("NOT RUNNING", style="bold red")
         )
+        sep = f" {_glyphs()['sep']} "
         header = Text.assemble(
-            "slots ",
-            (str(summary["backend_slots"]), "bold"),
-            "   dispatcher ",
+            ("slots ", MUTED),
+            (str(summary["backend_slots"]), ""),
+            (f"{sep}dispatcher ", MUTED),
             daemon,
-            "   ",
+            (sep, MUTED),
             (f"{summary['counts'].get('RUNNING', 0)} running", "green"),
-            " · ",
+            (sep, MUTED),
             (f"{summary['counts'].get('QUEUED', 0)} queued", "yellow"),
         )
         # Say what is off-screen. A list that silently stops at the panel edge
@@ -471,33 +636,44 @@ class Dashboard:
         hidden_above = self.offset
         hidden_below = max(0, len(active) - self.offset - len(shown))
         if hidden_above or hidden_below:
-            header.append("   ")
+            header.append(sep, style=MUTED)
             header.append(
                 f"showing {self.offset + 1}-{self.offset + len(shown)} of {len(active)}",
-                style="bold cyan",
+                style=ACCENT,
             )
             if hidden_below:
-                header.append(f"  ({hidden_below} below)", style="dim")
+                header.append(f" ({hidden_below} below)", style=MUTED)
         reserve = self._current_reserve()
         if reserve.label:
-            header.append(f"   [{reserve.label}]", style="bold magenta")
-        return Panel(
-            Group(header, table), title="queue", border_style="blue", padding=(0, 1)
-        )
+            header.append(f"{sep}[{reserve.label}]", style=f"bold {ACCENT}")
+        if not shown:
+            # An empty queue is the good case. Say so plainly instead of
+            # drawing column headings over nothing.
+            return _panel(
+                Group(header, Text("\n  nothing running or queued", style=CHROME)),
+                "queue",
+            )
+        return _panel(Group(header, table), "queue")
 
     def pressure_panel(self) -> Panel:
         """Who is actually holding memory - including work worker-q never started."""
         own = self.service.own_pids()
-        table = Table(box=None, pad_edge=False, expand=True)
-        table.add_column("PID", justify="right", width=7)
+        table = _table()
+        table.add_column("PID", justify="right", style=MUTED, width=7)
         table.add_column("RAM", justify="right", width=9)
-        table.add_column("PROCESS", overflow="ellipsis")
-        table.add_column("", width=8)
+        table.add_column("PROCESS", overflow="ellipsis", no_wrap=True, ratio=1, min_width=12)
+        table.add_column("", width=8, no_wrap=True)
 
         for proc in host.top_processes(8):
             if proc.memory_mib < 200:
                 continue
-            tag = Text("worker-q", style="green") if proc.pid in own else Text("foreign", style="yellow")
+            # Everything yellow is nothing yellow: what matters is which of
+            # these the queue actually started.
+            tag = (
+                Text("worker-q", style="green")
+                if proc.pid in own
+                else Text("foreign", style=MUTED)
+            )
             style = "bold red" if proc.memory_gib >= 8 else ""
             table.add_row(
                 str(proc.pid),
@@ -505,21 +681,19 @@ class Dashboard:
                 proc.name,
                 tag,
             )
-        return Panel(
-            table,
-            title="top memory consumers",
-            border_style="blue",
-            padding=(0, 1),
-        )
+        return _panel(table, "memory holders")
 
     def recent_panel(self, jobs: list[Any]) -> Panel:
-        table = Table(box=None, pad_edge=False, expand=True)
-        table.add_column("ID", justify="right", style="bold", width=5)
-        table.add_column("STATE", width=10)
-        table.add_column("PROJECT", width=18, overflow="ellipsis")
-        table.add_column("RUNTIME", justify="right", width=8)
-        table.add_column("EXIT", justify="right", width=5)
-        table.add_column("WHY", overflow="ellipsis")
+        table = _table()
+        table.add_column("ID", justify="right", style=MUTED, width=5)
+        table.add_column("STATE", width=11, no_wrap=True)
+        table.add_column("PROJECT", width=12, overflow="ellipsis", no_wrap=True)
+        table.add_column("RUNTIME", justify="right", width=7, no_wrap=True)
+        table.add_column("EXIT", justify="right", width=4, no_wrap=True)
+        # This panel is half the screen, so the elastic column needs a floor:
+        # without one the fixed widths eat it and the reason a job failed -
+        # the whole point of the panel - silently disappears.
+        table.add_column("WHY", overflow="ellipsis", no_wrap=True, ratio=1, min_width=10)
 
         finished = [j for j in jobs if j.is_terminal][:8]
         for job in finished:
@@ -530,28 +704,31 @@ class Dashboard:
                 why = classify_failure(self.service, job).label
             table.add_row(
                 str(job.id),
-                Text(job.state, style=STATE_STYLES.get(job.state, "")),
+                _state_cell(job.state),
                 job.project,
                 human_duration(job.runtime_seconds),
                 "-" if job.exit_code is None else str(job.exit_code),
                 Text(why, style="red" if why else ""),
             )
         if not finished:
-            table.add_row("", Text("nothing finished yet", style="dim"), "", "", "", "")
-        return Panel(table, title="recently finished", border_style="blue", padding=(0, 1))
+            return _panel(
+                Text("\n  nothing finished yet", style=CHROME), "recently finished"
+            )
+        return _panel(table, "recently finished")
 
     def footer(self) -> Text:
         stats = self.service.throughput(hours=24)
+        sep = f" {_glyphs()['sep']} "
         return Text.assemble(
-            (f"workerq {__version__}", "dim"),
-            ("   24h: ", "dim"),
+            (f"workerq {__version__}", MUTED),
+            (f"{sep}24h ", MUTED),
             (f"{stats['succeeded']} ok", "green"),
-            " · ",
-            (f"{stats['failed']} failed", "red" if stats["failed"] else "dim"),
-            " · ",
-            (f"{stats['cancelled']} cancelled", "dim"),
-            (f"   success {stats['success_rate']:.0f}%", "dim"),
-            (f"   median wait {human_duration(stats['median_wait_seconds'])}", "dim"),
+            (sep, CHROME),
+            (f"{stats['failed']} failed", "red" if stats["failed"] else MUTED),
+            (sep, CHROME),
+            (f"{stats['cancelled']} cancelled", MUTED),
+            (f"{sep}success {stats['success_rate']:.0f}%", MUTED),
+            (f"{sep}median wait {human_duration(stats['median_wait_seconds'])}", MUTED),
         )
 
     def keybar(self) -> Text:
@@ -559,34 +736,53 @@ class Dashboard:
         if self.message is not None:
             return self.message
         if not self.interactive:
-            return Text("ctrl-c to exit", style="dim")
-        return Text(KEY_HELP, style="dim")
+            return Text("ctrl-c to exit", style=MUTED)
+        return Text(key_help(), style=MUTED)
 
     # -- render -----------------------------------------------------------
-    def render(self) -> Layout:
+    def render(self, height: int | None = None) -> Layout:
         jobs = self.service.list_jobs(all_jobs=False, limit=30)
         layout = Layout()
+        # Built first: only now is machine_rows right for this frame's GPUs,
+        # and the queue gets whatever height is left over.
+        machine = self.machine_panel()
+        machine_height = self.machine_rows + 2
+        lower_height = _LOWER_MAX
+        if height is not None:
+            lower_height, self.visible_rows = _layout_sizes(height, machine_height)
         layout.split_column(
-            Layout(self.machine_panel(), size=8),
+            Layout(machine, size=machine_height),
             Layout(self.queue_panel(jobs), name="queue"),
-            Layout(name="lower", size=12),
+            Layout(name="lower", size=lower_height),
             Layout(self.keybar(), size=1),
             Layout(self.footer(), size=1),
         )
+        # Not an even split: "why did it fail" needs prose, a PID table does not.
         layout["lower"].split_row(
-            Layout(self.pressure_panel()), Layout(self.recent_panel(jobs))
+            Layout(self.pressure_panel(), ratio=45),
+            Layout(self.recent_panel(jobs), ratio=55),
         )
         return layout
 
 
-def _queue_rows(height: int) -> int:
-    """How many job rows the queue panel can hold at this terminal height.
+#: Lines the lower row wants, and the least it can work with.
+_LOWER_MAX, _LOWER_MIN = 12, 6
+#: The queue panel's own overhead: two borders, the summary line, the
+#: column headings.
+_QUEUE_CHROME = 4
 
-    The panel is the flexible one in the layout, so nothing else knows: the
-    machine panel takes 8, the lower row 12, the keybar and footer one each,
-    and the panel's own border and header take four more.
+
+def _layout_sizes(height: int, machine: int) -> tuple[int, int]:
+    """Split the terminal between the lower row and the queue.
+
+    The queue is why the dashboard exists, so the lower row gives ground
+    first. Nothing here may claim rows the panel cannot draw: an overstated
+    count is what made the "showing x-y of n" counter promise jobs that were
+    clipped off the bottom.
     """
-    return max(3, height - 8 - 12 - 2 - 4)
+    spare = max(0, height - machine - 2)  # keybar and footer
+    lower = max(_LOWER_MIN, min(_LOWER_MAX, spare - _LOWER_MIN))
+    return lower, max(1, spare - lower - _QUEUE_CHROME)
 
 
 #: How often keys are polled. Short enough that scrolling feels immediate,
@@ -600,8 +796,7 @@ def run_dashboard(service: GPUQService, *, interval: float = 2.0, once: bool = F
         from rich.console import Console
 
         console = Console()
-        dashboard.visible_rows = _queue_rows(console.size.height)
-        console.print(dashboard.render())
+        console.print(dashboard.render(console.size.height))
         return
 
     with Live(
@@ -609,10 +804,12 @@ def run_dashboard(service: GPUQService, *, interval: float = 2.0, once: bool = F
     ) as live:
         with KeyReader() as keys:
             dashboard.interactive = keys.enabled
-            # Fit the queue panel to the terminal: the panel is flexible, so
-            # this is the only place that knows how many rows it can hold.
-            height = getattr(live.console.size, "height", 40)
-            dashboard.visible_rows = _queue_rows(height)
+
+            def draw() -> None:
+                # Re-read the height every frame: the window can be resized
+                # under a dashboard that is meant to be left running for days.
+                live.update(dashboard.render(getattr(live.console.size, "height", 40)))
+
             last_refresh = 0.0
             try:
                 while True:
@@ -620,14 +817,12 @@ def run_dashboard(service: GPUQService, *, interval: float = 2.0, once: bool = F
                     if key is not None:
                         if not dashboard.handle_key(key):
                             break
-                        live.update(dashboard.render())
+                        draw()
                         last_refresh = time.monotonic()
                         continue
                     now = time.monotonic()
                     if now - last_refresh >= interval:
-                        height = getattr(live.console.size, "height", 40)
-                        dashboard.visible_rows = _queue_rows(height)
-                        live.update(dashboard.render())
+                        draw()
                         last_refresh = now
                     time.sleep(_KEY_POLL_SECONDS)
             except KeyboardInterrupt:

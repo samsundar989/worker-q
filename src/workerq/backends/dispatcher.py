@@ -21,6 +21,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -42,7 +43,7 @@ from workerq.telemetry import (
     EVENT_STARTED,
     open_telemetry,
 )
-from workerq.util import age_seconds, ensure_dir, utcnow_iso
+from workerq.util import age_seconds, ensure_dir, rotate_if_large, utcnow_iso
 from workerq.winproc import (
     ProcessGroup,
     ExclusiveLock,
@@ -113,6 +114,28 @@ _SAMPLE_INTERVAL_SECONDS = 10.0
 #: before killing it. The runner needs this window to record why the job
 #: stopped; killing it sooner loses the worker's only trace.
 _PREEMPT_BACKSTOP_MARGIN_SECONDS = 20.0
+#: Minimum gap between two log lines saying the same thing about the same job.
+#: A blocked queue is polled several times a second; without this the log grows
+#: by tens of megabytes a day and buries everything that matters.
+_BLOCKED_REPEAT_SECONDS = 300.0
+#: How long the main loop may go without completing a tick before the watchdog
+#: concludes it is wedged and ends the process. Generous next to the 0.25s tick
+#: and the 15s nvidia-smi timeout, so only a real hang trips it.
+_WATCHDOG_GRACE_SECONDS = 180.0
+#: Bytes written before the log size is re-checked, so rotation costs one stat
+#: per megabyte rather than one per line.
+_LOG_CHECK_BYTES = 1024 * 1024
+
+
+def _reason_key(reason: str) -> str:
+    """A wait reason with its numbers removed, for comparing one tick to the next.
+
+    Reasons embed live measurements: "93.4 GiB of 93.6 GiB committed" differs
+    from the same message one tick later purely because memory moved. Comparing
+    the raw string therefore treats an unchanged condition as a new event every
+    time, which is how a stalled queue produced 303,164 identical log lines.
+    """
+    return "".join("#" if c.isdigit() else c for c in reason)
 
 
 @dataclass
@@ -135,10 +158,21 @@ class Dispatcher:
         self._gpu_cache: tuple[float, Any] | None = None
         self.telemetry = open_telemetry(config.state_dir)
         self._last_sample = 0.0
-        #: backend_id -> (first_blocked_monotonic, last_reason), so a job that
-        #: cannot be admitted is reported once rather than every tick.
-        self._blocked: dict[int, tuple[float, str]] = {}
+        #: backend_id -> (first_blocked_monotonic, reason_key, next_repeat_at),
+        #: so a job that cannot be admitted is reported once rather than every
+        #: tick. The key is the reason with its measurements stripped: the raw
+        #: text carries a live figure that moves between ticks, and comparing
+        #: that defeated the deduplication entirely.
+        self._blocked: dict[int, tuple[float, str, float]] = {}
+        #: head backend_id -> when the queue started being held for it, and when
+        #: it may next be logged about. Bounding the hold is what stops one
+        #: unstartable job stalling everything behind it indefinitely.
+        self._hold_since: dict[int, float] = {}
+        self._hold_logged_at: dict[int, float] = {}
+        #: When the main loop last completed a tick, for the watchdog.
+        self._last_tick = time.monotonic()
         self._log_path = config.state_dir / "run" / "dispatcher.log"
+        self._log_written = _LOG_CHECK_BYTES  # force a size check on the first line
         #: Consecutive samples under the memory floor, for the pressure guard.
         self._pressure_strikes = 0
         self._stop = False
@@ -148,6 +182,11 @@ class Dispatcher:
         line = f"{utcnow_iso()} [dispatcher] {message}"
         try:
             ensure_dir(self._log_path.parent)
+            self._log_written += len(line) + 1
+            # Only stat occasionally: this is on the tick path.
+            if self._log_written >= _LOG_CHECK_BYTES:
+                self._log_written = 0
+                rotate_if_large(self._log_path)
             with open(self._log_path, "a", encoding="utf-8", errors="replace") as fh:
                 fh.write(line + "\n")
         except OSError:
@@ -268,6 +307,32 @@ class Dispatcher:
         return [index for _, index in candidates[:gpu_count]], None
 
     # -- child environment -------------------------------------------------
+    def _vram_baseline(self, row: dict[str, Any], devices: list[int]) -> float | None:
+        """Card usage before this job starts, when it will own the card alone.
+
+        Per-process VRAM is unreadable under WDDM, so the only honest way to
+        attribute usage is to watch the device total rise while exactly one job
+        is responsible for it. That holds when the job is exclusive-mode, has a
+        single device, and nothing else worker-q started is on it. Any other
+        arrangement would attribute somebody else's allocation to this job, so
+        return None and leave the peak unrecorded rather than record a wrong one.
+        """
+        if len(devices) != 1:
+            return None
+        if str(row.get("gpu_mode") or "exclusive") != "exclusive":
+            return None
+        device = devices[0]
+        occupancy = self._device_occupancy()
+        if occupancy.get(device, {}).get("jobs"):
+            return None
+        info = self._gpu_info()
+        if not getattr(info, "available", False):
+            return None
+        for dev in info.devices:
+            if dev.index == device:
+                return dev.memory_used_mib
+        return None
+
     def _build_env(self, row: dict[str, Any], devices: list[int]) -> dict[str, str]:
         env = dict(os.environ)
 
@@ -292,6 +357,15 @@ class Dispatcher:
 
         if devices:
             env["CUDA_VISIBLE_DEVICES"] = ",".join(str(d) for d in devices)
+            baseline = self._vram_baseline(row, devices)
+            if baseline is not None:
+                # What the card already held before this job existed. The runner
+                # subtracts it to attribute the rise to this job, which is the
+                # only way to get a per-job VRAM figure on a consumer card in
+                # WDDM mode. Set only when the job owns the device alone, so the
+                # rise cannot belong to somebody else.
+                env["WORKERQ_VRAM_BASELINE_MIB"] = f"{baseline:.1f}"
+                env["WORKERQ_VRAM_DEVICE"] = str(devices[0])
         env["GPUQ_BACKEND_JOB_ID"] = str(row["id"])
         env["GPUQ_STATE_DIR"] = str(self.config.state_dir)
         if self.config.profile:
@@ -350,14 +424,24 @@ class Dispatcher:
     def _note_blocked(self, backend_id: int, reason: str) -> None:
         """Record a blocked job once, and escalate if it stays blocked."""
         now = time.monotonic()
-        first, previous = self._blocked.get(backend_id, (now, ""))
-        self._blocked[backend_id] = (first, reason)
-        if previous == reason:
+        entry = self._blocked.get(backend_id)
+        first = entry[0] if entry else now
+        previous = entry[1] if entry else ""
+        next_repeat = entry[2] if entry else 0.0
+        key = _reason_key(reason)
+
+        if previous == key:
             waited = now - first
             threshold = self.config.resources.blocked_warning_seconds
-            if threshold and waited >= threshold and int(waited) % 300 < 1:
-                self.log(f"job {backend_id}: still blocked after {waited / 60:.0f}m - {reason}")
+            if threshold and waited >= threshold and now >= next_repeat:
+                self.log(
+                    f"job {backend_id}: still blocked after {waited / 60:.0f}m - {reason}"
+                )
+                next_repeat = now + _BLOCKED_REPEAT_SECONDS
+            self._blocked[backend_id] = (first, key, next_repeat)
             return
+
+        self._blocked[backend_id] = (first, key, now + _BLOCKED_REPEAT_SECONDS)
         self.log(f"job {backend_id}: waiting - {reason}")
         self.telemetry.record_event(
             EVENT_BLOCKED, backend_job_id=backend_id, detail=reason
@@ -729,6 +813,12 @@ class Dispatcher:
         in_flight = len(self.running) + len(self.adopted)
         queued = [row for row in self.store.queued() if not row.get("cancel_requested")]
         sched = self.config.scheduling
+        now = time.monotonic()
+        # A job that is no longer queued cannot be holding the queue.
+        live = {int(row["id"]) for row in queued}
+        for stale in [k for k in self._hold_since if k not in live]:
+            self._hold_since.pop(stale, None)
+            self._hold_logged_at.pop(stale, None)
 
         #: Set once a job has been passed over, so the job that caused it can be
         #: told apart from the ones merely behind it.
@@ -776,13 +866,32 @@ class Dispatcher:
                 # job cannot be deferred forever by a stream of small ones.
                 if not sched.backfill:
                     return
-                waited = self._blocked_wait_seconds(int(head_blocked["id"]))
+                head_id = int(head_blocked["id"])
+                waited = self._blocked_wait_seconds(head_id)
                 if waited >= sched.backfill_head_wait_seconds:
-                    self.log(
-                        f"job {head_blocked['id']}: waited {waited:.0f}s; "
-                        "holding the queue for it instead of backfilling"
-                    )
-                    return
+                    # Holding drains the machine so the head job gets a clear
+                    # run at it. That only works if queue pressure is what is
+                    # keeping it out. When the blocker is a long-running job
+                    # instead, holding forever stalls the whole queue and the
+                    # head gains nothing: it cannot start until that job ends
+                    # either way. So the hold is bounded, and once it expires
+                    # work that fits is allowed through again.
+                    started = self._hold_since.setdefault(head_id, now)
+                    if now - started < sched.backfill_max_hold_seconds:
+                        if now >= self._hold_logged_at.get(head_id, 0.0):
+                            self.log(
+                                f"job {head_id}: waited {waited:.0f}s; "
+                                "holding the queue for it instead of backfilling"
+                            )
+                            self._hold_logged_at[head_id] = now + _BLOCKED_REPEAT_SECONDS
+                        return
+                    if now >= self._hold_logged_at.get(head_id, 0.0):
+                        self.log(
+                            f"job {head_id}: held the queue for "
+                            f"{(now - started) / 60:.0f}m without starting; its "
+                            "blocker is not queue pressure, so backfilling resumes"
+                        )
+                        self._hold_logged_at[head_id] = now + _BLOCKED_REPEAT_SECONDS
                 skipped += 1
                 if skipped > sched.backfill_max_skip:
                     return
@@ -930,9 +1039,11 @@ class Dispatcher:
 
         interval = self.config.backend.poll_interval_seconds
         trim_counter = 0
+        self._start_watchdog()
         try:
             while not self._stop:
                 try:
+                    self._last_tick = time.monotonic()
                     self._heartbeat()
                     self._sample_resources()
                     self._reap()
@@ -986,6 +1097,39 @@ class Dispatcher:
                     continue
             self.log(f"job {backend_id}: process gone, marking finished")
             self.store.finish(backend_id, exit_code=None)
+
+
+    def _start_watchdog(self) -> None:
+        """End the process if the main loop stops making progress.
+
+        The lock that keeps one dispatcher per profile is an OS file lock, so it
+        is held for as long as this *process* lives, not for as long as the loop
+        works. A wedged daemon therefore blocks its own replacement: `restart`
+        and `init` both decline, and the queue stops scheduling until somebody
+        kills the pid by hand. That is what happened when host commit ran out
+        and a reader thread died mid-tick.
+
+        Exiting hard is the right response. Jobs are adopted by the next
+        dispatcher rather than killed, so the cost of being wrong is a restart,
+        while the cost of hanging on is a queue that never recovers on its own.
+        """
+
+        def watch() -> None:
+            while not self._stop:
+                time.sleep(_WATCHDOG_GRACE_SECONDS / 6.0)
+                stalled = time.monotonic() - self._last_tick
+                if stalled < _WATCHDOG_GRACE_SECONDS:
+                    continue
+                try:
+                    self.log(
+                        f"watchdog: no tick for {stalled:.0f}s; exiting so a new "
+                        "dispatcher can take the lock (running jobs are adopted)"
+                    )
+                except Exception:
+                    pass  # under memory pressure logging is what fails first
+                os._exit(1)
+
+        threading.Thread(target=watch, name="workerq-watchdog", daemon=True).start()
 
 
 def run_daemon(config: Config) -> int:

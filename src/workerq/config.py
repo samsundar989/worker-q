@@ -169,6 +169,12 @@ class SchedulingConfig:
     #: the queue drains until it can run. This is the starvation guard: it caps
     #: how long backfill may delay a job that cannot be packed.
     backfill_head_wait_seconds: int = 900
+    #: How long the queue may stay held for one job before backfilling resumes.
+    #: Draining the machine only helps when queue pressure is what keeps the head
+    #: out. When it is instead waiting on a job with hours left to run, an
+    #: unbounded hold idles the whole machine and buys the head nothing, so the
+    #: guard gives up after this long and lets work that fits through again.
+    backfill_max_hold_seconds: int = 1800
 
     #: Run job processes below normal priority so the desktop stays responsive
     #: when several of them share the CPUs. Scheduling priority only - it does
@@ -352,6 +358,8 @@ class Config:
             raise ConfigError("scheduling.backfill_max_skip must be >= 0")
         if sch.backfill_head_wait_seconds < 0:
             raise ConfigError("scheduling.backfill_head_wait_seconds must be >= 0")
+        if sch.backfill_max_hold_seconds < 0:
+            raise ConfigError("scheduling.backfill_max_hold_seconds must be >= 0")
         for name in ("pressure_free_percent", "pressure_recover_percent"):
             if not 0 <= getattr(sch, name) <= 100:
                 raise ConfigError(f"scheduling.{name} must be between 0 and 100")

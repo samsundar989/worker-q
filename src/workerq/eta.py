@@ -409,6 +409,8 @@ PEAK_HEADROOM = 1.5
 #: Never suggest less than this: tiny declarations are noise, and the configured
 #: default already covers work that declares nothing.
 MIN_SUGGESTION_GB = 2.0
+#: GPU work genuinely runs under a gigabyte, so the RAM floor does not apply.
+MIN_VRAM_SUGGESTION_GB = 1.0
 
 
 def learned_peak_ram(service: GPUQService, job: Job) -> tuple[float | None, int, str]:
@@ -433,32 +435,69 @@ def learned_peak_ram(service: GPUQService, job: Job) -> tuple[float | None, int,
     # minutes never reached steady state, and one cancelled after three hours
     # may have been doing something else entirely - both distort a peak. Taking
     # the worst *completed* run is the number that actually has to fit.
+    return _learned_peak(service, job, signature, cutoff, "peak_ram_mib", "peak_source")
+
+
+def learned_peak_vram(service: GPUQService, job: Job) -> tuple[float | None, int, str]:
+    """(worst observed VRAM peak MiB, runs, provenance) for this command's shape.
+
+    Separate from the RAM version because the two are not obtained the same way
+    on every platform. Where per-process VRAM is unreadable the figure is a
+    whole-card delta taken while the job owned the card alone, and the caller is
+    told so through the provenance string rather than being left to assume the
+    GPU was watched directly.
+    """
+    signature = job.command_signature or command_signature(
+        job.command, bool(job.shell_mode)
+    )
+    if not signature:
+        return None, 0, ""
+    cutoff = (utcnow() - timedelta(days=LEARNED_WINDOW_DAYS)).isoformat(
+        timespec="microseconds"
+    )
+    return _learned_peak(service, job, signature, cutoff, "peak_vram_mib", "vram_source")
+
+
+def _learned_peak(
+    service: GPUQService,
+    job: Job,
+    signature: str,
+    cutoff: str,
+    column: str,
+    source_column: str,
+) -> tuple[float | None, int, str]:
+    """Worst peak in `column` across recent runs of the same command shape."""
     try:
         rows = service.db.conn.execute(
-            "SELECT peak_ram_mib, peak_source FROM jobs "
+            f"SELECT {column} AS peak, {source_column} AS source FROM jobs "
             "WHERE project = ? AND command_signature = ? AND id != ? "
-            "AND peak_ram_mib IS NOT NULL AND finished_at >= ? AND state = ? "
+            f"AND {column} IS NOT NULL AND finished_at >= ? AND state = ? "
             "ORDER BY id DESC LIMIT 20",
             (job.project, signature, job.id, cutoff, JobState.SUCCEEDED.value),
         ).fetchall()
         if not rows:
             rows = service.db.conn.execute(
-                "SELECT peak_ram_mib, peak_source FROM jobs "
+                f"SELECT {column} AS peak, {source_column} AS source FROM jobs "
                 "WHERE project = ? AND command_signature = ? AND id != ? "
-                "AND peak_ram_mib IS NOT NULL AND finished_at >= ? "
+                f"AND {column} IS NOT NULL AND finished_at >= ? "
                 "ORDER BY id DESC LIMIT 20",
                 (job.project, signature, job.id, cutoff),
             ).fetchall()
     except Exception:
         return None, 0, ""
 
-    peaks = [float(r["peak_ram_mib"]) for r in rows if r["peak_ram_mib"] is not None]
+    peaks = [float(r["peak"]) for r in rows if r["peak"] is not None]
     if not peaks:
         return None, 0, ""
-    # Measured beats estimated: say which, so nobody treats a telemetry
-    # inference as if the job had been watched directly.
-    sources = {r["peak_source"] or "estimated" for r in rows}
-    provenance = "measured" if sources == {"measured"} else "estimated"
+    # Say where the number came from, so nobody treats a telemetry inference or
+    # a whole-card delta as if the job itself had been watched directly.
+    sources = {r["source"] or "estimated" for r in rows}
+    if sources == {"measured"}:
+        provenance = "measured"
+    elif sources == {"device_delta"}:
+        provenance = "device_delta"
+    else:
+        provenance = "estimated"
     return max(peaks), len(peaks), provenance
 
 
@@ -468,3 +507,17 @@ def suggested_ram_gb(peak_mib: float) -> float:
 
     gb = (peak_mib / 1024.0) * PEAK_HEADROOM
     return max(MIN_SUGGESTION_GB, float(math.ceil(gb)))
+
+
+def suggested_vram_gb(peak_mib: float) -> float:
+    """Same shape as the RAM suggestion, with a smaller floor.
+
+    A 2 GiB floor makes sense for RAM, where a Python interpreter and its
+    imports cost that much before the job does anything. Small GPU jobs really
+    do sit under a gigabyte, and rounding them up to 2 would re-introduce the
+    over-declaration this is meant to remove.
+    """
+    import math
+
+    gb = (peak_mib / 1024.0) * PEAK_HEADROOM
+    return max(MIN_VRAM_SUGGESTION_GB, float(math.ceil(gb)))

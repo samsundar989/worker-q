@@ -119,8 +119,14 @@ def memory() -> HostMemory:
 class ProcessMemory:
     pid: int
     name: str
+    #: What this process costs against the resource that actually runs out.
+    #: On Windows that is commit, not working set: a CUDA job under WDDM holds
+    #: far more commit than resident memory, and it is commit that fails first.
     memory_mib: float
     command: str = ""
+    #: Resident memory, kept separately because it is what the eye expects in
+    #: Task Manager and the two diverge by 5x or more on GPU jobs.
+    working_set_mib: float | None = None
 
     @property
     def memory_gib(self) -> float:
@@ -167,6 +173,150 @@ def tree_memory_mib(roots: set[int], *, ttl: float = _TOP_TTL) -> float | None:
     return sum(p.memory_mib for p in processes if p.pid in pids)
 
 
+def _windows_processes() -> list[ProcessMemory]:  # pragma: no cover - Windows only
+    """Every process with its *commit* charge, read straight from the kernel.
+
+    `tasklist` can only report working set, which is the wrong number on this
+    platform: a CUDA job under WDDM has its video allocations backed by system
+    commit, so it holds several times more commit than resident memory. Sizing
+    admission on working set therefore reports a training job as tiny while it
+    is in fact the largest thing on the machine.
+
+    Reading it through Toolhelp and `GetProcessMemoryInfo` also removes a
+    subprocess from a path that runs every few seconds. That matters under the
+    exact pressure this measures: once commit is exhausted, spawning anything
+    fails, and a sampler that shells out is the first thing to break.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        TH32CS_SNAPPROCESS = 0x00000002
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        MAX_PATH = 260
+
+        class PROCESSENTRY32(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", ctypes.c_char * MAX_PATH),
+            ]
+
+        class PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+                ("PrivateUsage", ctypes.c_size_t),
+            ]
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+
+        processes: list[ProcessMemory] = []
+        snapshot = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if not snapshot or snapshot == wintypes.HANDLE(-1).value:
+            return []
+        try:
+            entry = PROCESSENTRY32()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+            if not k32.Process32First(snapshot, ctypes.byref(entry)):
+                return []
+            while True:
+                pid = int(entry.th32ProcessID)
+                name = entry.szExeFile.decode("utf-8", "replace")
+                # Protected and system processes refuse to open. They are small
+                # and stable, so skipping them loses nothing that would change
+                # a scheduling decision.
+                handle = k32.OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+                )
+                if handle:
+                    try:
+                        counters = PROCESS_MEMORY_COUNTERS_EX()
+                        counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS_EX)
+                        if k32.K32GetProcessMemoryInfo(
+                            handle, ctypes.byref(counters), counters.cb
+                        ):
+                            processes.append(
+                                ProcessMemory(
+                                    pid=pid,
+                                    name=name,
+                                    memory_mib=float(counters.PrivateUsage) / _MIB,
+                                    working_set_mib=(
+                                        float(counters.WorkingSetSize) / _MIB
+                                    ),
+                                )
+                            )
+                    finally:
+                        k32.CloseHandle(handle)
+                if not k32.Process32Next(snapshot, ctypes.byref(entry)):
+                    break
+        finally:
+            k32.CloseHandle(snapshot)
+        return processes
+    except Exception:
+        return []
+
+
+def _tasklist_processes() -> list[ProcessMemory]:  # pragma: no cover - Windows only
+    """Working-set fallback for when the kernel query is unavailable.
+
+    Undercounts GPU jobs badly, so it is a last resort rather than the norm.
+    """
+    processes: list[ProcessMemory] = []
+    try:
+        proc = subprocess.run(
+            ["tasklist", "/fo", "csv", "/nh"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            encoding="utf-8",
+            errors="replace",
+            **no_window_kwargs(),
+        )
+        if proc.returncode != 0:
+            return []
+        import csv
+        import io
+
+        for row in csv.reader(io.StringIO(proc.stdout or "")):
+            if len(row) < 5:
+                continue
+            name, pid_text, mem_text = row[0], row[1], row[4]
+            digits = "".join(c for c in mem_text if c.isdigit())
+            if not digits or not pid_text.isdigit():
+                continue
+            working_set = float(digits) / 1024.0  # tasklist reports KiB
+            processes.append(
+                ProcessMemory(
+                    pid=int(pid_text),
+                    name=name,
+                    memory_mib=working_set,
+                    working_set_mib=working_set,
+                )
+            )
+    except Exception:
+        return []
+    return processes
+
+
 def all_processes(*, ttl: float = _TOP_TTL) -> list[ProcessMemory]:
     """Every process with its host memory, largest first. Cached briefly."""
     now = time.monotonic()
@@ -175,35 +325,10 @@ def all_processes(*, ttl: float = _TOP_TTL) -> list[ProcessMemory]:
 
     processes: list[ProcessMemory] = []
     if IS_WINDOWS:
-        try:
-            proc = subprocess.run(
-                ["tasklist", "/fo", "csv", "/nh"],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                encoding="utf-8",
-                errors="replace",
-                **no_window_kwargs(),
-            )
-            if proc.returncode == 0:
-                import csv
-                import io
-
-                for row in csv.reader(io.StringIO(proc.stdout or "")):
-                    if len(row) < 5:
-                        continue
-                    name, pid_text, mem_text = row[0], row[1], row[4]
-                    digits = "".join(c for c in mem_text if c.isdigit())
-                    if not digits or not pid_text.isdigit():
-                        continue
-                    processes.append(
-                        ProcessMemory(
-                            pid=int(pid_text),
-                            name=name,
-                            memory_mib=float(digits) / 1024.0,  # tasklist reports KiB
-                        )
-                    )
-        except Exception:
+        processes = _windows_processes()
+        if not processes:
+            processes = _tasklist_processes()
+        if not processes:
             return _TOP_CACHE.value
     else:  # pragma: no cover - POSIX
         try:

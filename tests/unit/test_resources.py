@@ -410,13 +410,19 @@ def test_high_commit_is_fine_while_there_is_room_left_to_commit(tmp_path):
     assert decision.admit, decision.reason
 
 
-def test_a_job_may_not_exceed_the_remaining_commit(tmp_path):
+def test_a_job_may_not_exceed_the_remaining_commit(tmp_path, monkeypatch):
     """The failure this actually catches, and percentages could not express.
 
     A job died on the live machine at 100% commit with 40% of RAM free. Under
     WDDM the GPU driver backs video memory with system commit, so VRAM counts
     against the commit limit even though physical RAM looks untouched.
     """
+    from workerq import host as host_mod
+
+    # These machines are synthetic: 61.6 GiB RAM with a 32 GiB pagefile, so the
+    # ceiling is 93.6. Without pinning it, `commit_ceiling_mib` reads the real
+    # host's pagefile setting and the test measures this developer's machine.
+    monkeypatch.setattr(host_mod, "_COMMIT_CEILING", [32768.0])
     config = _default_commit_config(tmp_path)
     decision = admit(
         config,
@@ -431,8 +437,14 @@ def test_a_job_may_not_exceed_the_remaining_commit(tmp_path):
     assert "VRAM counts here" in (decision.reason or "")
 
 
-def test_vram_counts_toward_commit_even_with_no_ram_declared(tmp_path):
+def test_vram_counts_toward_commit_even_with_no_ram_declared(tmp_path, monkeypatch):
     """The GPU-only job is exactly the one the old percentage rule missed."""
+    from workerq import host as host_mod
+
+    # These machines are synthetic: 61.6 GiB RAM with a 32 GiB pagefile, so the
+    # ceiling is 93.6. Without pinning it, `commit_ceiling_mib` reads the real
+    # host's pagefile setting and the test measures this developer's machine.
+    monkeypatch.setattr(host_mod, "_COMMIT_CEILING", [32768.0])
     config = _default_commit_config(tmp_path)
     decision = admit(
         config,
@@ -558,13 +570,19 @@ def test_commit_is_reported_as_headroom_not_only_a_percentage(tmp_path, monkeypa
     assert commit["available_mib"] == pytest.approx(expected)
 
 
-def test_ram_and_vram_pools_can_both_fit_while_commit_cannot(tmp_path):
+def test_ram_and_vram_pools_can_both_fit_while_commit_cannot(tmp_path, monkeypatch):
     """Why the commit check cannot be dropped in favour of RAM/VRAM/CPU alone.
 
     They are separate physical pools drawing on one shared commit budget, so
     gating each independently cannot see the sum. Here both pools have room and
     commit does not.
     """
+    from workerq import host as host_mod
+
+    # These machines are synthetic: 61.6 GiB RAM with a 32 GiB pagefile, so the
+    # ceiling is 93.6. Without pinning it, `commit_ceiling_mib` reads the real
+    # host's pagefile setting and the test measures this developer's machine.
+    monkeypatch.setattr(host_mod, "_COMMIT_CEILING", [32768.0])
     config = _default_commit_config(tmp_path)
     running_ram, running_vram = 16 * GIB, 20 * GIB
     candidate = ResourceRequest(ram_mib=24 * GIB, vram_mib=0.0, cpus=4)

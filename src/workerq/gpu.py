@@ -252,6 +252,27 @@ def foreign_processes(info: GpuInfo, *, own_pids: set[int] | None = None) -> lis
     return out
 
 
+def device_delta_mib(
+    info: GpuInfo, device_index: int | None, baseline_mib: float
+) -> float | None:
+    """How far card `device_index` has risen above `baseline_mib`.
+
+    The fallback for platforms where per-process VRAM cannot be read. It is only
+    meaningful while a single job owns the device, which the dispatcher decides
+    before it hands the baseline over; this function cannot verify that and does
+    not try. Returns None when the device cannot be read, and clamps at zero
+    rather than reporting a negative when the desktop releases memory mid-run.
+    """
+    if device_index is None or not info.available:
+        return None
+    for device in info.devices:
+        if device.index == device_index:
+            if device.memory_used_mib is None:
+                return None
+            return max(0.0, device.memory_used_mib - baseline_mib)
+    return None
+
+
 def tree_vram_mib(info: GpuInfo, pids: set[int]) -> float | None:
     """VRAM held across all devices by any of `pids`.
 

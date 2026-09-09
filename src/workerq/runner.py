@@ -363,6 +363,19 @@ def run_job(
         peak_ram: float | None = None
         peak_vram: float | None = None
         samples = 0
+        # Set by the dispatcher only when this job owns its card alone. Without
+        # a per-process figure, the rise above this baseline is the one honest
+        # attribution available under WDDM.
+        baseline_mib: float | None = None
+        baseline_device: int | None = None
+        vram_from_delta = False
+        try:
+            raw = os.environ.get("WORKERQ_VRAM_BASELINE_MIB")
+            if raw is not None:
+                baseline_mib = float(raw)
+                baseline_device = int(os.environ["WORKERQ_VRAM_DEVICE"])
+        except (TypeError, ValueError, KeyError):
+            baseline_mib = baseline_device = None
         try:
             while not stop_watch.wait(_USAGE_POLL_SECONDS):
                 try:
@@ -370,7 +383,13 @@ def run_job(
                     ram = host.tree_memory_mib(roots)
                     vram = None
                     if on_gpu:
-                        vram = gpu_mod.tree_vram_mib(gpu_mod.query_gpus(), pids)
+                        info = gpu_mod.query_gpus()
+                        vram = gpu_mod.tree_vram_mib(info, pids)
+                        if vram is None and baseline_mib is not None:
+                            vram = gpu_mod.device_delta_mib(
+                                info, baseline_device, baseline_mib
+                            )
+                            vram_from_delta = vram is not None
                     if ram is None and vram is None:
                         continue
                     if ram is not None:
@@ -384,6 +403,11 @@ def run_job(
                         peak_vram_mib=peak_vram,
                         usage_samples=samples,
                         peak_source="measured",
+                        vram_source=(
+                            None
+                            if peak_vram is None
+                            else ("device_delta" if vram_from_delta else "measured")
+                        ),
                     )
                 except Exception:
                     pass  # never let measurement take the job down
