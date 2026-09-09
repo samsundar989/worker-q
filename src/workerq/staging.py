@@ -254,16 +254,28 @@ def inspect_repo(
     status = RepoStatus(node=node.name, project=repo_root.name, remote_path=remote)
     entries = list(passthrough or [])
 
+    # Two cmd.exe traps, both of which made every path report "missing" while
+    # the files were plainly there.
+    #
+    # `cd /d <path> 2>nul || (...)` reports failure even when the directory
+    # exists: the redirection breaks the cd. `git -C` needs no working
+    # directory, so the cd is gone entirely.
+    #
+    # And `if exist X (A) else (B) & rest` absorbs `& rest` into the *else*
+    # branch, so when the test passed everything after it was silently
+    # skipped. Wrapping each `if` in its own parentheses is what keeps the
+    # chain intact.
     parts = [
-        f"cd /d {_q(remote)} 2>nul || (echo __NOREPO__ & exit /b 0)",
-        "echo __HEAD__ & git rev-parse HEAD",
-        "echo __BRANCH__ & git rev-parse --abbrev-ref HEAD",
-        "echo __ORIGIN__ & git remote get-url origin",
+        f"(if exist {_q(remote + chr(92) + '.git')} (echo __REPO__) else (echo __NOREPO__))",
+        f"echo __HEAD__ & git -C {_q(remote)} rev-parse HEAD",
+        f"echo __BRANCH__ & git -C {_q(remote)} rev-parse --abbrev-ref HEAD",
+        f"echo __ORIGIN__ & git -C {_q(remote)} remote get-url origin",
     ]
     for entry in entries:
         win = entry.replace("/", "\\")
         parts.append(
-            f'echo __PT__{entry} & if exist {_q(win)} (echo YES) else (echo NO)'
+            f"echo __PT__{entry} & "
+            f"(if exist {_q(remote + chr(92) + win)} (echo YES) else (echo NO))"
         )
     result = nodes.run_remote(node, " & ".join(parts))
     if not result.ok:

@@ -32,9 +32,15 @@ from typing import Any
 #: Looks like a Windows absolute path (`C:\...` or `C:/...`) or a POSIX one.
 _ABSOLUTE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\|/)")
 
-#: Options whose *value* is a path even when it does not look like one to a
-#: regex. Only used to make the explanation better, never to widen the check.
-_OUTPUT_FLAGS = ("--out", "--output", "--out-dir", "--outdir", "--save", "--save-to")
+#: Options whose value is where results go. A path after one of these is a
+#: write target whether or not it exists yet, which is what makes it dangerous
+#: across two machines.
+_OUTPUT_FLAGS = (
+    "--out", "--output", "--out-dir", "--outdir", "--out-path", "--outfile",
+    "--save", "--save-to", "--save-dir", "--dest", "--destination",
+    "--log-dir", "--logdir", "--checkpoint-dir", "--ckpt-dir", "--report",
+    "-o",
+)
 
 
 @dataclass
@@ -59,25 +65,52 @@ def _within(path: Path, root: Path) -> bool:
 
 
 def absolute_repo_paths(argv: list[str], repo_root: Path) -> list[str]:
-    """Absolute paths in `argv` that point inside `repo_root`.
+    """Absolute paths under `repo_root` that the job appears to **write**.
 
-    Absolute paths *outside* the repository are left alone: a dataset at
-    `D:\\data` is a read, and if it is missing on the node the job fails loudly,
-    which is the safe direction. It is the ones inside the repo that resolve on
-    both machines and quietly diverge.
+    Reads are not the hazard, and treating them as one rejects every real job.
+    An absolute path to the interpreter, a dataset or a checkpoint resolves to
+    the node's own copy, which is exactly what should happen - each machine has
+    its own venv and its own data. Only a *write* to such a path diverges: the
+    job succeeds and leaves its output where nobody is looking.
+
+    Three things are therefore not flagged:
+
+    * **argv[0]**, which is the program being run, never an output.
+    * Paths **outside** the repository. A dataset at `D:\\data` missing on the
+      node fails loudly, which is the safe direction.
+    * Paths that **already exist** and are not introduced by an output option -
+      an input the job reads.
+
+    That last rule is a heuristic and is deliberately biased toward reads: an
+    output option is what actually marks a write, and existence only decides
+    the ambiguous remainder. A bare, non-existent absolute path is treated as a
+    write because that is what one usually is.
     """
     found: list[str] = []
-    for token in argv:
-        text = str(token)
-        # `--out=C:\path` as well as `--out C:\path`
-        candidate = text.split("=", 1)[1] if "=" in text and _ABSOLUTE.match(text.split("=", 1)[1]) else text
+    tokens = [str(a) for a in argv]
+    for index, text in enumerate(tokens):
+        # The program itself is never an output.
+        if index == 0:
+            continue
+
+        after_output_flag = index > 0 and tokens[index - 1].lower() in _OUTPUT_FLAGS
+        candidate = text
+        if "=" in text:
+            flag, _, value = text.partition("=")
+            if flag.lower() in _OUTPUT_FLAGS and _ABSOLUTE.match(value):
+                candidate, after_output_flag = value, True
+
         if not _ABSOLUTE.match(candidate):
             continue
         try:
             path = Path(os.path.expandvars(candidate)).expanduser()
         except (OSError, ValueError):
             continue
-        if _within(path, repo_root) and candidate not in found:
+        if not _within(path, repo_root):
+            continue
+        if not after_output_flag and path.exists():
+            continue  # an input the job reads
+        if candidate not in found:
             found.append(candidate)
     return found
 
@@ -110,7 +143,7 @@ def assess(
         more = f" (and {len(repo_paths) - 3} more)" if len(repo_paths) > 3 else ""
         reasons.append(
             f"the command writes to an absolute path inside the repository: {shown}{more}. "
-            "That path exists on the other machine too, so the job would succeed "
+            "That path resolves on the other machine too, so the job would succeed "
             "there and leave its output on a machine you are not looking at. Use a "
             "path relative to the repository and declare it in [snapshot] outputs, "
             "or pin the job with --node local"
