@@ -191,3 +191,43 @@ def test_an_unparseable_reply_is_an_error(monkeypatch):
     _stub_transport(monkeypatch, {"show 77": (True, "not json at all")})
     with pytest.raises(remote.RemoteJobError):
         remote.job(node(), 77)
+
+
+# --------------------------------------------------------------------------
+# Not running the same job twice
+# --------------------------------------------------------------------------
+
+
+class FakeState:
+    def __init__(self, terminal: bool):
+        self.is_terminal = terminal
+
+
+class FakeJob:
+    def __init__(self, job_id, label, terminal=False):
+        self.id = job_id
+        self.label = label
+        self.state_enum = FakeState(terminal)
+
+
+def test_a_resent_spec_adopts_the_live_job_instead_of_duplicating_it():
+    """The window: the node accepts a job, the sender dies before recording it.
+
+    The job is still QUEUED on the sender, so it will be sent again. Without
+    this the work runs twice.
+    """
+    label = remote.origin_label(42, "PRIMARY")
+    jobs = [FakeJob(1, "other"), FakeJob(2, label), FakeJob(3, None)]
+    found = remote.existing_submission(jobs, label)
+    assert found is not None and found.id == 2
+
+
+def test_a_finished_job_is_not_treated_as_a_duplicate():
+    """Re-submitting something that already ran is a re-run, not a duplicate."""
+    label = remote.origin_label(42, "PRIMARY")
+    jobs = [FakeJob(2, label, terminal=True)]
+    assert remote.existing_submission(jobs, label) is None
+
+
+def test_no_earlier_submission_is_none():
+    assert remote.existing_submission([FakeJob(1, "other")], "wanted") is None

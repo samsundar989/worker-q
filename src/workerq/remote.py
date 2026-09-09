@@ -253,3 +253,26 @@ def list_jobs(node: NodeConfig, limit: int = 500) -> dict[int, dict[str, Any]]:
         except (KeyError, TypeError, ValueError):
             continue
     return out
+
+
+def existing_submission(jobs: list[Any], label: str) -> Any | None:
+    """An earlier, still-live submission of this same job, if there is one.
+
+    The receiving side calls this before creating a job, so that re-sending a
+    spec adopts what is already there instead of running the work twice. The
+    window it guards is small but real: the node accepts a submission and the
+    sending machine dies, or the link drops, before the remote id is recorded -
+    leaving the job still QUEUED on the sender, which will send it again.
+
+    Terminal jobs are deliberately *not* matched. A job that already ran to
+    completion and is being submitted again is a re-run somebody asked for, not
+    a duplicate to suppress.
+    """
+    for job in jobs:
+        if getattr(job, "label", None) != label:
+            continue
+        state = getattr(job, "state_enum", None)
+        if state is not None and getattr(state, "is_terminal", False):
+            continue
+        return job
+    return None

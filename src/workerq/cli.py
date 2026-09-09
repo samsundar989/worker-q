@@ -2746,6 +2746,38 @@ def internal_submit_spec(
         fail(f"the spec's working directory does not exist here: {spec.cwd}")
 
     service = get_service()
+
+    # Idempotent by label. The window is small but real: this node accepts a
+    # submission and the sending machine dies - or the link drops - before it
+    # records the id. The job is still QUEUED there, so it would be sent again
+    # and the work would run twice.
+    #
+    # The check belongs here rather than on the sender: this is one local
+    # database query, where asking from the other side would be a whole SSH
+    # round trip (~540 ms) added to every placement to guard against something
+    # that almost never happens.
+    try:
+        from workerq.remote import existing_submission
+
+        earlier = existing_submission(
+            service.list_jobs(all_jobs=True, limit=500, refresh=False), spec.label
+        )
+        if earlier is not None:
+            emit_json({
+                "job_id": earlier.id,
+                "state": earlier.state,
+                "project": earlier.project,
+                "log_path": earlier.log_path,
+                "origin_job_id": spec.origin_job_id,
+                "origin_host": spec.origin_host,
+                "adopted": True,
+            })
+            service.close()
+            return
+    except Exception:
+        # Never let the duplicate check stop a legitimate submission.
+        pass
+
     try:
         result = service.submit(
             SubmitRequest(
