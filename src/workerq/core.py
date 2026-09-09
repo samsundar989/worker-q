@@ -386,7 +386,9 @@ class GPUQService:
                 snapshot=snapshot,
                 backend_job_id=backend_job_id,
                 queue_position=self._queue_position(job_id),
-                advisories=self._history_advisories(job) + advisories,
+                advisories=(
+                    self._history_advisories(job) + self._vram_advisories(job) + advisories
+                ),
             )
 
         except BaseException as exc:
@@ -725,6 +727,51 @@ class GPUQService:
                 f"{runs} run(s) ({tag}), but declares {declared_gb:.1f} GiB. That headroom "
                 f"is held against every other job - --ram {suggested:.0f} would still be "
                 "generous and would start sooner."
+            ]
+        return []
+
+    def _vram_advisories(self, job: Job) -> list[str]:
+        """The same feedback for VRAM, which nothing used to check.
+
+        RAM declarations self-correct because their peaks are measured and fed
+        back. VRAM had no such loop on a machine where per-process usage cannot
+        be read, so a number guessed once was reused indefinitely - in both
+        directions. Over-declaring parks most of the card against jobs that
+        never touch it; under-declaring is what a CUDA out-of-memory failure
+        looks like from the outside.
+        """
+        from workerq.eta import learned_peak_vram, suggested_vram_gb
+
+        declared_mib = job.requested_vram_mib
+        if not declared_mib:
+            return []
+        try:
+            peak_mib, runs, provenance = learned_peak_vram(self, job)
+        except Exception:
+            return []
+        if peak_mib is None or runs < 2:
+            return []
+
+        suggested = suggested_vram_gb(peak_mib)
+        declared_gb = declared_mib / 1024.0
+        peak_gb = peak_mib / 1024.0
+        tag = {
+            "measured": "measured",
+            "device_delta": "measured as the rise in whole-card use while it ran alone",
+        }.get(provenance, "estimated from telemetry")
+
+        if declared_gb < peak_gb:
+            return [
+                f"this command peaked at {peak_gb:.1f} GiB of VRAM across {runs} run(s) "
+                f"({tag}) but declares {declared_gb:.1f} GiB. Under-declaring VRAM is what "
+                f"a CUDA out-of-memory failure looks like - consider --vram {suggested:.0f}."
+            ]
+        if declared_gb >= suggested * 1.5:
+            return [
+                f"this command has never used more than {peak_gb:.1f} GiB of VRAM across "
+                f"{runs} run(s) ({tag}), but declares {declared_gb:.1f} GiB. On a single-GPU "
+                f"machine that reserves the card against everything else - --vram "
+                f"{suggested:.0f} would still be generous and would start sooner."
             ]
         return []
 
@@ -1172,15 +1219,31 @@ class GPUQService:
         """What this job's own history says it should have declared."""
         from workerq.eta import learned_peak_ram, suggested_ram_gb
 
+        from workerq.eta import learned_peak_vram, suggested_vram_gb
+
         job = self.get_job(job_id)
         peak_mib, runs, provenance = learned_peak_ram(self, job)
         declared_gb = (job.requested_ram_mib or 0) / 1024.0
+
+        vram_peak, vram_runs, vram_provenance = learned_peak_vram(self, job)
+        vram: dict[str, Any] = {
+            "declared_vram_gb": (job.requested_vram_mib or 0) / 1024.0,
+            "vram_runs": vram_runs,
+            "suggested_vram_gb": (
+                None if vram_peak is None else suggested_vram_gb(vram_peak)
+            ),
+        }
+        if vram_peak is not None:
+            vram["peak_vram_gb"] = vram_peak / 1024.0
+            vram["vram_provenance"] = vram_provenance
+
         if peak_mib is None:
             return {
                 "job_id": job_id,
                 "declared_ram_gb": declared_gb,
                 "runs": 0,
                 "suggested_ram_gb": None,
+                **vram,
             }
         return {
             "job_id": job_id,
@@ -1189,6 +1252,7 @@ class GPUQService:
             "runs": runs,
             "provenance": provenance,
             "suggested_ram_gb": suggested_ram_gb(peak_mib),
+            **vram,
         }
 
     def get_reserve(self) -> dict[str, Any]:

@@ -179,6 +179,7 @@ class Job:
     #: Observed peaks, sampled while the job ran. None means never measured,
     #: which must not be read as "used nothing".
     peak_ram_mib: float | None = None
+    vram_source: str | None = None
     peak_vram_mib: float | None = None
     usage_samples: int = 0
     #: 'measured' (this job's own processes) or 'estimated' (machine telemetry).
@@ -271,6 +272,7 @@ class Job:
             "progress_note": self.progress_note,
             "progress_updated_at": self.progress_updated_at,
             "peak_ram_mib": self.peak_ram_mib,
+            "vram_source": self.vram_source,
             "peak_vram_mib": self.peak_vram_mib,
             "usage_samples": self.usage_samples,
             "peak_source": self.peak_source,

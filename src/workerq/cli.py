@@ -1376,6 +1376,46 @@ def restart(
     service.close()
 
 
+def _print_vram_suggestion(console: Any, job_id: int, data: dict[str, Any]) -> None:
+    """The VRAM half of `requests --suggest`, when there is history for it."""
+    suggested = data.get("suggested_vram_gb")
+    if suggested is None:
+        return
+    declared = data.get("declared_vram_gb") or 0.0
+    peak = data.get("peak_vram_gb")
+    if peak is None:
+        return
+    tag = {
+        "measured": "measured from the job's own processes",
+        "device_delta": "the rise in whole-card use while it ran alone",
+    }.get(data.get("vram_provenance", ""), "estimated from machine-wide telemetry")
+    console.print(
+        f"\nVRAM, worst of {data['vram_runs']} past run(s): "
+        f"[bold]{peak:.1f} GiB[/bold]  [dim]({tag})[/dim]"
+    )
+    console.print(
+        f"Suggested declaration: [bold green]{suggested:.0f} GiB[/bold green]"
+        "  [dim](peak + 50% headroom)[/dim]"
+    )
+    if declared > suggested:
+        console.print(
+            f"[yellow]Declaring {declared:.0f} GiB holds {declared - suggested:.0f} GiB "
+            "of the card more than this command has ever used.[/yellow]"
+        )
+        console.print(
+            f"[dim]Apply it: workerq requests {job_id} --vram {suggested:.0f}[/dim]"
+        )
+    elif declared and declared < peak:
+        console.print(
+            f"[red]Declaring {declared:.0f} GiB is below the {peak:.1f} GiB this "
+            "command has actually used, which is how a job hits CUDA out-of-memory."
+            "[/red]"
+        )
+        console.print(
+            f"[dim]Apply it: workerq requests {job_id} --vram {suggested:.0f}[/dim]"
+        )
+
+
 @app.command()
 def requests(
     job_id: int = typer.Argument(..., help="Queued job to correct."),
@@ -1439,6 +1479,7 @@ def requests(
                     f"[dim]Apply it: workerq requests {job_id} "
                     f"--ram {data['suggested_ram_gb']:.0f}[/dim]"
                 )
+        _print_vram_suggestion(console, job_id, data)
         service.close()
         return
 
@@ -1662,11 +1703,24 @@ def _render_usage_accuracy(service: GPUQService, *, json_output: bool) -> None:
         "[dim]SUGGEST is the worst peak seen plus 50%. Correct a queued job in "
         "place with: workerq requests <id> --ram <n>[/dim]"
     )
+    vram_waste = data.get("mean_overdeclared_vram_mib")
+    if vram_waste and vram_waste > 0:
+        console.print(
+            f"[dim]On average {vram_waste / 1024:.1f} GiB of VRAM per job is reserved "
+            "but never touched. On a single-GPU machine that is what keeps other GPU "
+            "work waiting.[/dim]"
+        )
     if not data["vram_measurable"]:
         console.print(
             "[dim]Per-process VRAM is not reportable on this GPU (consumer cards in "
-            "WDDM mode report N/A), so VRAM peaks stay blank and declared VRAM "
-            "cannot be checked automatically.[/dim]"
+            "WDDM mode report N/A), so VRAM peaks stay blank until a job runs alone "
+            "on a card, which is when worker-q can attribute the rise to it.[/dim]"
+        )
+    elif data.get("vram_from_device_delta"):
+        console.print(
+            "[dim]VRAM peaks are the rise in whole-card use while the job owned the "
+            "card alone - per-process VRAM cannot be read on this GPU. Jobs that "
+            "shared a card have no VRAM peak recorded.[/dim]"
         )
 
 

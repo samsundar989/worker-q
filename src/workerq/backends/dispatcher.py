@@ -307,6 +307,32 @@ class Dispatcher:
         return [index for _, index in candidates[:gpu_count]], None
 
     # -- child environment -------------------------------------------------
+    def _vram_baseline(self, row: dict[str, Any], devices: list[int]) -> float | None:
+        """Card usage before this job starts, when it will own the card alone.
+
+        Per-process VRAM is unreadable under WDDM, so the only honest way to
+        attribute usage is to watch the device total rise while exactly one job
+        is responsible for it. That holds when the job is exclusive-mode, has a
+        single device, and nothing else worker-q started is on it. Any other
+        arrangement would attribute somebody else's allocation to this job, so
+        return None and leave the peak unrecorded rather than record a wrong one.
+        """
+        if len(devices) != 1:
+            return None
+        if str(row.get("gpu_mode") or "exclusive") != "exclusive":
+            return None
+        device = devices[0]
+        occupancy = self._device_occupancy()
+        if occupancy.get(device, {}).get("jobs"):
+            return None
+        info = self._gpu_info()
+        if not getattr(info, "available", False):
+            return None
+        for dev in info.devices:
+            if dev.index == device:
+                return dev.memory_used_mib
+        return None
+
     def _build_env(self, row: dict[str, Any], devices: list[int]) -> dict[str, str]:
         env = dict(os.environ)
 
@@ -331,6 +357,15 @@ class Dispatcher:
 
         if devices:
             env["CUDA_VISIBLE_DEVICES"] = ",".join(str(d) for d in devices)
+            baseline = self._vram_baseline(row, devices)
+            if baseline is not None:
+                # What the card already held before this job existed. The runner
+                # subtracts it to attribute the rise to this job, which is the
+                # only way to get a per-job VRAM figure on a consumer card in
+                # WDDM mode. Set only when the job owns the device alone, so the
+                # rise cannot belong to somebody else.
+                env["WORKERQ_VRAM_BASELINE_MIB"] = f"{baseline:.1f}"
+                env["WORKERQ_VRAM_DEVICE"] = str(devices[0])
         env["GPUQ_BACKEND_JOB_ID"] = str(row["id"])
         env["GPUQ_STATE_DIR"] = str(self.config.state_dir)
         if self.config.profile:
