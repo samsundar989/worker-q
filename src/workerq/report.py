@@ -323,6 +323,10 @@ def declared_vs_observed(service: GPUQService, *, limit: int = 200) -> dict[str,
     """
     from workerq.eta import suggested_ram_gb, suggested_vram_gb
 
+    # Same ceiling the CLI applies to a single job: a SUGGEST column that names
+    # more than the machine has is advice nobody can take.
+    ram_ceiling, vram_ceiling = service._suggestion_ceiling()
+
     rows: list[dict[str, Any]] = []
     for job in service.db.list_jobs(limit=limit):
         # A running job's peak is provisional - it may not have reached full
@@ -355,12 +359,12 @@ def declared_vs_observed(service: GPUQService, *, limit: int = 200) -> dict[str,
                 "peak_source": job.peak_source,
                 "vram_source": job.vram_source,
                 "suggested_vram_gb": (
-                    suggested_vram_gb(job.peak_vram_mib)
+                    suggested_vram_gb(job.peak_vram_mib, vram_ceiling)
                     if job.peak_vram_mib is not None
                     else None
                 ),
                 "suggested_ram_gb": (
-                    suggested_ram_gb(job.peak_ram_mib)
+                    suggested_ram_gb(job.peak_ram_mib, ram_ceiling)
                     if job.peak_ram_mib is not None
                     else None
                 ),

@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 
 from workerq.core import GPUQError, GPUQService, SubmitRequest
-from workerq.eta import learned_peak_ram, suggested_ram_gb
+from workerq.eta import learned_peak_ram, suggested_ram_gb, suggested_vram_gb
 from workerq.models import JobState
 
 GIB = 1024.0
@@ -54,13 +54,32 @@ def test_a_suggestion_is_never_trivially_small():
     assert suggested_ram_gb(0.1 * GIB) == 2.0
 
 
+def test_a_suggestion_never_exceeds_what_the_machine_has():
+    """Headroom is unbounded on its own and lands past installed capacity.
+
+    A 28.5 GiB VRAM peak on a 31.8 GiB card suggested 43 GiB, which admission
+    control rejects outright - so acting on the advice traded a job that OOMs
+    for one that never runs.
+    """
+    assert suggested_vram_gb(28.5 * GIB) == 43.0
+    assert suggested_vram_gb(28.5 * GIB, 27.8) == 27.0
+    # A ceiling well above the suggestion leaves it alone.
+    assert suggested_ram_gb(31.5 * GIB, 53.6) == 48.0
+    assert suggested_ram_gb(31.5 * GIB, 40.0) == 40.0
+
+
+def test_an_uncapped_suggestion_is_unchanged():
+    """No ceiling means no clamping, so callers without capacity are safe."""
+    assert suggested_ram_gb(10.0 * GIB, None) == 15.0
+
+
 # -- learning ---------------------------------------------------------------
 
 
 def test_nothing_is_suggested_without_history(service: GPUQService):
     service.ensure_ready()
     job_id = _submit(service, ram_gb=28.0)
-    peak, runs, _ = learned_peak_ram(service, service.db.get_job(job_id))
+    peak, runs, _, _ = learned_peak_ram(service, service.db.get_job(job_id))
     assert peak is None and runs == 0
 
 
@@ -71,7 +90,7 @@ def test_the_worst_successful_run_is_what_has_to_fit(service: GPUQService):
         _finish(service, done, peak_gb=gb, state=JobState.SUCCEEDED)
 
     job_id = _submit(service, ram_gb=28.0)
-    peak, runs, provenance = learned_peak_ram(service, service.db.get_job(job_id))
+    peak, runs, provenance, proven = learned_peak_ram(service, service.db.get_job(job_id))
     assert peak == pytest.approx(10.2 * GIB)
     assert runs == 3
     assert provenance == "measured"
@@ -92,9 +111,48 @@ def test_a_cancelled_outlier_does_not_poison_the_suggestion(service: GPUQService
     _finish(service, outlier, peak_gb=19.2, state=JobState.CANCELLED)
 
     job_id = _submit(service, ram_gb=28.0)
-    peak, runs, _ = learned_peak_ram(service, service.db.get_job(job_id))
+    peak, runs, _, _ = learned_peak_ram(service, service.db.get_job(job_id))
     assert peak == pytest.approx(10.2 * GIB)
     assert runs == 2
+
+
+def test_a_peak_from_runs_that_only_ever_failed_is_marked_unproven(
+    service: GPUQService,
+):
+    """A job that died of memory exhaustion never reached its real peak.
+
+    The peak it leaves behind is a floor, and advice drawn from it used to
+    argue for a *smaller* declaration - recommending the failure that produced
+    the number. The flag is what lets the caller refuse to do that.
+    """
+    service.ensure_ready()
+    for gb in (1.6, 1.4):
+        died = _submit(service, ram_gb=12.0)
+        _finish(service, died, peak_gb=gb, state=JobState.FAILED)
+
+    job_id = _submit(service, ram_gb=12.0)
+    peak, runs, _, proven = learned_peak_ram(service, service.db.get_job(job_id))
+    assert peak == pytest.approx(1.6 * GIB)
+    assert runs == 2
+    assert proven is False
+
+    advisories = service._history_advisories(service.db.get_job(job_id))
+    assert advisories == [], "must not talk the declaration down from a failed run"
+
+
+def test_one_successful_run_makes_the_peak_proven(service: GPUQService):
+    """A single completed run is enough; the fallback is only for none at all."""
+    service.ensure_ready()
+    died = _submit(service, ram_gb=12.0)
+    _finish(service, died, peak_gb=1.6, state=JobState.FAILED)
+    done = _submit(service, ram_gb=12.0)
+    _finish(service, done, peak_gb=2.0, state=JobState.SUCCEEDED)
+
+    job_id = _submit(service, ram_gb=12.0)
+    peak, runs, _, proven = learned_peak_ram(service, service.db.get_job(job_id))
+    assert peak == pytest.approx(2.0 * GIB), "the failed run is excluded outright"
+    assert runs == 1
+    assert proven is True
 
 
 def test_unfinished_runs_are_ignored(service: GPUQService):
@@ -105,7 +163,7 @@ def test_unfinished_runs_are_ignored(service: GPUQService):
         running, state=JobState.RUNNING.value, peak_ram_mib=0.2 * GIB, usage_samples=1
     )
     job_id = _submit(service, ram_gb=28.0)
-    peak, runs, _ = learned_peak_ram(service, service.db.get_job(job_id))
+    peak, runs, _, _ = learned_peak_ram(service, service.db.get_job(job_id))
     assert peak is None and runs == 0
 
 

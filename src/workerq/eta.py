@@ -413,8 +413,10 @@ MIN_SUGGESTION_GB = 2.0
 MIN_VRAM_SUGGESTION_GB = 1.0
 
 
-def learned_peak_ram(service: GPUQService, job: Job) -> tuple[float | None, int, str]:
-    """(worst observed peak MiB, runs, provenance) for this command's shape.
+def learned_peak_ram(
+    service: GPUQService, job: Job
+) -> tuple[float | None, int, str, bool]:
+    """(worst observed peak MiB, runs, provenance, proven) for this command's shape.
 
     The counterpart of `learned_duration`, and it answers the question people
     actually get wrong: not "how long will this take" but "how much will it
@@ -426,7 +428,7 @@ def learned_peak_ram(service: GPUQService, job: Job) -> tuple[float | None, int,
         job.command, bool(job.shell_mode)
     )
     if not signature:
-        return None, 0, ""
+        return None, 0, "", False
 
     cutoff = (utcnow() - timedelta(days=LEARNED_WINDOW_DAYS)).isoformat(
         timespec="microseconds"
@@ -438,8 +440,10 @@ def learned_peak_ram(service: GPUQService, job: Job) -> tuple[float | None, int,
     return _learned_peak(service, job, signature, cutoff, "peak_ram_mib", "peak_source")
 
 
-def learned_peak_vram(service: GPUQService, job: Job) -> tuple[float | None, int, str]:
-    """(worst observed VRAM peak MiB, runs, provenance) for this command's shape.
+def learned_peak_vram(
+    service: GPUQService, job: Job
+) -> tuple[float | None, int, str, bool]:
+    """(worst observed VRAM peak MiB, runs, provenance, proven) for this command's shape.
 
     Separate from the RAM version because the two are not obtained the same way
     on every platform. Where per-process VRAM is unreadable the figure is a
@@ -451,7 +455,7 @@ def learned_peak_vram(service: GPUQService, job: Job) -> tuple[float | None, int
         job.command, bool(job.shell_mode)
     )
     if not signature:
-        return None, 0, ""
+        return None, 0, "", False
     cutoff = (utcnow() - timedelta(days=LEARNED_WINDOW_DAYS)).isoformat(
         timespec="microseconds"
     )
@@ -465,8 +469,16 @@ def _learned_peak(
     cutoff: str,
     column: str,
     source_column: str,
-) -> tuple[float | None, int, str]:
-    """Worst peak in `column` across recent runs of the same command shape."""
+) -> tuple[float | None, int, str, bool]:
+    """Worst peak in `column` across recent runs of the same command shape.
+
+    The fourth element says whether any of those runs actually succeeded. A
+    peak taken only from failed runs is a lower bound, not a peak: the common
+    reason a memory-hungry job fails is that it ran out of memory, which stops
+    it before it reaches full size. Advice drawn from one of those must never
+    talk the declaration *down*, or it recommends the failure that produced it.
+    """
+    proven = True
     try:
         rows = service.db.conn.execute(
             f"SELECT {column} AS peak, {source_column} AS source FROM jobs "
@@ -476,6 +488,7 @@ def _learned_peak(
             (job.project, signature, job.id, cutoff, JobState.SUCCEEDED.value),
         ).fetchall()
         if not rows:
+            proven = False
             rows = service.db.conn.execute(
                 f"SELECT {column} AS peak, {source_column} AS source FROM jobs "
                 "WHERE project = ? AND command_signature = ? AND id != ? "
@@ -484,11 +497,11 @@ def _learned_peak(
                 (job.project, signature, job.id, cutoff),
             ).fetchall()
     except Exception:
-        return None, 0, ""
+        return None, 0, "", False
 
     peaks = [float(r["peak"]) for r in rows if r["peak"] is not None]
     if not peaks:
-        return None, 0, ""
+        return None, 0, "", False
     # Say where the number came from, so nobody treats a telemetry inference or
     # a whole-card delta as if the job itself had been watched directly.
     sources = {r["source"] or "estimated" for r in rows}
@@ -498,18 +511,34 @@ def _learned_peak(
         provenance = "device_delta"
     else:
         provenance = "estimated"
-    return max(peaks), len(peaks), provenance
+    return max(peaks), len(peaks), provenance, proven
 
 
-def suggested_ram_gb(peak_mib: float) -> float:
-    """A declaration that would comfortably hold `peak_mib`, rounded up."""
+def _with_headroom(peak_mib: float, floor_gb: float, usable_gb: float | None) -> float:
+    """Peak plus headroom, rounded up, but never past what the machine has.
+
+    The headroom is unbounded on its own, and on a big peak it lands past the
+    installed capacity: a 28.5 GiB VRAM peak on a 31.8 GiB card suggests 43.
+    Advice like that is worse than none, because acting on it trades a job that
+    OOMs for one that is rejected outright or waits forever - and the whole
+    point of measuring peaks is to give a number somebody can actually apply.
+    So the ceiling is what admission control would allow, and when even the
+    peak does not fit, the caller is told rather than handed a fiction.
+    """
     import math
 
-    gb = (peak_mib / 1024.0) * PEAK_HEADROOM
-    return max(MIN_SUGGESTION_GB, float(math.ceil(gb)))
+    gb = max(floor_gb, float(math.ceil((peak_mib / 1024.0) * PEAK_HEADROOM)))
+    if usable_gb is None:
+        return gb
+    return min(gb, float(math.floor(usable_gb)))
 
 
-def suggested_vram_gb(peak_mib: float) -> float:
+def suggested_ram_gb(peak_mib: float, usable_gb: float | None = None) -> float:
+    """A declaration that would comfortably hold `peak_mib`, rounded up."""
+    return _with_headroom(peak_mib, MIN_SUGGESTION_GB, usable_gb)
+
+
+def suggested_vram_gb(peak_mib: float, usable_gb: float | None = None) -> float:
     """Same shape as the RAM suggestion, with a smaller floor.
 
     A 2 GiB floor makes sense for RAM, where a Python interpreter and its
@@ -517,7 +546,4 @@ def suggested_vram_gb(peak_mib: float) -> float:
     do sit under a gigabyte, and rounding them up to 2 would re-introduce the
     over-declaration this is meant to remove.
     """
-    import math
-
-    gb = (peak_mib / 1024.0) * PEAK_HEADROOM
-    return max(MIN_VRAM_SUGGESTION_GB, float(math.ceil(gb)))
+    return _with_headroom(peak_mib, MIN_VRAM_SUGGESTION_GB, usable_gb)

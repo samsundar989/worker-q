@@ -755,6 +755,25 @@ class GPUQService:
                 "This job would never start."
             )
 
+    def _suggestion_ceiling(self) -> tuple[float | None, float | None]:
+        """Usable RAM and VRAM in GiB, as a cap on what we advise declaring.
+
+        `_reject_impossible` refuses a declaration above these, so a suggestion
+        above them would be advice the very next command rejects. Returns
+        (None, None) when enforcement is off or capacity cannot be read, which
+        leaves the suggestion uncapped rather than silently shrinking it.
+        """
+        from workerq import resources as res
+
+        if not self.config.resources.enforce:
+            return None, None
+        try:
+            cap = res.capacity(self.config, gpu=self.gpu_info())
+        except Exception:
+            return None, None
+        vram = cap.usable_vram_mib / 1024.0 if cap.usable_vram_mib else None
+        return cap.usable_ram_mib / 1024.0, vram
+
     def _history_advisories(self, job: Job) -> list[str]:
         """Compare this declaration against what the same command has used.
 
@@ -768,13 +787,13 @@ class GPUQService:
         if not declared_mib:
             return []
         try:
-            peak_mib, runs, provenance = learned_peak_ram(self, job)
+            peak_mib, runs, provenance, proven = learned_peak_ram(self, job)
         except Exception:
             return []
         if peak_mib is None or runs < 2:
             return []
 
-        suggested = suggested_ram_gb(peak_mib)
+        suggested = suggested_ram_gb(peak_mib, self._suggestion_ceiling()[0])
         declared_gb = declared_mib / 1024.0
         tag = "measured" if provenance == "measured" else "estimated from telemetry"
 
@@ -786,7 +805,10 @@ class GPUQService:
                 f"({tag}) but declares {declared_gb:.1f} GiB. Under-declaring is how a "
                 f"machine gets oversubscribed - consider --ram {suggested:.0f}."
             ]
-        if declared_gb >= suggested * 1.5:
+        # Only a run that finished proves how big the job gets. Talking the
+        # declaration down from a run that died early - often of the very
+        # exhaustion this is meant to prevent - recommends that failure again.
+        if declared_gb >= suggested * 1.5 and proven:
             return [
                 f"this command has never used more than {peak_mib / 1024.0:.1f} GiB across "
                 f"{runs} run(s) ({tag}), but declares {declared_gb:.1f} GiB. That headroom "
@@ -811,13 +833,13 @@ class GPUQService:
         if not declared_mib:
             return []
         try:
-            peak_mib, runs, provenance = learned_peak_vram(self, job)
+            peak_mib, runs, provenance, proven = learned_peak_vram(self, job)
         except Exception:
             return []
         if peak_mib is None or runs < 2:
             return []
 
-        suggested = suggested_vram_gb(peak_mib)
+        suggested = suggested_vram_gb(peak_mib, self._suggestion_ceiling()[1])
         declared_gb = declared_mib / 1024.0
         peak_gb = peak_mib / 1024.0
         tag = {
@@ -831,7 +853,9 @@ class GPUQService:
                 f"({tag}) but declares {declared_gb:.1f} GiB. Under-declaring VRAM is what "
                 f"a CUDA out-of-memory failure looks like - consider --vram {suggested:.0f}."
             ]
-        if declared_gb >= suggested * 1.5:
+        # See `_history_advisories`: a CUDA out-of-memory failure caps the peak it
+        # leaves behind, so that peak must never argue for a smaller card share.
+        if declared_gb >= suggested * 1.5 and proven:
             return [
                 f"this command has never used more than {peak_gb:.1f} GiB of VRAM across "
                 f"{runs} run(s) ({tag}), but declares {declared_gb:.1f} GiB. On a single-GPU "
@@ -1287,38 +1311,49 @@ class GPUQService:
         from workerq.eta import learned_peak_vram, suggested_vram_gb
 
         job = self.get_job(job_id)
-        peak_mib, runs, provenance = learned_peak_ram(self, job)
+        ram_ceiling, vram_ceiling = self._suggestion_ceiling()
+        peak_mib, runs, provenance, proven = learned_peak_ram(self, job)
         declared_gb = (job.requested_ram_mib or 0) / 1024.0
 
-        vram_peak, vram_runs, vram_provenance = learned_peak_vram(self, job)
+        vram_peak, vram_runs, vram_provenance, vram_proven = learned_peak_vram(self, job)
         vram: dict[str, Any] = {
             "declared_vram_gb": (job.requested_vram_mib or 0) / 1024.0,
             "vram_runs": vram_runs,
+            "vram_proven": vram_proven,
             "suggested_vram_gb": (
-                None if vram_peak is None else suggested_vram_gb(vram_peak)
+                None if vram_peak is None else suggested_vram_gb(vram_peak, vram_ceiling)
             ),
         }
         if vram_peak is not None:
             vram["peak_vram_gb"] = vram_peak / 1024.0
             vram["vram_provenance"] = vram_provenance
+            # The peak itself can exceed what admission control will hand out.
+            # No declaration fixes that, so say so instead of implying one will.
+            if vram_ceiling is not None and vram_peak / 1024.0 > vram_ceiling:
+                vram["vram_exceeds_capacity_gb"] = vram_ceiling
 
         if peak_mib is None:
             return {
                 "job_id": job_id,
                 "declared_ram_gb": declared_gb,
                 "runs": 0,
+                "proven": False,
                 "suggested_ram_gb": None,
                 **vram,
             }
-        return {
+        out = {
             "job_id": job_id,
             "declared_ram_gb": declared_gb,
             "peak_ram_gb": peak_mib / 1024.0,
             "runs": runs,
             "provenance": provenance,
-            "suggested_ram_gb": suggested_ram_gb(peak_mib),
+            "proven": proven,
+            "suggested_ram_gb": suggested_ram_gb(peak_mib, ram_ceiling),
             **vram,
         }
+        if ram_ceiling is not None and peak_mib / 1024.0 > ram_ceiling:
+            out["ram_exceeds_capacity_gb"] = ram_ceiling
+        return out
 
     def get_reserve(self) -> dict[str, Any]:
         """The reserve in force, plus what it leaves for jobs."""

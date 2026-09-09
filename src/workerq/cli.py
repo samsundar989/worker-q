@@ -1430,11 +1430,29 @@ def _print_vram_suggestion(console: Any, job_id: int, data: dict[str, Any]) -> N
         f"\nVRAM, worst of {data['vram_runs']} past run(s): "
         f"[bold]{peak:.1f} GiB[/bold]  [dim]({tag})[/dim]"
     )
+    ceiling = data.get("vram_exceeds_capacity_gb")
+    if ceiling is not None:
+        console.print(
+            f"Suggested declaration: [bold green]{suggested:.0f} GiB[/bold green]"
+            "  [dim](all the card admission control will hand out)[/dim]"
+        )
+        console.print(
+            f"[red]This command's own peak of {peak:.1f} GiB is above the "
+            f"{ceiling:.1f} GiB usable, so no declaration makes it fit. Give it a "
+            "smaller batch or model, or run it where the card is bigger.[/red]"
+        )
+        return
     console.print(
         f"Suggested declaration: [bold green]{suggested:.0f} GiB[/bold green]"
         "  [dim](peak + 50% headroom)[/dim]"
     )
-    if declared > suggested:
+    if not data.get("vram_proven", True):
+        console.print(
+            "[yellow]No run of this command has ever succeeded, so that figure is a "
+            "floor, not a peak - a CUDA out-of-memory failure caps the number it "
+            "leaves behind. Do not declare less than you already have.[/yellow]"
+        )
+    elif declared > suggested:
         console.print(
             f"[yellow]Declaring {declared:.0f} GiB holds {declared - suggested:.0f} GiB "
             "of the card more than this command has ever used.[/yellow]"
@@ -1501,11 +1519,32 @@ def requests(
                 f"Worst of {data['runs']} past run(s): "
                 f"[bold]{data['peak_ram_gb']:.1f} GiB[/bold]  [dim]({tag})[/dim]"
             )
+            ram_ceiling = data.get("ram_exceeds_capacity_gb")
+            if ram_ceiling is not None:
+                console.print(
+                    f"Suggested declaration: [bold green]{data['suggested_ram_gb']:.0f} "
+                    "GiB[/bold green]  [dim](all admission control will hand out)[/dim]"
+                )
+                console.print(
+                    f"\n[red]This command's own peak of {data['peak_ram_gb']:.1f} GiB is "
+                    f"above the {ram_ceiling:.1f} GiB usable, so no declaration makes it "
+                    "fit. It has been overrunning whatever it declared.[/red]"
+                )
+                _print_vram_suggestion(console, job_id, data)
+                service.close()
+                return
             console.print(
                 f"Suggested declaration: [bold green]{data['suggested_ram_gb']:.0f} "
                 f"GiB[/bold green]  [dim](peak + 50% headroom)[/dim]"
             )
-            if data["declared_ram_gb"] > data["suggested_ram_gb"]:
+            if not data.get("proven", True):
+                console.print(
+                    "\n[yellow]No run of this command has ever succeeded, so that "
+                    "figure is a floor, not a peak - a run that died early never "
+                    "reached full size. Treat it as the minimum, and do not "
+                    "declare less than you already have.[/yellow]"
+                )
+            elif data["declared_ram_gb"] > data["suggested_ram_gb"]:
                 console.print(
                     f"\n[yellow]Declaring {data['declared_ram_gb']:.0f} GiB reserves "
                     f"{data['declared_ram_gb'] - data['suggested_ram_gb']:.0f} GiB more "
@@ -2563,6 +2602,66 @@ def node_check(
                 "dispatch."
             )
     raise typer.Exit(0 if ok_all else 1)
+
+
+@node_app.command("drain")
+def node_drain(
+    name: str = typer.Argument(..., help="Node to stop sending work to."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Stop placing new work on a node. Running jobs are left alone.
+
+    For taking a machine down for maintenance without losing hours of work:
+    the node stays registered and its jobs keep running to completion, but
+    nothing new is sent. `workerq node enable` reverses it.
+
+    Cancelling the running jobs is deliberately *not* what this does. A drain
+    that killed work would be the same thing as `cancel`, and the reason to
+    drain is usually that you want the work to finish.
+    """
+    config = load_config()
+    node = _node_or_fail(config, name)
+    node.enabled = False
+    path = config.save()
+
+    running = 0
+    try:
+        service = get_service()
+        running = sum(
+            1
+            for job in service.list_jobs(state="RUNNING", limit=500, refresh=False)
+            if job.node == name
+        )
+        service.close()
+    except Exception:
+        pass
+
+    if json_output:
+        emit_json({"node": name, "enabled": False, "running": running, "config": str(path)})
+        return
+    console.print(f"[yellow]draining[/yellow] {name} - no new work will be placed there")
+    if running:
+        console.print(
+            f"  {running} job(s) still running there. They are left alone and will "
+            "finish;\n  watch them with [bold]workerq status[/bold]."
+        )
+    console.print(f"\n  Undo with [bold]workerq node enable {name}[/bold]")
+
+
+@node_app.command("enable")
+def node_enable(
+    name: str = typer.Argument(..., help="Node to start using again."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Start placing work on a drained node again."""
+    config = load_config()
+    node = _node_or_fail(config, name)
+    node.enabled = True
+    path = config.save()
+    if json_output:
+        emit_json({"node": name, "enabled": True, "config": str(path)})
+        return
+    console.print(f"[green]enabled[/green] {name} - it will be considered for placement")
 
 
 @node_app.command("drain")
