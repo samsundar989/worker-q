@@ -1,6 +1,10 @@
 # Multi-node: dispatching to a second machine
 
-Status: **design, not implemented.** This supersedes Stage 3 of
+Status: **implemented and running.** Jobs submitted on the primary are
+placed on either machine automatically, run there, and their results and logs
+come home. What remains is listed in [§10](#10-phases).
+
+This supersedes Stage 3 of
 [future-slurm.md](future-slurm.md), which sketched the idea and then argued
 against it. The argument still holds at scale; what changed is that the target
 is exactly two machines, which that document itself names as the honest
@@ -1151,19 +1155,76 @@ Collection failing does not fail the job — the results still exist on the node
 — but it is logged as *"results are still on `<node>`… they are not lost"*
 rather than passing quietly.
 
-### Phase 5 — automatic placement
+### Phase 5 — automatic placement ✅ done
 
-Eligibility, fit prediction, scoring, and wait reasons that name both machines.
-This is where [§4](#4-the-queue-lives-on-the-primary) and
-[§5](#5-placement) actually land.
+worker-q now chooses. Proven with two jobs that could not both run here:
 
-### Phase 6 — the unhappy paths
+```text
+job 8: it blocks a later job here, so looking for another machine
+job 8: placed on 3080ti as its job 12 (28004 bytes shipped)
+job 9: keeping local: moving it would not free anything
+```
 
-Link-drop semantics, reconcile-by-label, `node drain`, offline handling,
-version-skew refusal, clock-skew warning. Deliberately last, and deliberately
-its own phase: this is the part that `future-slurm.md` warned about, and
+`A on DESKTOP-UNR95NB` and `B on Sam_Mega_PC`, in parallel rather than one
+after the other.
+
+The contention test is a **counterfactual, not a queue-depth count**: is there
+a job behind this one that cannot start now but could if this one went
+elsewhere? Depth would be the wrong measure, because a queue full of 30 GiB
+jobs is not a reason to exile a small one — moving it frees nothing they can
+use.
+
+Every placement decision is logged once, when it changes. A job that ran on the
+slower machine, or did not, is otherwise impossible to argue about afterwards;
+and an unthrottled line on a loop that ticks four times a second would
+reproduce the 303,164 identical lines that commit `16b2846` had to fix.
+
+`[scheduling] auto_placement = false` is the escape hatch, and `status` grows a
+`NODE` column — but only on a machine that has somewhere else to send work.
+
+One bug this work introduced and fixed: **`workerq config set` silently deleted
+the node registry.** `to_dict()` deliberately excludes nodes because it feeds
+the dotted-key coercion machinery, but both mutation paths rebuilt a `Config`
+from that dict — so the first config change after registering a node wiped it,
+and the dispatcher then had nowhere to place anything while `node list` still
+showed the node online.
+
+### Phase 6 — the unhappy paths ✅ mostly done
+
+Deliberately its own phase: this is what `future-slurm.md` warned about, and
 folding it into Phase 5 would mean shipping the happy path and discovering the
 rest in production.
+
+Done:
+
+- **Link drop.** A node that cannot be polled leaves its jobs `RUNNING`.
+  Unreachable is not finished, and collapsing those two is how a live training
+  run gets recorded as failed and started again somewhere else.
+- **No duplicate work.** `_submit-spec` is idempotent by label: re-sending a
+  spec adopts the job already there rather than creating a second one. This
+  guards the window where the node accepts a job and the sender dies before
+  recording its id — the job is still `QUEUED` on the sender, so it would
+  otherwise be sent again. The check lives on the *receiving* side, because
+  asking from the sender would add a whole SSH round trip to every placement to
+  guard against something that almost never happens.
+- **Protocol refusal.** A version gap produces a parse error *after* the work
+  has been queued on the far side, so dispatch stops on a protocol mismatch.
+  Only the protocol may refuse; a differing `__version__` is reported and
+  tolerated, because that is the check which already failed to notice a real
+  skew between these two machines.
+- **Clock skew.** Output collection compares file times against the node's own
+  clock — deliberately, since comparing against this machine's would be wrong
+  whenever the two disagree. But a node minutes out would silently collect the
+  wrong files and report success, so more than two minutes of skew stops
+  dispatch. Unknown is not treated as wrong.
+- **`node drain` / `node enable`.** Stops placement without touching what is
+  running. It deliberately does not cancel: a drain that killed jobs would just
+  be `cancel`, and the reason to drain is usually that you want the work to
+  finish.
+
+Still open: surfacing *"running but its node is unreachable"* in `status`. The
+job is safe and the state is correct; it simply looks like any other running
+job until you check `workerq node list`.
 
 ### Phase 7 — node-aware learning
 
