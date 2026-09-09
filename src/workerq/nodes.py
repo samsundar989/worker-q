@@ -492,6 +492,14 @@ class ReportCache:
         report.age_seconds = 0.0
         return report
 
+    def peek(self, name: str) -> tuple[float, NodeReport] | None:
+        """The cached report and when it was taken, without fetching.
+
+        Lets the main loop publish what a background poller collected, without
+        either of them blocking on the other.
+        """
+        return self._reports.get(name)
+
     def invalidate(self, name: str) -> None:
         self._reports.pop(name, None)
 
@@ -519,3 +527,60 @@ def compatibility(local: NodeReport, remote: NodeReport) -> tuple[bool, str | No
             "machines to the same worker-q before dispatching"
         )
     return True, None
+
+
+def published_reports(config: Config, store: Any) -> dict[str, NodeReport]:
+    """The dispatcher's latest view of each node, read from the queue meta table.
+
+    Costs nothing: no SSH, no subprocess. The dispatcher already polls every
+    node every few seconds and writes what it saw, so `top`, `status` and
+    `node list` can all answer "how is that machine" without opening their own
+    connection - which a 1 Hz dashboard could not afford anyway, at ~540 ms a
+    round trip.
+
+    A report older than the node's own poll interval by a wide margin means the
+    dispatcher is not running, not that the node is down. Callers are given the
+    age and decide; this function does not guess.
+    """
+    from workerq.backends.dispatcher import META_NODE_REPORT
+    from workerq.util import age_seconds
+
+    out: dict[str, NodeReport] = {}
+    for node in config.nodes:
+        try:
+            raw = store.get_meta(META_NODE_REPORT + node.name)
+        except Exception:
+            raw = None
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        report = NodeReport(
+            name=node.name,
+            protocol=payload.get("protocol"),
+            version=payload.get("version"),
+            hostname=payload.get("hostname"),
+            cpus=payload.get("cpus"),
+            commit_ceiling_mib=payload.get("commit_ceiling_mib"),
+            queued=int(payload.get("queued") or 0),
+            slots=payload.get("slots"),
+            daemon_running=payload.get("daemon_running"),
+            remote_time=payload.get("remote_time"),
+            error=payload.get("error"),
+            latency_seconds=payload.get("latency_seconds"),
+        )
+        host_raw = payload.get("host")
+        if host_raw:
+            report.host_memory = host.HostMemory(**{
+                k: v for k, v in host_raw.items()
+                if k in {"total_mib", "available_mib", "commit_used_mib",
+                         "commit_limit_mib", "error"}
+            })
+        gpu_raw = payload.get("gpu")
+        if gpu_raw:
+            report.gpu = GpuInfo.from_dict(gpu_raw)
+        report.age_seconds = age_seconds(payload.get("at")) or 0.0
+        out[node.name] = report
+    return out

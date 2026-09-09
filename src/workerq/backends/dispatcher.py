@@ -55,6 +55,17 @@ from workerq.winproc import (
 
 # meta keys
 META_SLOTS = "slots"
+
+#: Prefix for the last report from each node, published into the queue meta
+#: table. The dispatcher already polls every node every few seconds; anything
+#: else that wants to know a node's state - `top`, `status`, `node list` -
+#: reads it from here instead of opening its own SSH connection.
+#:
+#: This is the same mechanism the reserve and the slot count use, and for the
+#: same reason: the queue database is the channel. A 1 Hz dashboard cannot
+#: afford a 540 ms round trip on the render path, and two independent pollers
+#: would double the traffic to say the same thing twice.
+META_NODE_REPORT = "node_report:"
 META_GPU_FREE_PERC = "gpu_free_perc"
 #: Live reserve. Set through `workerq reserve` and re-read every tick, so the
 #: owner can reclaim the machine without restarting the daemon.
@@ -159,6 +170,9 @@ _REMOTE_TERMINAL = frozenset({"SUCCEEDED", "FAILED", "CANCELLED", "LOST"})
 #: added by hand, so this only has to be faster than a person gets impatient.
 _NODE_RELOAD_SECONDS = 15.0
 
+#: How often node reports are copied into the queue meta table for observers.
+_NODE_PUBLISH_SECONDS = 2.0
+
 #: How long a node's staging state is trusted. A whole SSH connection, on a
 #: loop that ticks four times a second, to answer a question whose answer
 #: changes only when a human runs `workerq node stage`.
@@ -215,6 +229,7 @@ class Dispatcher:
         self._reports: Any | None = None
         #: When the node registry was last re-read from the config file.
         self._nodes_loaded_at = 0.0
+        self._reports_published_at = 0.0
         #: (node, repo) -> (checked_at, ready, reason). Staging state changes
         #: when somebody runs `node stage`, not on its own.
         self._repo_ready_cache: dict[tuple[str, str], tuple[float, bool, str | None]] = {}
@@ -959,7 +974,14 @@ class Dispatcher:
                     return
                 head_id = int(head_blocked["id"])
                 waited = self._blocked_wait_seconds(head_id)
-                if waited >= sched.backfill_head_wait_seconds:
+                # Holding is a bet that the machine will free up if we stop
+                # adding to it. With nothing running there is nothing to drain,
+                # so the bet cannot pay: the head is held out by the desktop,
+                # the editors, or its own size, none of which the queue can
+                # evict. Holding then buys the head nothing and costs every job
+                # behind it - an idle machine with a 1 GiB job waiting on a
+                # 32 GiB one that will not fit either way.
+                if waited >= sched.backfill_head_wait_seconds and in_flight > 0:
                     # Holding drains the machine so the head job gets a clear
                     # run at it. That only works if queue pressure is what is
                     # keeping it out. When the blocker is a long-running job
@@ -983,6 +1005,11 @@ class Dispatcher:
                             "blocker is not queue pressure, so backfilling resumes"
                         )
                         self._hold_logged_at[head_id] = now + _BLOCKED_REPEAT_SECONDS
+                elif in_flight == 0:
+                    # Not holding, so the hold clock must not run. Otherwise an
+                    # idle spell silently spends the head's one bounded hold and
+                    # it never gets the drained machine the hold promises it.
+                    self._hold_since.pop(head_id, None)
                 skipped += 1
                 if skipped > sched.backfill_max_skip:
                     return
@@ -1144,6 +1171,35 @@ class Dispatcher:
     # machine, and charging it against this one's headroom would idle the 5090
     # for work that is not here.
 
+    def _publish_node_reports(self) -> None:
+        """Write the latest node reports where anything else can read them.
+
+        On the main loop, because the queue database connection belongs to this
+        thread. The poller thread only refreshes the in-memory cache.
+        """
+        if self._reports is None or not self.config.nodes:
+            return
+        now = time.monotonic()
+        if now - self._reports_published_at < _NODE_PUBLISH_SECONDS:
+            return
+        self._reports_published_at = now
+        for node in self.config.nodes:
+            cached = self._reports.peek(node.name)
+            if cached is None:
+                continue
+            at, report = cached
+            try:
+                self.store.set_meta(
+                    META_NODE_REPORT + node.name,
+                    json.dumps({
+                        "at": utcnow_iso(),
+                        "age_at_publish": now - at,
+                        **report.to_dict(),
+                    }),
+                )
+            except Exception:
+                pass
+
     def _refresh_nodes(self) -> None:
         """Re-read the node registry from disk.
 
@@ -1180,6 +1236,11 @@ class Dispatcher:
 
         if self._reports is None:
             self._reports = nodemod.ReportCache()
+        # Deliberately does not write to the store. This is called from the
+        # node-poller thread, and a SQLite connection belongs to the thread
+        # that created it - writing here raised, and the exception was
+        # swallowed, so reports silently never appeared. Publishing happens on
+        # the main loop instead, in `_publish_node_reports`.
         return self._reports.get(node)
 
     def _node_usable(self, node: Any, report: Any) -> tuple[bool, str | None]:
@@ -1583,6 +1644,7 @@ class Dispatcher:
         interval = self.config.backend.poll_interval_seconds
         trim_counter = 0
         self._start_watchdog()
+        self._start_node_poller()
         try:
             while not self._stop:
                 try:
@@ -1590,6 +1652,7 @@ class Dispatcher:
                     self._heartbeat()
                     self._sample_resources()
                     self._refresh_nodes()
+                    self._publish_node_reports()
                     self._reap()
                     self._service_cancellations()
                     self._service_preemptions()
@@ -1642,6 +1705,46 @@ class Dispatcher:
             self.log(f"job {backend_id}: process gone, marking finished")
             self.store.finish(backend_id, exit_code=None)
 
+
+    def _start_node_poller(self) -> None:
+        """Keep every node's report fresh, off the dispatch loop.
+
+        On a thread rather than in the tick for two reasons. An SSH round trip
+        costs about 540 ms on this pair and the tick runs four times a second,
+        so polling inline would stall cancellation and reaping for a fifth of
+        the time. And polling only when a job needs placing - which is what
+        happened before this - meant an idle queue reported nothing at all, so
+        `top` showed "no report yet" on a perfectly healthy machine, and the
+        first job to arrive paid the cold poll itself.
+
+        Failures are swallowed on purpose: a node that cannot be reached is a
+        report with an error in it, not an exception that stops the loop.
+        """
+        import threading
+
+        def poll() -> None:
+            while not self._stop:
+                try:
+                    for node in list(self.config.nodes):
+                        if self._stop:
+                            break
+                        if node.enabled:
+                            self._node_report(node)
+                except Exception:
+                    pass
+                # Sleep in short slices so shutdown is not held up by a node
+                # with a long poll interval.
+                waited = 0.0
+                step = 0.25
+                target = min(
+                    (n.poll_interval_seconds for n in self.config.nodes if n.enabled),
+                    default=5.0,
+                )
+                while waited < target and not self._stop:
+                    time.sleep(step)
+                    waited += step
+
+        threading.Thread(target=poll, name="workerq-node-poll", daemon=True).start()
 
     def _start_watchdog(self) -> None:
         """End the process if the main loop stops making progress.

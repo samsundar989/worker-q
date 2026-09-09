@@ -514,8 +514,75 @@ class Dashboard:
             ),
             Text("(after reserved headroom)", style="dim"),
         )
+        self._add_node_rows(rows, sep)
         self.machine_rows = rows.row_count
         return _panel(rows, "machine")
+
+    def _add_node_rows(self, rows: Any, sep: str) -> None:
+        """One line per other machine, read from what the dispatcher last saw.
+
+        Deliberately free of I/O. This panel redraws about once a second and an
+        SSH round trip costs ~540 ms on this pair, so polling here would stall
+        the dashboard for half of every frame. The dispatcher already polls
+        every node; it publishes what it saw into the queue meta table and this
+        reads it from there.
+
+        The consequence to be honest about: what is shown is as fresh as the
+        dispatcher's last poll, and if the dispatcher is not running it is
+        stale. So the age is shown whenever it is not current, rather than
+        letting an old number pass as a live one.
+        """
+        from workerq import nodes as nodemod
+
+        config = self.service.config
+        if not getattr(config, "nodes", None):
+            return
+        try:
+            reports = nodemod.published_reports(config, self.service.backend.store)
+        except Exception:
+            reports = {}
+
+        for node in config.nodes:
+            report = reports.get(node.name)
+            label = node.name[:10]
+            if report is None:
+                rows.add_row(
+                    label,
+                    Text("no report yet", style=CHROME),
+                    Text("the dispatcher has not polled it", style="dim"),
+                )
+                continue
+            if not report.online:
+                rows.add_row(
+                    label,
+                    Text("offline", style="bold red"),
+                    Text(report.error or "unreachable", style="dim"),
+                )
+                continue
+
+            device = report.gpu.devices[0] if report.gpu and report.gpu.devices else None
+            mem = report.host_memory
+            # Kept short on purpose. This grid shares fixed column widths with
+            # the local rows above, and Rich shrinks every column when the
+            # total overflows - so a chatty node line truncated "Commit" to
+            # "Com…" on the rows that matter most.
+            # The bar already carries VRAM, so this says the things it cannot.
+            detail = []
+            if mem is not None:
+                detail.append(f"ram {_gib(mem.used_mib)}/{_gib(mem.total_mib)}G")
+            detail.append(f"{len(report.running)} job")
+            if not node.enabled:
+                detail.append("DRAINED")
+            # Only shown when it is not current: an age on every line reads as
+            # noise, an age on a stale line reads as a warning.
+            if report.age_seconds > max(10.0, node.poll_interval_seconds * 3):
+                detail.append(f"{report.age_seconds:.0f}s ago")
+            bar = _bar(device.memory_used_mib, device.memory_total_mib) if device else Text("")
+            rows.add_row(
+                label,
+                bar,
+                Text(f" {sep} ".join(detail), style="" if node.enabled else MUTED),
+            )
 
     def _fit(self, active: list[Any]) -> tuple[list[Any], dict[int, str]]:
         """The jobs that fit in the panel, and why any of them are waiting.
