@@ -362,13 +362,24 @@ def run_remote(
     )
 
 
-def copy_to_node(node: NodeConfig, local: Any, remote: str, *, timeout: float = 600.0) -> RemoteResult:
-    """scp one file to a node. Used for snapshot bundles."""
+def scp_path(path: str) -> str:
+    """A Windows path as the remote half of an scp argument.
+
+    scp hands the remote path to the sftp subsystem, which wants forward
+    slashes: `C:\\Users\\...` comes back as "No such file or directory" while
+    `C:/Users/...` fetches the file. Uploads happen to tolerate backslashes,
+    which is worse than if they did not - it makes the rule look optional until
+    the first download fails.
+    """
+    return path.replace("\\", "/")
+
+
+def _scp(node: NodeConfig, argv_tail: list[str], timeout: float) -> RemoteResult:
     scp = shutil.which("scp") or "scp"
     argv = [scp, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new"]
     if node.port != 22:
         argv += ["-P", str(node.port)]
-    argv += [str(local), f"{node.target}:{remote}"]
+    argv += argv_tail
     try:
         proc = subprocess.run(
             argv,
@@ -390,6 +401,16 @@ def copy_to_node(node: NodeConfig, local: Any, remote: str, *, timeout: float = 
         proc.stderr or "",
         None if proc.returncode == 0 else (proc.stderr or "").strip()[:200] or "scp failed",
     )
+
+
+def copy_to_node(node: NodeConfig, local: Any, remote: str, *, timeout: float = 600.0) -> RemoteResult:
+    """scp one file to a node. Used for snapshot bundles and job specs."""
+    return _scp(node, [str(local), f"{node.target}:{scp_path(remote)}"], timeout)
+
+
+def copy_from_node(node: NodeConfig, remote: str, local: Any, *, timeout: float = 600.0) -> RemoteResult:
+    """scp one file back from a node. Used to bring a finished job's log home."""
+    return _scp(node, [f"{node.target}:{scp_path(remote)}", str(local)], timeout)
 
 
 def remote_report(node: NodeConfig) -> NodeReport:

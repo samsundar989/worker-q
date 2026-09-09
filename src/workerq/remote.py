@@ -223,24 +223,9 @@ def fetch_log(node: NodeConfig, remote_log_path: str, dest: Path) -> bool:
     """Bring a finished job's log home.
 
     Small, and it is the difference between a job's output surviving the worker
-    being switched off and not. Failure is not fatal: the log still exists on
-    the node.
+    being switched off and not. Failure is not fatal - the log still exists on
+    the node - so this reports rather than raises.
     """
-    from workerq import nodes as nodemod
-
-    scp = nodemod.shutil.which("scp") or "scp"
-    argv = [scp, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new"]
-    if node.port != 22:
-        argv += ["-P", str(node.port)]
-    argv += [f"{node.target}:{remote_log_path}", str(dest)]
-    try:
-        proc = nodemod.subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=300,
-            **nodemod.no_window_kwargs(),
-        )
-    except Exception:
-        return False
-    return proc.returncode == 0 and dest.exists()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    result = nodes.copy_from_node(node, remote_log_path, dest)
+    return result.ok and dest.exists()

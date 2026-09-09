@@ -279,3 +279,22 @@ def test_an_unknown_top_level_section_does_not_brick_an_older_workerq(tmp_path):
     )
     assert config.core.max_concurrent_jobs == 3
     assert config.nodes == []
+
+
+@pytest.mark.parametrize(
+    "windows, expected",
+    [
+        (r"C:\Users\me\.local\state\gpuq\logs\job-000010.log",
+         "C:/Users/me/.local/state/gpuq/logs/job-000010.log"),
+        (r"D:\a b\c.bundle", "D:/a b/c.bundle"),
+        ("C:/already/forward", "C:/already/forward"),
+    ],
+)
+def test_remote_scp_paths_use_forward_slashes(windows, expected):
+    """scp hands the remote path to sftp, which wants forward slashes.
+
+    Uploads happen to tolerate backslashes, which is worse than if they did
+    not: it made the rule look optional right up until the first *download*
+    came back "No such file or directory" for a path that plainly existed.
+    """
+    assert nodes.scp_path(windows) == expected

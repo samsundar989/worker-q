@@ -1050,12 +1050,63 @@ Cleanup uses `git worktree remove`, never a recursive delete — passthrough
 entries are junctions to live data, and following one would destroy a dataset
 the primary cannot see and did not put there.
 
-### Phase 4 — dispatch, pinned only
+### Phase 4 — dispatch, pinned only 🚧 job lifecycle proven end to end
 
-`RemoteWorkerqBackend` and `ClusterBackend`, with placement restricted to an
-explicit `--node`. All the plumbing — submit, state mapping, logs, cancel,
-reconcile — exercised with a human choosing the machine. Automatic placement is
-still off.
+**A job submitted here has run on the worker.** `RAN ON DESKTOP-UNR95NB`, in a
+worktree materialised from a shipped bundle, with the log retrieved afterwards.
+The full round trip - ship, submit, run, reconcile by label, fetch log, clean
+up - works against the real pair.
+
+`workerq/remote.py` is the client: `submit`, `job`, `find_by_origin`, `cancel`,
+`log_tail`, `fetch_log`. `_submit-spec` is the receiving half.
+
+**A job spec crosses as a file, never as a command line.** This repeats the
+decision already made for the runner, which takes only a job id and reads argv
+back from the database, because on Windows a `Popen` list is joined by
+`list2cmdline` and re-parsed by the child's C runtime. Remote dispatch stacks
+ssh, `cmd.exe` and typer on top of that, so user argv on a command line is a
+quoting bug waiting for the first path with a space in it.
+
+**The primary's job id travels in the job's label.** The node assigns its own
+id, so the label is the only durable link between the two records - and the
+case it exists for is the connection dropping *between* the node queueing a job
+and the primary recording its id. The id is lost then; the label is not.
+
+#### A correction to the architecture in [§3](#3-shape)
+
+The diagram shows a `ClusterBackend` implementing `SchedulerBackend` and
+composing the local and remote backends, so `GPUQService` stays unchanged. That
+does not work, and the reason is worth recording rather than quietly redrawing.
+
+`SchedulerBackend.submit()` is called at **submission** time. Placement happens
+at **dispatch** time, one tick before a node will actually start the job
+([§4](#4-the-queue-lives-on-the-primary)) - deliberately, so a job is never
+committed to a machine that gets busy before it runs. A backend method that
+must return a placement at submit time cannot express that.
+
+So the shape is: **the dispatcher is the placement engine, and `remote.py` is a
+client it calls.** There is no `ClusterBackend`. The local dispatcher gains
+node awareness in its dispatch loop, and remote jobs are excluded from local
+slot and reservation accounting, because their footprint is on the other
+machine.
+
+#### Still to do in this phase
+
+The dispatcher integration itself: a `node` column on `bjobs`, remote start
+inside `_start_ready_jobs`, remote reaping, and exclusion from local
+accounting. The lifecycle it will drive is proven; what is missing is the loop
+that drives it.
+
+Two more path bugs of the same family were found and fixed here, both of which
+only appear against a real machine:
+
+- **A worktree path handed to the far side must be expanded.** `%USERPROFILE%`
+  is resolved by `cmd.exe` for a command sent over SSH, but not by scp, and not
+  by the remote *Python* reading a job spec. Remote repo paths are now resolved
+  once, at the point they are built.
+- **scp wants forward slashes.** Uploads tolerate backslashes; downloads do
+  not, which made the rule look optional until a log that plainly existed came
+  back "No such file or directory".
 
 ### Phase 4b — output reconciliation
 

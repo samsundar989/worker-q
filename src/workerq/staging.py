@@ -192,17 +192,23 @@ def remote_repo_path(node: NodeConfig, repo_root: Path) -> str:
     under its own state directory and derives `execution_cwd` relative to the
     repo root, so the absolute paths never have to match.
     """
+    # Always expanded. A command sent over SSH runs through cmd.exe and would
+    # resolve `%USERPROFILE%` itself, but this path is also handed to scp and
+    # written into a job spec that the *remote Python* reads, and neither
+    # expands anything. Resolving once here removes the whole class of bug
+    # rather than fixing it per call site - it has already bitten twice.
+    root = expand_remote(node, node.repo_root)
     wanted = normalise_origin(origin_url(repo_root))
     if wanted:
         index = index_repos(node)
         # Prefer the same name when it is also the same repository, so a
         # machine holding two clones of one repo behaves predictably.
         if index.get(repo_root.name) == wanted:
-            return f"{node.repo_root}\\{repo_root.name}"
+            return f"{root}\\{repo_root.name}"
         for name, origin in index.items():
             if origin == wanted:
-                return f"{node.repo_root}\\{name}"
-    return f"{node.repo_root}\\{repo_root.name}"
+                return f"{root}\\{name}"
+    return f"{root}\\{repo_root.name}"
 
 
 def _q(path: str) -> str:
