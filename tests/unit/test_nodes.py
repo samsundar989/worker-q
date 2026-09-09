@@ -260,3 +260,22 @@ def test_common_ssh_failures_are_named_not_echoed(stderr, expected):
 def test_an_unrecognised_failure_still_says_something_useful():
     assert "weird" in nodes._explain_failure(1, "something weird happened", "")
     assert "exited 1" in nodes._explain_failure(1, "", "")
+
+
+def test_an_unknown_top_level_section_does_not_brick_an_older_workerq(tmp_path):
+    """The guarantee that was written down but only half-implemented.
+
+    Unknown keys *inside* a section were always ignored so that "a config
+    written by a newer gpuq does not brick an older one". A whole new
+    top-level table was not covered, and adding `[[node]]` duly bricked every
+    install that predated it - including the one serving the live queue, which
+    could no longer parse its own config to be told to stop.
+    """
+    config = write_config(
+        tmp_path,
+        "[core]\nmax_concurrent_jobs = 3\n\n"
+        '[[future_feature]]\nname = "x"\n\n'
+        'scalar_at_top_level = 7\n',
+    )
+    assert config.core.max_concurrent_jobs == 3
+    assert config.nodes == []

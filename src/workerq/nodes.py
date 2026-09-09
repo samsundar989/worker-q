@@ -313,6 +313,85 @@ def _explain_failure(code: int, stderr: str | None, stdout: str | None) -> str:
     return f"ssh exited {code}"
 
 
+@dataclass
+class RemoteResult:
+    """Outcome of one remote command. Never raises; callers branch on `ok`."""
+
+    ok: bool
+    returncode: int
+    stdout: str
+    stderr: str
+    error: str | None = None
+
+    @property
+    def out(self) -> str:
+        return self.stdout.strip()
+
+
+def run_remote(
+    node: NodeConfig, command: str, *, timeout: float | None = None
+) -> RemoteResult:
+    """Run one command on a node over SSH.
+
+    Batch aggressively: the connection costs ~530 ms and each extra command
+    about 22 ms, so `a && b && c` in one call is four times cheaper than three
+    calls. Windows OpenSSH cannot multiplex, so there is no other lever.
+    """
+    argv = ssh_command(node, command)
+    limit = node.timeout_seconds if timeout is None else timeout
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=limit,
+            encoding="utf-8",
+            errors="replace",
+            **no_window_kwargs(),
+        )
+    except subprocess.TimeoutExpired:
+        return RemoteResult(False, -1, "", "", f"timed out after {limit:.0f}s")
+    except Exception as exc:
+        return RemoteResult(False, -1, "", "", f"{type(exc).__name__}: {exc}")
+    return RemoteResult(
+        proc.returncode == 0,
+        proc.returncode,
+        proc.stdout or "",
+        proc.stderr or "",
+        None if proc.returncode == 0 else _explain_failure(proc.returncode, proc.stderr, proc.stdout),
+    )
+
+
+def copy_to_node(node: NodeConfig, local: Any, remote: str, *, timeout: float = 600.0) -> RemoteResult:
+    """scp one file to a node. Used for snapshot bundles."""
+    scp = shutil.which("scp") or "scp"
+    argv = [scp, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new"]
+    if node.port != 22:
+        argv += ["-P", str(node.port)]
+    argv += [str(local), f"{node.target}:{remote}"]
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            encoding="utf-8",
+            errors="replace",
+            **no_window_kwargs(),
+        )
+    except subprocess.TimeoutExpired:
+        return RemoteResult(False, -1, "", "", f"transfer timed out after {timeout:.0f}s")
+    except Exception as exc:
+        return RemoteResult(False, -1, "", "", f"{type(exc).__name__}: {exc}")
+    return RemoteResult(
+        proc.returncode == 0,
+        proc.returncode,
+        proc.stdout or "",
+        proc.stderr or "",
+        None if proc.returncode == 0 else (proc.stderr or "").strip()[:200] or "scp failed",
+    )
+
+
 def remote_report(node: NodeConfig) -> NodeReport:
     """Ask one machine for its state. Never raises."""
     started = time.monotonic()

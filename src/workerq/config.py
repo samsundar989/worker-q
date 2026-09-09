@@ -265,6 +265,11 @@ class NodeConfig:
     poll_interval_seconds: float = 3.0
     #: Seconds to wait for a node report before treating the node as offline.
     timeout_seconds: float = 20.0
+    #: Directory on that machine holding one clone per project. A repo's own
+    #: path need not match the primary's - snapshots are materialised under
+    #: worker-q's state directory and `execution_cwd` is relative to the repo
+    #: root - so only the parent has to be agreed.
+    repo_root: str = r"%USERPROFILE%\Documents"
     #: Path to `workerq.exe` on that machine. The default resolves through the
     #: remote PATH, which a non-interactive SSH session does not always have.
     workerq_path: str = "%USERPROFILE%\\.local\\bin\\workerq.exe"
@@ -648,7 +653,17 @@ def _apply_file(data: dict[str, Any], raw: dict[str, Any], path: Path) -> None:
             data["node"] = _read_nodes(values, path)
             continue
         if not isinstance(values, dict):
-            raise ConfigError(f"{path}: top-level key {section!r} must be a table")
+            # Ignored, not fatal - the same rule the per-key branch below
+            # follows, and for the same reason: a config written by a newer
+            # worker-q must not brick an older one.
+            #
+            # This was learned the hard way. `[[node]]` was added as a
+            # top-level array of tables, and every older install - including
+            # the one actually serving the queue - died parsing its own config
+            # the moment a node was registered. The guarantee was already
+            # written down; it just did not extend to the shape of a section,
+            # only to the keys inside one.
+            continue
         for key, value in values.items():
             dotted = normalize_key(f"{section}.{key}")
             sect, _, k = dotted.partition(".")
