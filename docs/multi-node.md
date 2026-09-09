@@ -1,8 +1,9 @@
 # Multi-node: dispatching to a second machine
 
-Status: **implemented and running.** Jobs submitted on the primary are
-placed on either machine automatically, run there, and their results and logs
-come home. What remains is listed in [§10](#10-phases).
+Status: **complete.** Jobs submitted on the primary are placed on either
+machine automatically, run there, and their results and logs come home. All
+seven phases are implemented; the one deliberate omission is described under
+[Phase 7](#phase-7--node-aware-learning--done).
 
 This supersedes Stage 3 of
 [future-slurm.md](future-slurm.md), which sketched the idea and then argued
@@ -1252,13 +1253,31 @@ publishing *must* stay on the main loop, because a SQLite connection belongs to
 the thread that created it — writing from the poller raised, the exception was
 swallowed, and reports silently never appeared.
 
-### Phase 7 — node-aware learning ⛔ not started
+### Phase 7 — node-aware learning ✅ done
 
-`eta.py` still pools durations across machines, so a 3080 Ti run and a 5090 run
-of the same command feed one estimate that is right for neither — see
-[§8.1](#81-eta-and-suggest-are-silently-node-blind). `jobs.node` now records
-where each job ran, which is the input this needs; the work is to key duration
-history by it while leaving peak RAM pooled.
+`learned_duration` is keyed by machine. History from the machine a job will
+actually use is preferred, however few samples it has; runs from elsewhere are
+a fallback and are labelled as such — `learned elsewhere n=4` rather than
+`learned n=4`.
+
+Saying it out loud matters more than it looks. A rough bound offered as a
+measurement is how an ETA stops being trusted, and this failure is silent: a
+pooled median across a 3080 Ti and a 5090 is wrong for both, and nothing about
+the number admits it. A test asserts that more samples from the wrong machine
+still lose to fewer from the right one.
+
+**Peaks stay pooled, deliberately.** How much memory a job needs does not
+change because the machine is slower — a batch is a batch — so splitting that
+history would halve the evidence behind every SUGGEST for no gain. A test pins
+this, so it reads as a decision rather than an omission.
+
+One case is left unsolved on purpose. A job that sizes itself to *available*
+VRAM measures larger on the 5090 than it would on the 3080 Ti, so its history
+can exile it from the smaller card. Detecting that needs knowing the job
+self-sizes, which worker-q cannot know, and guessing would be worse than the
+current behaviour. What exists instead: suggestions are capped at usable
+capacity, so `--suggest` never advises a declaration the next `submit` would
+refuse.
 
 ### Phase 7 — node-aware learning
 

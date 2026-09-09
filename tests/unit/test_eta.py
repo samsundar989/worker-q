@@ -14,6 +14,8 @@ import pytest
 from workerq.core import GPUQService
 from workerq.db import json_dumps
 from workerq.eta import (
+    SOURCE_LEARNED_OTHER,
+    learned_peak_ram,
     MIN_SAMPLES,
     SOURCE_DECLARED,
     SOURCE_LEARNED,
@@ -250,7 +252,7 @@ def test_stale_history_is_ignored(service: GPUQService):
             service, state=JobState.SUCCEEDED.value,
             started_at=old, finished_at=old,
         )
-    duration, _ = learned_duration(service, _job(service))
+    duration, _, _ = learned_duration(service, _job(service))
     assert duration is None
 
 
@@ -420,3 +422,90 @@ def test_a_blocked_job_does_not_claim_it_starts_immediately(service: GPUQService
         blocked = forecast_queue(service, [queued])
     assert blocked[queued.id]["starts_in_seconds"] is None
     assert blocked[queued.id]["start_at"] is None
+
+
+# --------------------------------------------------------------------------
+# Durations are per machine (phase 7 of docs/multi-node.md)
+# --------------------------------------------------------------------------
+
+
+def test_history_from_a_slower_machine_is_not_passed_off_as_local(service: GPUQService):
+    """The failure this exists to prevent, and it is a silent one.
+
+    A 3080 Ti is not a slower 5090 by a constant. Pooling runs from both gives
+    a median right for neither, and nothing about the number says so - which is
+    worse than the honest "unknown" shown before there is any history at all.
+    """
+    service.ensure_ready()
+    for _ in range(4):
+        _job(
+            service, state=JobState.SUCCEEDED.value, node="3080ti",
+            started_at=_ago(400), finished_at=_ago(100),
+        )
+    here = _job(service)
+    median, samples, same_machine = learned_duration(service, here)
+
+    # Used, because a rough bound beats no estimate at all...
+    assert median is not None and samples == 4
+    # ...but never presented as a measurement of this machine.
+    assert same_machine is False
+    assert estimate_job(service, here).source == SOURCE_LEARNED_OTHER
+    assert "elsewhere" in estimate_job(service, here).label()
+
+
+def test_local_history_is_preferred_over_a_larger_sample_from_elsewhere(
+    service: GPUQService,
+):
+    """More samples from the wrong machine is still the wrong machine."""
+    service.ensure_ready()
+    for _ in range(8):
+        _job(
+            service, state=JobState.SUCCEEDED.value, node="3080ti",
+            started_at=_ago(900), finished_at=_ago(100),   # 800s there
+        )
+    for _ in range(3):
+        _job(
+            service, state=JobState.SUCCEEDED.value,
+            started_at=_ago(200), finished_at=_ago(100),   # 100s here
+        )
+    median, samples, same_machine = learned_duration(service, _job(service))
+    assert same_machine is True
+    assert samples == 3
+    assert 90 < median < 110
+
+
+def test_a_job_bound_for_a_node_learns_from_that_node(service: GPUQService):
+    """The symmetric case: the estimate for a remote job is the remote history."""
+    service.ensure_ready()
+    for _ in range(4):
+        _job(
+            service, state=JobState.SUCCEEDED.value, node="3080ti",
+            started_at=_ago(900), finished_at=_ago(100),   # 800s
+        )
+    for _ in range(4):
+        _job(
+            service, state=JobState.SUCCEEDED.value,
+            started_at=_ago(200), finished_at=_ago(100),   # 100s
+        )
+    median, _, same_machine = learned_duration(service, _job(service, node="3080ti"))
+    assert same_machine is True
+    assert 780 < median < 820
+
+
+def test_peaks_stay_pooled_across_machines(service: GPUQService):
+    """Deliberately unlike duration: a batch is a batch.
+
+    How much memory a job needs does not change because the machine is slower,
+    so splitting this history would halve the evidence behind every SUGGEST for
+    no gain.
+    """
+    service.ensure_ready()
+    for _ in range(3):
+        _job(
+            service, state=JobState.SUCCEEDED.value, node="3080ti",
+            started_at=_ago(400), finished_at=_ago(100),
+            peak_ram_mib=6 * 1024.0, peak_source="measured",
+        )
+    peak, runs, _provenance, _proven = learned_peak_ram(service, _job(service))
+    assert peak == 6 * 1024.0
+    assert runs == 3

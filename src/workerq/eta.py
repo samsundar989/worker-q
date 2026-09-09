@@ -37,6 +37,10 @@ LEARNED_WINDOW_DAYS = 30
 SOURCE_PROGRESS = "progress"
 SOURCE_DECLARED = "declared"
 SOURCE_LEARNED = "learned"
+#: Learned, but from runs on a *different* machine. Kept distinct because a
+#: 3080 Ti and a 5090 are not interchangeable timers, and an estimate that
+#: quietly mixes them is right for neither.
+SOURCE_LEARNED_OTHER = "learned-elsewhere"
 SOURCE_UNKNOWN = "unknown"
 
 
@@ -151,6 +155,11 @@ class Estimate:
         """Short provenance tag, so nobody mistakes a guess for a measurement."""
         if self.source == SOURCE_LEARNED:
             return f"learned n={self.samples}"
+        if self.source == SOURCE_LEARNED_OTHER:
+            # Said out loud rather than folded into "learned": the number is
+            # from a machine of different speed and should be read as a rough
+            # bound, not a measurement of what this run will cost.
+            return f"learned elsewhere n={self.samples}"
         return self.source
 
     def to_dict(self) -> dict[str, Any]:
@@ -165,29 +174,36 @@ class Estimate:
 UNKNOWN = Estimate(None, None, SOURCE_UNKNOWN)
 
 
-def learned_duration(
-    service: GPUQService, job: Job
-) -> tuple[float | None, int]:
-    """Median wall time of past successful runs of this same command shape."""
-    signature = job.command_signature or command_signature(
-        job.command, bool(job.shell_mode)
-    )
-    if not signature:
-        return None, 0
+def _median(values: list[float]) -> float:
+    values.sort()
+    middle = len(values) // 2
+    if len(values) % 2:
+        return values[middle]
+    return (values[middle - 1] + values[middle]) / 2.0
 
-    cutoff = (utcnow() - timedelta(days=LEARNED_WINDOW_DAYS)).isoformat(
-        timespec="microseconds"
-    )
+
+def _durations_for(
+    service: GPUQService, job: Job, signature: str, cutoff: str, node: str | None
+) -> list[float]:
+    """Wall times of successful runs of this command shape on one machine.
+
+    `node` is matched exactly, and `None` means this machine - stored as NULL,
+    so it needs `IS NULL` rather than `= ?`, which would match nothing.
+    """
+    clause = "node IS NULL" if node is None else "node = ?"
+    params: list[Any] = [job.project, signature, JobState.SUCCEEDED.value, job.id, cutoff]
+    if node is not None:
+        params.append(node)
     try:
         rows = service.db.conn.execute(
             "SELECT started_at, finished_at FROM jobs "
             "WHERE project = ? AND command_signature = ? AND state = ? "
             "AND id != ? AND started_at IS NOT NULL AND finished_at IS NOT NULL "
-            "AND finished_at >= ? ORDER BY id DESC LIMIT 20",
-            (job.project, signature, JobState.SUCCEEDED.value, job.id, cutoff),
+            f"AND finished_at >= ? AND {clause} ORDER BY id DESC LIMIT 20",
+            tuple(params),
         ).fetchall()
     except Exception:
-        return None, 0
+        return []
 
     durations: list[float] = []
     for row in rows:
@@ -196,18 +212,60 @@ def learned_duration(
             seconds = (end - start).total_seconds()
             if seconds > 0:
                 durations.append(seconds)
+    return durations
 
-    if len(durations) < MIN_SAMPLES:
-        return None, len(durations)
 
-    durations.sort()
-    middle = len(durations) // 2
-    median = (
-        durations[middle]
-        if len(durations) % 2
-        else (durations[middle - 1] + durations[middle]) / 2.0
+def learned_duration(
+    service: GPUQService, job: Job
+) -> tuple[float | None, int, bool]:
+    """Median wall time of past successful runs, *on the machine this will use*.
+
+    Duration is the one learned quantity that is genuinely node-dependent. A
+    3080 Ti is not a slower 5090 by a constant, and pooling runs from both
+    produces a number right for neither - silently, which is worse than the
+    honest "unknown" worker-q shows before it has any history at all.
+
+    So history is keyed by machine first. Runs from elsewhere are used only as
+    a fallback, and the third element says so, because a rough bound offered
+    as a measurement is how an ETA stops being trusted.
+
+    Peaks are deliberately *not* treated this way: see `_learned_peak`.
+    """
+    signature = job.command_signature or command_signature(
+        job.command, bool(job.shell_mode)
     )
-    return median, len(durations)
+    if not signature:
+        return None, 0, True
+
+    cutoff = (utcnow() - timedelta(days=LEARNED_WINDOW_DAYS)).isoformat(
+        timespec="microseconds"
+    )
+
+    same = _durations_for(service, job, signature, cutoff, job.node)
+    if len(same) >= MIN_SAMPLES:
+        return _median(same), len(same), True
+
+    # Nothing from this machine yet. Anything is better than no estimate, as
+    # long as it is not presented as one taken here.
+    other = _durations_for(service, job, signature, cutoff, None) if job.node else []
+    if not other:
+        try:
+            rows = service.db.conn.execute(
+                "SELECT DISTINCT node FROM jobs WHERE project = ? AND command_signature = ? "
+                "AND state = ? AND node IS NOT NULL",
+                (job.project, signature, JobState.SUCCEEDED.value),
+            ).fetchall()
+        except Exception:
+            rows = []
+        for row in rows:
+            if row["node"] != job.node:
+                other.extend(
+                    _durations_for(service, job, signature, cutoff, row["node"])
+                )
+    if len(other) >= MIN_SAMPLES:
+        return _median(other), len(other), False
+
+    return None, len(same), True
 
 
 def estimate_job(service: GPUQService, job: Job) -> Estimate:
@@ -233,12 +291,12 @@ def estimate_job(service: GPUQService, job: Job) -> Estimate:
         )
 
     # 3. What this command has historically cost.
-    median, samples = learned_duration(service, job)
+    median, samples, same_machine = learned_duration(service, job)
     if median is not None:
         return Estimate(
             median,
             max(0.0, median - elapsed) if running else median,
-            SOURCE_LEARNED,
+            SOURCE_LEARNED if same_machine else SOURCE_LEARNED_OTHER,
             samples,
         )
 
