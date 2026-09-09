@@ -172,6 +172,11 @@ class SchedulingConfig:
     #: the queue drains until it can run. This is the starvation guard: it caps
     #: how long backfill may delay a job that cannot be packed.
     backfill_head_wait_seconds: int = 900
+    #: Let worker-q choose which machine a job runs on, once a node is
+    #: registered. Off pins everything here unless `--node` says otherwise,
+    #: which is the escape hatch if placement ever misbehaves.
+    auto_placement: bool = True
+
     #: How long the queue may stay held for one job before backfilling resumes.
     #: Draining the machine only helps when queue pressure is what keeps the head
     #: out. When it is instead waiting on a job with hours left to run, an
@@ -507,7 +512,9 @@ class Config:
             if value is None:
                 continue
             _set_dotted(data, dotted.replace("__", "."), value, coerce=True)
-        return _from_dict(data, source_path=self.source_path, profile=self.profile)
+        return _from_dict(
+            data, source_path=self.source_path, profile=self.profile, nodes=self.nodes
+        )
 
 
 def _toml_value(value: Any) -> str:
@@ -619,14 +626,30 @@ def set_dotted_and_save(config: Config, dotted: str, value: Any) -> Config:
     """Validate, apply and persist a single configuration change."""
     data = config.to_dict()
     _set_dotted(data, dotted, value, coerce=True)
-    updated = _from_dict(data, source_path=config.source_path, profile=config.profile)
+    updated = _from_dict(
+        data, source_path=config.source_path, profile=config.profile, nodes=config.nodes
+    )
     updated.save()
     return updated
 
 
 def _from_dict(
-    data: dict[str, Any], *, source_path: Path | None = None, profile: str | None = None
+    data: dict[str, Any],
+    *,
+    source_path: Path | None = None,
+    profile: str | None = None,
+    nodes: list[NodeConfig] | None = None,
 ) -> Config:
+    """Rebuild a Config from the nested section dict.
+
+    `nodes` is passed separately because the node registry is deliberately not
+    part of `to_dict()`: that dict feeds the dotted-key coercion machinery,
+    which is built for scalar keys inside fixed sections. Anything rebuilding a
+    Config from it must carry the registry across explicitly. Forgetting to do so
+    deleted every registered node the first time `workerq config set` ran, and
+    the dispatcher then had nowhere to place anything while `node list` still
+    showed the node online.
+    """
     return Config(
         core=CoreConfig(**data.get("core", {})),
         gpu=GpuConfig(**data.get("gpu", {})),
@@ -636,7 +659,11 @@ def _from_dict(
         preemption=PreemptionConfig(**data.get("preemption", {})),
         gaming=GamingConfig(**data.get("gaming", {})),
         claude=ClaudeConfig(**data.get("claude", {})),
-        nodes=[NodeConfig(**entry) for entry in data.get("node", [])],
+        nodes=(
+            list(nodes)
+            if nodes is not None
+            else [NodeConfig(**entry) for entry in data.get("node", [])]
+        ),
         source_path=source_path,
         profile=profile,
     )

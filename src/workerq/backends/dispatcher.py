@@ -159,6 +159,11 @@ _REMOTE_TERMINAL = frozenset({"SUCCEEDED", "FAILED", "CANCELLED", "LOST"})
 #: added by hand, so this only has to be faster than a person gets impatient.
 _NODE_RELOAD_SECONDS = 15.0
 
+#: How long a node's staging state is trusted. A whole SSH connection, on a
+#: loop that ticks four times a second, to answer a question whose answer
+#: changes only when a human runs `workerq node stage`.
+_REPO_READY_SECONDS = 60.0
+
 
 class Dispatcher:
     def __init__(self, config: Config) -> None:
@@ -193,6 +198,12 @@ class Dispatcher:
         self._reports: Any | None = None
         #: When the node registry was last re-read from the config file.
         self._nodes_loaded_at = 0.0
+        #: (node, repo) -> (checked_at, ready, reason). Staging state changes
+        #: when somebody runs `node stage`, not on its own.
+        self._repo_ready_cache: dict[tuple[str, str], tuple[float, bool, str | None]] = {}
+        #: Last placement explanation per job, so the reason is logged when it
+        #: changes rather than four times a second.
+        self._placement_logged: dict[int, str] = {}
 
     # -- logging ----------------------------------------------------------
     def log(self, message: str) -> None:
@@ -895,7 +906,29 @@ class Dispatcher:
                 if devices is not None:
                     blocked_reason = None
 
+            # Placement. Asked whether or not this machine could take the job,
+            # because "it fits here" is not the same as "here is the right
+            # place for it" once a second machine exists.
+            local_ok = blocked_reason is None
+            chosen, remote_why = self._choose_node(row, queued, position, local_ok)
+            if chosen is not None:
+                if self._start_remote(row, chosen):
+                    self._blocked.pop(backend_id, None)
+                    continue
+                # Placement failed after we decided to move it. Fall through
+                # and let it run here if it can, rather than stalling.
+                if local_ok:
+                    pass
+                else:
+                    self._record_wait(backend_id, blocked_reason or "placement failed")
+                    skipped += 1
+                    if skipped > sched.backfill_max_skip:
+                        return
+                    continue
+
             if blocked_reason is not None:
+                if remote_why:
+                    blocked_reason = f"{blocked_reason} | {remote_why}"
                 self._record_wait(backend_id, blocked_reason)
                 if head_blocked is None:
                     head_blocked = row
@@ -942,6 +975,149 @@ class Dispatcher:
                 self._blocked.pop(backend_id, None)
                 in_flight += 1
 
+
+
+    # -- automatic placement ----------------------------------------------
+
+    def _placement_note(self, backend_id: int, message: str) -> None:
+        """Log a placement decision, once, and only when it changes.
+
+        Every placement decision should be explainable after the fact - a job
+        that ran on the slower machine, or did not, is otherwise impossible to
+        argue about. Throttled by content, because this is on a loop that ticks
+        four times a second and an unthrottled line here would reproduce the
+        303,164-identical-lines incident that commit 16b2846 fixed.
+        """
+        if self._placement_logged.get(backend_id) == message:
+            return
+        self._placement_logged[backend_id] = message
+        self.log(f"job {backend_id}: {message}")
+
+    def _repo_ready(self, node: Any, spec: dict[str, Any]) -> tuple[bool, str | None]:
+        """Does that node have this project's source and declared inputs?
+
+        Cached: it is a whole SSH connection, staging state changes when
+        somebody runs `node stage` and not otherwise, and this is on a loop
+        that ticks four times a second.
+        """
+        from workerq import staging
+
+        repo_root = spec.get("repo_root")
+        if not repo_root:
+            return False, "job has no repository"
+        key = (node.name, str(repo_root))
+        now = time.monotonic()
+        cached = self._repo_ready_cache.get(key)
+        if cached is not None and now - cached[0] < _REPO_READY_SECONDS:
+            return cached[1], cached[2]
+
+        try:
+            status = staging.inspect_repo(
+                node, Path(repo_root), list(spec.get("passthrough") or [])
+            )
+        except Exception as exc:
+            answer = (False, f"could not check {node.name}: {exc}")
+        else:
+            if status.error:
+                answer = (False, f"{node.name}: {status.error}")
+            elif not status.exists:
+                answer = (
+                    False,
+                    f"{node.name} has no clone of {status.project} "
+                    f"(workerq node stage {node.name} --clone)",
+                )
+            elif status.missing:
+                shown = ", ".join(status.missing[:3])
+                more = f" and {len(status.missing) - 3} more" if len(status.missing) > 3 else ""
+                answer = (False, f"{node.name} is missing {shown}{more}")
+            else:
+                answer = (True, None)
+
+        self._repo_ready_cache[key] = (now, answer[0], answer[1])
+        return answer
+
+    def _would_block_the_queue(
+        self, row: dict[str, Any], queued: list[dict[str, Any]], position: int
+    ) -> bool:
+        """Would running this job *here* keep a later one from starting?
+
+        This is the whole of the placement rule, and it is a counterfactual
+        rather than a queue-depth count. Depth is the wrong measure: a queue
+        full of 30 GiB jobs is not a reason to exile a small one, because
+        moving it frees nothing they can use.
+
+        So the question asked is the one that matters - is there a job behind
+        this one that cannot start now, but could if this one went elsewhere?
+        If yes, moving this job buys an earlier start for that job. If no,
+        moving it only makes this job slower on a slower machine.
+        """
+        mine = self._request_for(row)
+        running = self._running_requests()
+        with_me = running + [mine]
+        for later in queued[position + 1:]:
+            if later.get("pinned_node"):
+                continue
+            theirs = self._request_for(later)
+            blocked_now = not res.admit(self.config, theirs, with_me, gpu=self._gpu_info()).admit
+            free_if_moved = res.admit(self.config, theirs, running, gpu=self._gpu_info()).admit
+            if blocked_now and free_if_moved:
+                return True
+        return False
+
+    def _choose_node(
+        self,
+        row: dict[str, Any],
+        queued: list[dict[str, Any]],
+        position: int,
+        local_ok: bool,
+    ) -> tuple[Any | None, str | None]:
+        """Pick a machine, or None to stay here.
+
+        Contention, not fit. The worker runs the same job more slowly, so
+        sending work there is a win only when it buys an earlier start - see
+        docs/multi-node.md 5.4.
+        """
+        backend_id = int(row["id"])
+        if not self.config.scheduling.auto_placement:
+            return None, None
+        raw = row.get("remote_spec_json")
+        if not raw:
+            self._placement_note(backend_id, "cannot travel: no remote spec")
+            return None, None
+        candidates = [n for n in self.config.nodes if n.enabled]
+        if not candidates:
+            return None, None
+        try:
+            spec = json.loads(raw)
+        except (TypeError, ValueError):
+            return None, None
+
+        # If this job can start here and moving it frees nothing, keep it: the
+        # local machine is faster and there is no transfer.
+        if local_ok:
+            if not self._would_block_the_queue(row, queued, position):
+                self._placement_note(
+                    backend_id, "keeping local: moving it would not free anything"
+                )
+                return None, None
+            self._placement_note(
+                backend_id, "it blocks a later job here, so looking for another machine"
+            )
+
+        reasons: list[str] = []
+        for node in candidates:
+            ready, why = self._repo_ready(node, spec)
+            if not ready:
+                reasons.append(why or f"{node.name} is not ready")
+                continue
+            admits, why = self._remote_admits(node, row)
+            if not admits:
+                reasons.append(why or f"{node.name} is busy")
+                continue
+            return node, None
+        if reasons:
+            self._placement_note(backend_id, "no node took it: " + "; ".join(reasons))
+        return None, "; ".join(reasons) if reasons else None
 
     # -- remote placement -------------------------------------------------
     #

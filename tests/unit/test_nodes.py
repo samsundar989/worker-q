@@ -298,3 +298,31 @@ def test_remote_scp_paths_use_forward_slashes(windows, expected):
     came back "No such file or directory" for a path that plainly existed.
     """
     assert nodes.scp_path(windows) == expected
+
+
+def test_changing_a_setting_does_not_delete_the_node_registry(tmp_path):
+    """It did, and it took a live node with it.
+
+    `to_dict()` deliberately excludes nodes - it feeds the dotted-key coercion
+    machinery, which is built for scalar keys in fixed sections. But both
+    mutation paths rebuilt a Config from that dict, so the first
+    `workerq config set` after registering a node silently wiped it, and the
+    dispatcher then had nowhere to place anything while `node list` still
+    showed the node online.
+    """
+    from workerq.config import set_dotted_and_save
+
+    config = Config(core=CoreConfig(state_dir=str(tmp_path)), source_path=tmp_path / "c.toml")
+    config.nodes = [NodeConfig(name="w1", address="host1")]
+    config.save()
+
+    updated = set_dotted_and_save(load_config(tmp_path / "c.toml"), "core.max_concurrent_jobs", 3)
+    assert updated.core.max_concurrent_jobs == 3
+    assert [n.name for n in updated.nodes] == ["w1"]
+    assert [n.name for n in load_config(tmp_path / "c.toml").nodes] == ["w1"]
+
+
+def test_with_overrides_also_keeps_the_registry(tmp_path):
+    config = Config(core=CoreConfig(state_dir=str(tmp_path)))
+    config.nodes = [NodeConfig(name="w1", address="host1")]
+    assert [n.name for n in config.with_overrides(core__max_concurrent_jobs=2).nodes] == ["w1"]
