@@ -187,7 +187,7 @@ _JOB_COLUMNS = (
     "preempted_at, preempted_by, preempted_reason, description, blocks, "
     "eta_seconds, command_signature, progress_fraction, progress_note, "
     "progress_updated_at, peak_ram_mib, peak_vram_mib, usage_samples, peak_source, "
-    "vram_source"
+    "vram_source, node"
 )
 
 #: Columns callers are allowed to update through `update_job`.
@@ -230,6 +230,7 @@ _UPDATABLE = frozenset(
         "peak_vram_mib",
         "usage_samples",
         "peak_source",
+        "node",
     }
 )
 

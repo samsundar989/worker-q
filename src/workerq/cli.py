@@ -420,34 +420,54 @@ def _render_status(
         console.print("  workerq submit --project my-project -- python train.py")
         return
 
+    # The NODE column appears only on a machine that has somewhere else to
+    # send work. On a single-machine install it would be a column of dashes,
+    # and this table is already close to the width of a terminal.
+    show_node = bool(getattr(service.config, "nodes", None)) or any(
+        j.node for j in jobs
+    )
+
     table = Table(box=None, pad_edge=False, show_edge=False)
     table.add_column("ID", justify="right", style="bold")
     table.add_column("STATE")
     table.add_column("PRI")
     table.add_column("PROJECT")
     table.add_column("AGE/RUNTIME", justify="right")
+    if show_node:
+        table.add_column("NODE")
     table.add_column("GPU", justify="right")
     table.add_column("BE", justify="right")
     table.add_column("COMMAND")
 
-    width = max(30, console.width - 74)
+    width = max(30, console.width - (86 if show_node else 74))
     for job in jobs:
         command = truncate(job.display_command, width)
         wait_reason = None
         if job.state == JobState.QUEUED.value:
             wait_reason = service.queue_wait_reason(job)
-        table.add_row(
+        cells = [
             str(job.id),
             _state_text(job.state),
             Text(job.priority, style=PRIORITY_STYLES.get(job.priority, "")),
             job.project,
             _job_age_column(job),
+        ]
+        if show_node:
+            # "local" is spelled out rather than left blank: a blank cell reads
+            # as "unknown", and where a job ran is never unknown.
+            cells.append(
+                Text(job.node, style=theme.ACCENT) if job.node
+                else Text("local", style=theme.MUTED)
+            )
+        cells += [
             str(job.requested_gpu_count),
             str(job.backend_job_id if job.backend_job_id is not None else "-"),
             command,
-        )
+        ]
+        table.add_row(*cells)
         if wait_reason:
-            table.add_row("", "", "", "", "", "", "", Text(f"  ^ {wait_reason}", style="dim"))
+            blanks = [""] * (len(cells) - 1)
+            table.add_row(*blanks, Text(f"  ^ {wait_reason}", style="dim"))
 
     console.print(table)
 

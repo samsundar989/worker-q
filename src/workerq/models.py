@@ -180,6 +180,8 @@ class Job:
     #: which must not be read as "used nothing".
     peak_ram_mib: float | None = None
     vram_source: str | None = None
+    #: Machine this job ran on. None means the one that queued it.
+    node: str | None = None
     peak_vram_mib: float | None = None
     usage_samples: int = 0
     #: 'measured' (this job's own processes) or 'estimated' (machine telemetry).
@@ -273,6 +275,7 @@ class Job:
             "progress_updated_at": self.progress_updated_at,
             "peak_ram_mib": self.peak_ram_mib,
             "vram_source": self.vram_source,
+            "node": self.node,
             "peak_vram_mib": self.peak_vram_mib,
             "usage_samples": self.usage_samples,
             "peak_source": self.peak_source,

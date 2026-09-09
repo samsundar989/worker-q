@@ -1492,6 +1492,14 @@ class GPUQService:
         except Exception:
             return None
 
+        # Record where it ran before anything else. This is not a state change,
+        # so it has to happen before the early return below - otherwise a job
+        # that goes straight to RUNNING on another machine and stays there is
+        # never marked as having left this one.
+        placed_on = bjob.extra.get("node")
+        if mutate and placed_on and placed_on != job.node:
+            self.db.update_job(job.id, node=str(placed_on))
+
         target = map_backend_state(bjob.state, bjob.exit_code)
         if target is None or target is job.state_enum:
             return None

@@ -484,5 +484,11 @@ def row_to_backend_job(row: dict[str, Any]) -> BackendJob:
             "preemptible": bool(row.get("preemptible")),
             "preempt_requested": bool(row.get("preempt_requested")),
             "preempt_by": row.get("preempt_by"),
+            # Where the job is actually running. None means this machine, and
+            # core copies it onto the job record so `status` can say so - a
+            # remote job that looks identical to a local one is the whole
+            # monitoring problem a second machine creates.
+            "node": row.get("node"),
+            "remote_id": row.get("remote_id"),
         },
     )
