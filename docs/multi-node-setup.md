@@ -748,9 +748,31 @@ machines together.**
 > for why the fix is a protocol version and a build commit rather than a
 > version string.
 
-Upgrading over a live install has a known failure mode: `uv tool install` rolls
-back silently when something holds the shim. Stop the dispatcher first, and
-close any `workerq top`:
+Upgrading over a live install has a known failure mode, and on the worker it is
+worse than on the primary. There, `uv tool install` rolls back silently when
+something holds the shim. **Here it leaves a broken install** - the running
+dispatcher holds `Scripts/`, `uv` cannot remove it, and you get:
+
+```text
+error: failed to remove directory ...\uv\tools\worker-q\Scripts: Access is denied
+error: uv trampoline failed to canonicalize script path
+```
+
+`Scripts/` is then half-written and `workerq.exe` no longer runs, so the node
+goes unreachable and you cannot even use it to stop its own daemon. Recover by
+killing the daemon directly, reinstalling, and restarting via
+[4.3](#43-restarting-the-dispatcher-remotely):
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'"   # find -m workerq _daemon
+taskkill /PID <pid> /F
+```
+
+That is safe on this machine precisely because it is dedicated. On the primary
+a live `workerq.exe` is usually somebody's dashboard, and killing it is the
+wrong move.
+
+So: stop the dispatcher first, and close any `workerq top`:
 
 ```powershell
 workerq _stop-daemon
