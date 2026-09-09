@@ -2565,6 +2565,66 @@ def node_check(
     raise typer.Exit(0 if ok_all else 1)
 
 
+@node_app.command("drain")
+def node_drain(
+    name: str = typer.Argument(..., help="Node to stop sending work to."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Stop placing new work on a node. Running jobs are left alone.
+
+    For taking a machine down for maintenance without losing hours of work:
+    the node stays registered and its jobs keep running to completion, but
+    nothing new is sent. `workerq node enable` reverses it.
+
+    Cancelling the running jobs is deliberately *not* what this does. A drain
+    that killed work would be the same thing as `cancel`, and the reason to
+    drain is usually that you want the work to finish.
+    """
+    config = load_config()
+    node = _node_or_fail(config, name)
+    node.enabled = False
+    path = config.save()
+
+    running = 0
+    try:
+        service = get_service()
+        running = sum(
+            1
+            for job in service.list_jobs(state="RUNNING", limit=500, refresh=False)
+            if job.node == name
+        )
+        service.close()
+    except Exception:
+        pass
+
+    if json_output:
+        emit_json({"node": name, "enabled": False, "running": running, "config": str(path)})
+        return
+    console.print(f"[yellow]draining[/yellow] {name} - no new work will be placed there")
+    if running:
+        console.print(
+            f"  {running} job(s) still running there. They are left alone and will "
+            "finish;\n  watch them with [bold]workerq status[/bold]."
+        )
+    console.print(f"\n  Undo with [bold]workerq node enable {name}[/bold]")
+
+
+@node_app.command("enable")
+def node_enable(
+    name: str = typer.Argument(..., help="Node to start using again."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Start placing work on a drained node again."""
+    config = load_config()
+    node = _node_or_fail(config, name)
+    node.enabled = True
+    path = config.save()
+    if json_output:
+        emit_json({"node": name, "enabled": True, "config": str(path)})
+        return
+    console.print(f"[green]enabled[/green] {name} - it will be considered for placement")
+
+
 @node_app.command("stage")
 def node_stage(
     name: str = typer.Argument(..., help="Node to stage onto."),

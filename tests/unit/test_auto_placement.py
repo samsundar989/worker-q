@@ -129,3 +129,84 @@ def test_placement_notes_are_logged_once_per_decision(dispatcher):
     assert len(written) == 1
     dispatcher._placement_note(7, "something else happened")
     assert len(written) == 2
+
+
+# --------------------------------------------------------------------------
+# Refusing a node that is reachable but wrong (phase 6)
+# --------------------------------------------------------------------------
+
+
+def _report(**kw):
+    from workerq import nodes as nodemod
+
+    base = dict(name="w", protocol=nodemod.NODE_PROTOCOL_VERSION, version="1.3.0")
+    base.update(kw)
+    return nodemod.NodeReport(**base)
+
+
+def test_a_protocol_mismatch_stops_dispatch(dispatcher):
+    """Reachable and roomy is not the same as safe to send work to.
+
+    The wire format is one worker-q's JSON parsed by another, so a version gap
+    produces a parse error *after* the work has been queued on the far side.
+    """
+    from workerq import nodes as nodemod
+    from workerq.config import NodeConfig
+
+    node = NodeConfig(name="w", address="h")
+    remote = _report(protocol=nodemod.NODE_PROTOCOL_VERSION + 1)
+    ok, why = dispatcher._node_usable(node, remote)
+    assert not ok and "protocol" in why
+
+
+def test_a_differing_version_alone_does_not_stop_dispatch(dispatcher):
+    """That check already failed to notice a real skew, so it may not refuse."""
+    from workerq.config import NodeConfig
+
+    ok, _ = dispatcher._node_usable(NodeConfig(name="w", address="h"), _report(version="9.9.9"))
+    assert ok
+
+
+def test_a_badly_skewed_clock_stops_dispatch(dispatcher):
+    """Collecting a finished job's output compares file times against the node.
+
+    A clock minutes out silently collects the wrong files, which is worse than
+    refusing: the job reports success and the results are wrong.
+    """
+    from datetime import timedelta
+
+    from workerq.config import NodeConfig
+    from workerq.util import utcnow
+
+    remote = _report(remote_time=(utcnow() + timedelta(minutes=10)).isoformat())
+    ok, why = dispatcher._node_usable(NodeConfig(name="w", address="h"), remote)
+    assert not ok and "clock" in why
+
+
+def test_a_slightly_off_clock_is_tolerated(dispatcher):
+    """This is not about precision, only about being wrong enough to matter."""
+    from datetime import timedelta
+
+    from workerq.config import NodeConfig
+    from workerq.util import utcnow
+
+    remote = _report(remote_time=(utcnow() + timedelta(seconds=5)).isoformat())
+    ok, _ = dispatcher._node_usable(NodeConfig(name="w", address="h"), remote)
+    assert ok
+
+
+def test_a_node_that_reports_no_time_is_not_refused_for_it(dispatcher):
+    """Unknown is not the same as wrong."""
+    from workerq.config import NodeConfig
+
+    ok, _ = dispatcher._node_usable(NodeConfig(name="w", address="h"), _report())
+    assert ok
+
+
+def test_a_drained_node_is_not_offered_to_placement(dispatcher):
+    """Drain is for maintenance: stop sending work, do not kill any."""
+    from workerq.config import NodeConfig
+
+    dispatcher.config.nodes = [NodeConfig(name="w", address="h", enabled=False)]
+    chosen, _ = dispatcher._choose_node(row(1, cpus=8), [row(1, cpus=8)], 0, True)
+    assert chosen is None

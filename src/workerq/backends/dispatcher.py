@@ -164,6 +164,23 @@ _NODE_RELOAD_SECONDS = 15.0
 #: changes only when a human runs `workerq node stage`.
 _REPO_READY_SECONDS = 60.0
 
+#: How far two machines' clocks may differ before dispatch stops. Generous,
+#: because this is not about precision - it is about a clock that is wrong
+#: enough to pick the wrong files when collecting a finished job's output.
+_MAX_CLOCK_SKEW_SECONDS = 120.0
+
+
+def _clock_skew_seconds(remote_time: str | None) -> float | None:
+    """Remote clock minus ours, in seconds. None when it cannot be told."""
+    if not remote_time:
+        return None
+    from workerq.util import parse_iso, utcnow
+
+    parsed = parse_iso(remote_time)
+    if parsed is None:
+        return None
+    return (parsed - utcnow()).total_seconds()
+
 
 class Dispatcher:
     def __init__(self, config: Config) -> None:
@@ -1165,6 +1182,42 @@ class Dispatcher:
             self._reports = nodemod.ReportCache()
         return self._reports.get(node)
 
+    def _node_usable(self, node: Any, report: Any) -> tuple[bool, str | None]:
+        """Is this node safe to send work to at all?
+
+        Separate from "does the job fit there". A node can have ample room and
+        still be the wrong place to send a job, and both of these are silent
+        failures rather than loud ones:
+
+        * **Protocol mismatch.** The wire format is one worker-q's JSON parsed
+          by another. Sending a job across a version gap produces a parse error
+          at the worst possible moment - after the work has been queued there.
+          Only the protocol number may refuse; a differing `__version__` is
+          reported and tolerated, because that check has already failed to
+          notice a real skew.
+        * **Clock skew.** Every timestamp that matters here crosses the link:
+          a job's runtime, and the marker deciding which files a finished job
+          wrote. A node whose clock is minutes off will silently collect the
+          wrong files, so a large skew stops dispatch rather than corrupting
+          results quietly.
+        """
+        from workerq import nodes as nodemod
+
+        local = nodemod.local_report(self.config)
+        ok, why = nodemod.compatibility(local, report)
+        if not ok:
+            return False, f"{node.name}: {why}"
+
+        skew = _clock_skew_seconds(report.remote_time)
+        if skew is not None and abs(skew) > _MAX_CLOCK_SKEW_SECONDS:
+            return False, (
+                f"{node.name}: its clock is {abs(skew):.0f}s "
+                f"{'ahead of' if skew > 0 else 'behind'} this machine. "
+                "Output collection compares file times against it, so results "
+                "would be picked wrongly. Fix the clock (w32tm /resync)"
+            )
+        return True, None
+
     def _remote_admits(self, node: Any, row: dict[str, Any]) -> tuple[bool, str | None]:
         """Would that machine start this job right now?
 
@@ -1180,6 +1233,9 @@ class Dispatcher:
         report = self._node_report(node)
         if not report.online:
             return False, f"node {node.name} is unreachable ({report.error})"
+        usable, why = self._node_usable(node, report)
+        if not usable:
+            return False, why
         snapshot = report.snapshot(self.config)
         if snapshot is None:
             return False, f"node {node.name} reported no capacity"
