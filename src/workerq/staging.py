@@ -370,6 +370,94 @@ def build_bundle(repo_root: Path, ref: str, bases: list[str], dest: Path) -> Pat
     return dest
 
 
+
+#: Creates the passthrough links inside a materialised worktree.
+#:
+#: Mirrors `snapshot.apply_passthrough`, including its most important rule: an
+#: entry whose destination already exists in the snapshot is skipped, never
+#: replaced. Several projects here keep a tracked `.gitkeep` or `README.md`
+#: inside an otherwise-ignored directory, so the directory *does* exist in the
+#: snapshot and linking over it would hide tracked files.
+_LINK_SCRIPT = r'''
+param([string]$Live, [string]$Work, [string]$Entries)
+foreach ($rel in ($Entries -split '\|')) {
+  if (-not $rel) { continue }
+  $src  = Join-Path $Live $rel
+  $dest = Join-Path $Work $rel
+  if (-not (Test-Path -LiteralPath $src)) { Write-Output "SKIP_NOSRC $rel"; continue }
+  if (Test-Path -LiteralPath $dest)       { Write-Output "SKIP_EXISTS $rel"; continue }
+  $parent = Split-Path $dest -Parent
+  if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+    New-Item -ItemType Directory -Force -Path $parent | Out-Null
+  }
+  try {
+    if ((Get-Item -LiteralPath $src) -is [System.IO.DirectoryInfo]) {
+      New-Item -ItemType Junction -Path $dest -Target $src -ErrorAction Stop | Out-Null
+      Write-Output "JUNCTION $rel"
+    } else {
+      New-Item -ItemType HardLink -Path $dest -Target $src -ErrorAction Stop | Out-Null
+      Write-Output "HARDLINK $rel"
+    }
+  } catch {
+    try { Copy-Item -LiteralPath $src -Destination $dest -Recurse -Force -ErrorAction Stop
+          Write-Output "COPIED $rel" }
+    catch { Write-Output ("FAILED " + $rel + " :: " + $_.Exception.Message) }
+  }
+}
+'''
+
+
+def link_passthrough(
+    node: NodeConfig, repo_root: Path, worktree: str, entries: list[str]
+) -> dict[str, str]:
+    """Link the node's live data into a worktree, the way a local job gets it.
+
+    Without this the worktree is source-only. Verifying the data exists on the
+    node says nothing about the job being able to *see* it, and a job that
+    cannot see its dataset fails in a way that looks like worker-q losing it.
+
+    Links, never copies, wherever Windows allows: these are the same 80 GB
+    datasets the whole design exists to avoid moving. A copy is the last-resort
+    fallback for the cases junctions and hard links refuse, such as a file on a
+    different volume.
+    """
+    result: dict[str, str] = {}
+    if not entries:
+        return result
+
+    live = remote_repo_path(node, repo_root)
+    stage_dir = expand_remote(node, REMOTE_STAGE_DIR)
+    script_path = f"{stage_dir}\\link-{abs(hash(worktree)) % 10**8}.ps1"
+
+    with tempfile.TemporaryDirectory(prefix="workerq-link-") as tmp:
+        local = Path(tmp) / "link.ps1"
+        local.write_text(_LINK_SCRIPT, encoding="utf-8")
+        nodes.run_remote(node, f"mkdir {_q(stage_dir)} 2>nul & exit /b 0")
+        sent = nodes.copy_to_node(node, local, script_path)
+        if not sent.ok:
+            raise StagingError(f"could not send the linker: {sent.error}")
+
+    joined = "|".join(e.replace("/", "\\") for e in entries)
+    run = nodes.run_remote(
+        node,
+        "powershell -NoProfile -ExecutionPolicy Bypass -File "
+        f'{_q(script_path)} -Live {_q(live)} -Work {_q(worktree)} -Entries "{joined}"',
+        timeout=max(node.timeout_seconds, 600.0),
+    )
+    nodes.run_remote(node, f"del {_q(script_path)} 2>nul & exit /b 0")
+    if not run.ok:
+        raise StagingError(f"could not link passthrough data: {run.error}")
+
+    for line in run.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2:
+            result[parts[1].replace("\\", "/")] = parts[0]
+    failed = [k for k, v in result.items() if v == "FAILED"]
+    if failed:
+        raise StagingError(f"could not link {', '.join(failed[:3])} on {node.name}")
+    return result
+
+
 def ship_snapshot(
     node: NodeConfig,
     repo_root: Path,
@@ -377,6 +465,7 @@ def ship_snapshot(
     job_id: int,
     commit: str,
     ref: str | None = None,
+    passthrough: list[str] | None = None,
 ) -> dict[str, Any]:
     """Put one snapshot commit on the node and materialise a worktree for it.
 
@@ -425,6 +514,12 @@ def ship_snapshot(
     if not already:
         nodes.run_remote(node, f"del {_q(remote_bundle)} 2>nul & exit /b 0")
 
+    # The worktree is source only until this runs. `git worktree add` knows
+    # nothing about passthrough, and the remote submission uses
+    # --live-worktree, which deliberately applies none - so without this the
+    # job cannot see its own dataset or venv.
+    linked = link_passthrough(node, repo_root, worktree, list(passthrough or []))
+
     return {
         "node": node.name,
         "worktree": worktree,
@@ -433,23 +528,86 @@ def ship_snapshot(
         "bundle_bytes": size,
         "already_present": already,
         "bases_used": len(bases),
+        "linked": linked,
     }
 
 
-def remove_worktree(node: NodeConfig, repo_root: Path, job_id: int) -> bool:
-    """Drop a materialised snapshot. Best-effort; the node's own cleanup owns it.
+#: Detaches every junction and symlink in a tree, without following any.
+#:
+#: `Directory.Delete(path, false)` removes the link itself; anything recursive
+#: - including `Remove-Item -Recurse` and git's own cleanup - walks *through* a
+#: junction and deletes the target.
+_UNLINK_SCRIPT = r'''
+param([string]$Work)
+if (-not (Test-Path -LiteralPath $Work)) { Write-Output "NOTREE"; exit 0 }
+$found = 0
+# Deepest first, so removing a link never invalidates a path still to visit.
+$items = Get-ChildItem -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue |
+         Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint } |
+         Sort-Object { $_.FullName.Length } -Descending
+foreach ($i in $items) {
+  try {
+    if ($i.PSIsContainer) { [System.IO.Directory]::Delete($i.FullName, $false) }
+    else                  { [System.IO.File]::Delete($i.FullName) }
+    $found++
+  } catch { Write-Output ("UNLINK_FAILED " + $i.FullName) }
+}
+Write-Output ("UNLINKED " + $found)
+'''
 
-    Uses `git worktree remove`, never a recursive delete: passthrough entries
-    are junctions back to live data, and following one would destroy a dataset
-    the primary cannot see and did not put there.
+
+def remove_worktree(node: NodeConfig, repo_root: Path, job_id: int) -> bool:
+    """Drop a materialised snapshot without destroying what it links to.
+
+    Every junction is detached **before** anything recursive runs. This is not
+    a precaution, it is a repair: the first version went straight to
+    `git worktree remove --force`, which follows reparse points, and it emptied
+    a staged `.cache` through its junction on a real node before erroring out.
+    Had the tree been biohub's, it would have taken 80 GB of dataset with it.
+
+    Locally the same rule has always applied - `snapshot.unlink_reparse_points`
+    runs before any removal, guarded by
+    `test_cleanup_does_not_delete_live_passthrough_data`, which exists because
+    an earlier local implementation made this exact mistake.
+
+    Returns False rather than raising: failing to clean up a worktree costs
+    disk, and is never worth taking a job down for.
     """
     remote_repo = remote_repo_path(node, repo_root)
     worktree = f"{remote_repo}\\.gpuq-work\\job-{job_id:06d}"
+    stage_dir = expand_remote(node, REMOTE_STAGE_DIR)
+    script_path = f"{stage_dir}\\unlink-{job_id:06d}.ps1"
+
+    with tempfile.TemporaryDirectory(prefix="workerq-unlink-") as tmp:
+        local = Path(tmp) / "unlink.ps1"
+        local.write_text(_UNLINK_SCRIPT, encoding="utf-8")
+        nodes.run_remote(node, f"mkdir {_q(stage_dir)} 2>nul & exit /b 0")
+        sent = nodes.copy_to_node(node, local, script_path)
+        if not sent.ok:
+            # Without the unlink step, removal is not safe to attempt at all.
+            return False
+
+    unlink = nodes.run_remote(
+        node,
+        "powershell -NoProfile -ExecutionPolicy Bypass -File "
+        f"{_q(script_path)} -Work {_q(worktree)}",
+        timeout=max(node.timeout_seconds, 300.0),
+    )
+    nodes.run_remote(node, f"del {_q(script_path)} 2>nul & exit /b 0")
+    if not unlink.ok or "UNLINK_FAILED" in unlink.stdout:
+        # A junction that could not be detached must not be walked through.
+        return False
+
     result = nodes.run_remote(
         node,
-        f"cd /d {_q(remote_repo)} && git worktree remove --force {_q(worktree)}",
+        f"git -C {_q(remote_repo)} worktree remove --force {_q(worktree)}",
+        timeout=max(node.timeout_seconds, 300.0),
     )
-    return result.ok
+    if not result.ok:
+        # The links are already gone, so a plain delete cannot reach live data.
+        nodes.run_remote(node, f"rmdir /s /q {_q(worktree)} 2>nul & exit /b 0")
+        nodes.run_remote(node, f"git -C {_q(remote_repo)} worktree prune")
+    return True
 
 
 # --------------------------------------------------------------------------

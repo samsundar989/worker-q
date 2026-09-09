@@ -1339,6 +1339,7 @@ class Dispatcher:
                 job_id=origin_job_id,
                 commit=spec_data["snapshot_commit"],
                 ref=spec_data.get("snapshot_ref"),
+                passthrough=list(spec_data.get("passthrough") or []),
             )
             spec = remotemod.JobSpec(
                 project=spec_data.get("project") or "unknown",

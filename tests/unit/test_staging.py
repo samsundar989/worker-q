@@ -277,3 +277,77 @@ def test_every_passthrough_path_is_checked_in_one_call(monkeypatch, tmp_path):
     assert status.passthrough == {".venv": True, "data/train": False, "models/clean": True}
     assert status.missing == ["data/train"]
     assert not status.ready
+
+
+# --------------------------------------------------------------------------
+# Removing a worktree must not destroy what it links to
+# --------------------------------------------------------------------------
+
+
+def test_junctions_are_detached_before_anything_recursive_runs(monkeypatch, tmp_path):
+    """The local rule, applied to the remote path, after it was learned twice.
+
+    `git worktree remove --force` deletes recursively and follows reparse
+    points. The first version of this went straight to it and emptied a staged
+    `.cache` through its junction on a real node; had the tree been biohub's it
+    would have taken 80 GB of dataset with it.
+
+    Locally the same mistake was made once before, which is why
+    `snapshot.unlink_reparse_points` exists and why
+    `test_cleanup_does_not_delete_live_passthrough_data` guards it.
+    """
+    order: list[str] = []
+
+    def record(node, command, *, timeout=None):
+        if "unlink-" in command and "powershell" in command:
+            order.append("unlink")
+            return RemoteResult(True, 0, "UNLINKED 3", "")
+        if "worktree remove" in command:
+            order.append("worktree-remove")
+        return RemoteResult(True, 0, "", "")
+
+    monkeypatch.setattr(staging, "origin_url", lambda _r: None)
+    monkeypatch.setattr(staging.nodes, "run_remote", record)
+    monkeypatch.setattr(
+        staging.nodes, "copy_to_node", lambda *a, **k: RemoteResult(True, 0, "", "")
+    )
+
+    assert staging.remove_worktree(node(), tmp_path / "proj", 42)
+    assert order.index("unlink") < order.index("worktree-remove")
+
+
+def test_a_junction_that_will_not_detach_stops_the_removal(monkeypatch, tmp_path):
+    """Better to leak a worktree than to walk through a link into live data."""
+
+    def refuse_unlink(node, command, *, timeout=None):
+        if "unlink-" in command and "powershell" in command:
+            return RemoteResult(True, 0, "UNLINK_FAILED some-path", "")
+        if "worktree remove" in command:
+            raise AssertionError("must not remove while a junction is still attached")
+        return RemoteResult(True, 0, "", "")
+
+    monkeypatch.setattr(staging, "origin_url", lambda _r: None)
+    monkeypatch.setattr(staging.nodes, "run_remote", refuse_unlink)
+    monkeypatch.setattr(
+        staging.nodes, "copy_to_node", lambda *a, **k: RemoteResult(True, 0, "", "")
+    )
+
+    assert staging.remove_worktree(node(), tmp_path / "proj", 42) is False
+
+
+def test_removal_is_abandoned_if_the_unlinker_cannot_be_sent(monkeypatch, tmp_path):
+    """No unlink step means removal is not safe to attempt at all."""
+
+    def fail_copy(*a, **k):
+        return RemoteResult(False, 1, "", "", "no route to host")
+
+    def guard(node, command, *, timeout=None):
+        if "worktree remove" in command:
+            raise AssertionError("must not remove without unlinking first")
+        return RemoteResult(True, 0, "", "")
+
+    monkeypatch.setattr(staging, "origin_url", lambda _r: None)
+    monkeypatch.setattr(staging.nodes, "run_remote", guard)
+    monkeypatch.setattr(staging.nodes, "copy_to_node", fail_copy)
+
+    assert staging.remove_worktree(node(), tmp_path / "proj", 42) is False
