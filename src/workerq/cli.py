@@ -2615,6 +2615,86 @@ def node_stage(
     raise typer.Exit(0 if status.ready else 1)
 
 
+@app.command("_submit-spec", hidden=True)
+def internal_submit_spec(
+    spec_path: str = typer.Argument(..., help="JSON job spec written by the dispatching machine."),
+    json_output: bool = typer.Option(True, "--json", help="Machine-readable output."),
+) -> None:
+    """Internal: queue a job described by a JSON file.
+
+    The receiving half of remote dispatch. A spec crosses as a *file* rather
+    than a command line for the same reason `_run` takes only a job id: user
+    argv would otherwise be re-quoted through ssh, cmd.exe and typer, and each
+    of those layers has its own edge cases with spaces, quotes and globs.
+
+    The tree at `cwd` is already a frozen snapshot, materialised by the sending
+    machine from a git bundle, so it is submitted `--live-worktree`. Snapshotting
+    it again would freeze a snapshot and lose the commit identity the primary
+    recorded against the job.
+    """
+    from workerq.core import SubmitRequest
+    from workerq.remote import SPEC_PROTOCOL, JobSpec
+
+    path = Path(spec_path).expanduser()
+    if not path.is_file():
+        fail(f"job spec not found: {path}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        fail(f"unreadable job spec {path}: {exc}")
+        return
+
+    protocol = data.get("protocol")
+    if protocol != SPEC_PROTOCOL:
+        # Refuse rather than guess. A spec from a newer worker-q may mean
+        # something different by a field it happens to share.
+        fail(
+            f"job spec protocol {protocol} != {SPEC_PROTOCOL}; the two machines "
+            "are running incompatible worker-q builds"
+        )
+        return
+
+    spec = JobSpec.from_dict(data)
+    if not Path(spec.cwd).is_dir():
+        fail(f"the spec's working directory does not exist here: {spec.cwd}")
+
+    service = get_service()
+    try:
+        result = service.submit(
+            SubmitRequest(
+                command=list(spec.argv),
+                project=spec.project,
+                priority=spec.priority,
+                gpus=spec.gpus,
+                label=spec.label,
+                cwd=spec.cwd,
+                live_worktree=True,
+                shell=spec.shell,
+                env=dict(spec.env or {}),
+                passthrough=list(spec.passthrough or []),
+                ram_gb=spec.ram_gb,
+                vram_gb=spec.vram_gb,
+                cpus=spec.cpus,
+                preemptible=spec.preemptible,
+                share_gpu=spec.share_gpu,
+                describe=spec.describe,
+                blocks=spec.blocks,
+                eta_seconds=spec.eta_seconds,
+            )
+        )
+    except Exception as exc:
+        fail(str(exc))
+        return
+    finally:
+        pass
+
+    payload = result.to_dict()
+    payload["origin_job_id"] = spec.origin_job_id
+    payload["origin_host"] = spec.origin_host
+    emit_json(payload)
+    service.close()
+
+
 @app.command("_node-report", hidden=True)
 def internal_node_report(
     json_output: bool = typer.Option(True, "--json", help="Machine-readable output."),
