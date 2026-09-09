@@ -199,10 +199,30 @@ possible* but *how much setup it needs*:
 | CUDA works in… | implication |
 | --- | --- |
 | console session (certain) | the design works; dispatcher starts at logon |
-| SSH session **with a console user logged in** | the dispatcher can also be started and restarted remotely — a real convenience |
+| SSH session **with a console user logged in** | jobs could be launched from SSH too — but see below, they should not be |
 | SSH session **with nobody logged in** | auto-logon is unnecessary; the machine can sit at the login screen |
 
 Only the first row is load-bearing. The other two remove manual steps.
+
+**Corrected after trying it.** An earlier draft of this section said the second
+row meant the dispatcher could be "started and restarted remotely". It cannot,
+not with `workerq restart`: a dispatcher started inside an SSH session **dies
+when that session ends**, even though it is spawned detached, because Windows
+OpenSSH tears down its session's processes on disconnect. The symptom is
+particularly unhelpful — `_dispatcher-status` reports a pid and a heartbeat
+that only *looks* fresh, for the thirty seconds before it goes stale.
+
+The remote restart that does work goes through the logon task, whose principal
+is `Interactive`, so the dispatcher lands in the console session where CUDA
+also works:
+
+```powershell
+ssh <node> schtasks /Run /TN "worker-q dispatcher"
+```
+
+`workerq restart` now warns when `SSH_CONNECTION` is set rather than appearing
+to succeed, and `workerq node check` flags a node whose dispatcher is down —
+reachable and compatible is not the same as able to run anything.
 
 Related, and not optional: **never dispatch over an RDP session.** RDP swaps in
 a dummy display driver and the NVIDIA driver is not activated. SSH sessions

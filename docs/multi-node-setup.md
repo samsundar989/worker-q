@@ -153,7 +153,9 @@ and launches every job from there; SSH carries only `submit`/`status`/`logs`/
 `cancel`, which never touch CUDA.
 
 - **A works** (expected): proceed.
-- **B also works**: the dispatcher can be restarted remotely — a convenience.
+- **B also works**: jobs *can* be launched over SSH. This does **not** mean the
+  dispatcher can be restarted that way — one started in an SSH session dies
+  with the session; see [4.3](#43-restarting-the-dispatcher-remotely).
 - **C also works**: no auto-logon needed; skip [1.5](#15-w-auto-logon-only-if-05c-failed).
 - **A fails**: stop. Something is wrong with the driver or card, unrelated to
   this project.
@@ -506,6 +508,39 @@ ssh desktop-unr95nb "%USERPROFILE%\.local\bin\workerq.exe doctor"
 ```
 
 The dispatcher should already be running, without anyone touching the machine.
+
+### 4.3 Restarting the dispatcher remotely
+
+`ssh <node> workerq restart` **does not work**, and fails in the worst way: it
+reports success, and the dispatcher dies as soon as the SSH session closes.
+Windows OpenSSH tears down its session's processes on disconnect, detached or
+not. For about thirty seconds afterwards `_dispatcher-status` still shows a pid
+and a `heartbeat_age_seconds` that has not yet gone stale, so the machine looks
+healthy while accepting nothing.
+
+Go through the logon task instead. Its principal is `Interactive`, so the
+dispatcher starts in the console session — which is also the only session where
+CUDA works:
+
+```powershell
+ssh desktop-unr95nb schtasks /Run /TN "worker-q dispatcher"
+```
+
+Verify:
+
+```powershell
+ssh desktop-unr95nb "%USERPROFILE%\.local\bin\workerq.exe _dispatcher-status"
+```
+
+`daemon_running` must be `true`. A fresh heartbeat on its own proves nothing —
+that is exactly what a just-killed dispatcher looks like.
+
+`workerq restart` now warns when it detects `SSH_CONNECTION` rather than
+appearing to succeed, `workerq node check` flags a node whose dispatcher is
+down, and `workerq node list` carries a `DISP` column — reachable and
+compatible is not the same as able to run anything.
+
+---
 
 ---
 

@@ -1344,6 +1344,22 @@ def restart(
     it only supervises - so this is safe while work is in flight. The new
     dispatcher adopts them again on the way up.
     """
+    # A dispatcher started inside an SSH session dies when that session ends,
+    # even though it is spawned detached: Windows OpenSSH tears down the
+    # session's processes on disconnect. Measured - a remote `restart` left a
+    # dead daemon with a heartbeat that only *looked* fresh for 30 seconds.
+    #
+    # This also happens to be the mechanism that keeps CUDA working, since the
+    # console session is the one with display access, so the fix is not to
+    # fight it but to start the dispatcher where it belongs.
+    if not json_output and (os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_CLIENT")):
+        console.print(
+            "[yellow]warning:[/yellow] this looks like an SSH session. A dispatcher "
+            "started here dies when the session ends,\n"
+            "         and a job it launched would have no CUDA access. Start it in "
+            "the console session instead:\n"
+            '         [bold]schtasks /Run /TN "worker-q dispatcher"[/bold]'
+        )
     service = get_service()
     service.ensure_ready()
     running = len(service.db.list_jobs(states=[JobState.RUNNING.value]))
@@ -2298,6 +2314,30 @@ node_app = typer.Typer(
 app.add_typer(node_app, name="node")
 
 
+def _local_report(config):
+    """This machine's report, with its queue and dispatcher state filled in.
+
+    Without a service the local row is strictly less informative than a remote
+    one, which reads as a bug in the remote path rather than a missing argument
+    in the local one.
+    """
+    from workerq import nodes as nodemod
+
+    service = None
+    try:
+        service = get_service()
+    except Exception:
+        service = None
+    try:
+        return nodemod.local_report(config, service)
+    finally:
+        if service is not None:
+            try:
+                service.close()
+            except Exception:
+                pass
+
+
 def _node_or_fail(config, name: str):
     node = config.node(name)
     if node is None:
@@ -2365,7 +2405,7 @@ def node_list(
     from workerq import nodes as nodemod
 
     config = load_config()
-    reports = [nodemod.local_report(config)]
+    reports = [_local_report(config)]
     for node in config.nodes:
         reports.append(
             nodemod.remote_report(node) if probe
@@ -2377,8 +2417,12 @@ def node_list(
         return
 
     table = Table(box=None, pad_edge=False, header_style=theme.MUTED)
-    for col in ("NODE", "STATE", "VERSION", "CPU", "RAM FREE", "GPU", "VRAM FREE", "RUN", "AGE"):
-        table.add_column(col, justify="right" if col in {"CPU", "RUN", "AGE"} else "left")
+    for col in ("NODE", "STATE", "VER", "CPU", "RAM", "GPU", "VRAM", "RUN", "DISP", "RTT"):
+        table.add_column(
+            col,
+            justify="right" if col in {"CPU", "RAM", "VRAM", "RUN", "RTT"} else "left",
+            no_wrap=True,
+        )
 
     # Offline reasons are printed under the table, not inside it. They are
     # sentences, and a sentence squeezed into a "RAM FREE" column wraps into
@@ -2388,13 +2432,24 @@ def node_list(
     for r in reports:
         if not r.online:
             problems.append((r.name, r.error or "unreachable"))
-            table.add_row(r.name, Text("offline", style="red"), "-", "-", "-", "-", "-", "-", "-")
+            table.add_row(
+                r.name, Text("offline", style="red"), *(["-"] * 8)
+            )
             continue
         mem = r.host_memory
         dev = (r.gpu.devices[0] if r.gpu and r.gpu.devices else None)
-        free_gb = f"{(mem.available_mib or 0) / 1024:.1f} / {(mem.total_mib or 0) / 1024:.0f} GiB" if mem else "-"
-        vram = (f"{(dev.memory_free_mib or 0) / 1024:.1f} / {(dev.memory_total_mib or 0) / 1024:.0f} GiB"
-                if dev else "-")
+        free_gb = (
+            f"{(mem.available_mib or 0) / 1024:.0f}/{(mem.total_mib or 0) / 1024:.0f}G"
+            if mem else "-"
+        )
+        vram = (
+            f"{(dev.memory_free_mib or 0) / 1024:.0f}/"
+            f"{(dev.memory_total_mib or 0) / 1024:.0f}G"
+            if dev else "-"
+        )
+        # A node whose dispatcher is down is reachable and useless, which the
+        # STATE column alone would not convey.
+        disp = r.daemon_running
         table.add_row(
             Text(r.name, style="bold" if r.is_local else None),
             Text("local" if r.is_local else "online", style="green"),
@@ -2404,7 +2459,10 @@ def node_list(
             (dev.name.replace("NVIDIA GeForce ", "") if dev else "-"),
             vram,
             str(len(r.running)),
-            "-" if r.is_local else f"{r.latency_seconds:.1f}s",
+            Text("up", style="green") if disp else (
+                Text("DOWN", style="bold red") if disp is False else Text("?", style=theme.MUTED)
+            ),
+            "-" if r.is_local else f"{(r.latency_seconds or 0):.1f}s",
         )
     console.print(table)
     for name, reason in problems:
@@ -2429,7 +2487,7 @@ def node_check(
     if not targets:
         fail("no nodes registered; add one with `workerq node add`")
 
-    local = nodemod.local_report(config)
+    local = _local_report(config)
     results = []
     ok_all = True
     for node in targets:
@@ -2455,8 +2513,22 @@ def node_check(
         console.print(f"       protocol    {remote_dict.get('protocol')} "
                       f"(this machine {local.protocol})")
         console.print(f"       hostname    {remote_dict.get('hostname')}")
-        console.print(f"       dispatcher  {remote_dict.get('daemon_running')}"
-                      f", {remote_dict.get('slots')} slot(s)")
+        daemon = remote_dict.get("daemon_running")
+        console.print(
+            f"       dispatcher  {daemon}, {remote_dict.get('slots')} slot(s)"
+        )
+        if daemon is False:
+            # Not a FAIL: the node is reachable and compatible, it simply is not
+            # going to run anything. Naming the fix matters because the obvious
+            # remedy - `ssh node workerq restart` - does not work.
+            console.print(
+                "       [yellow]note[/yellow] its dispatcher is not running, so it "
+                "would accept nothing.\n"
+                "            Restart it in the console session (an SSH-started one "
+                "dies with the session):\n"
+                '            [bold]ssh <node> schtasks /Run /TN "worker-q '
+                'dispatcher"[/bold]'
+            )
         if remote_dict.get("version") != local.version:
             console.print(
                 f"       [yellow]note[/yellow] versions differ. A matching version is "
