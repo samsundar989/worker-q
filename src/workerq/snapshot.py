@@ -550,6 +550,37 @@ def load_project_passthrough(repo_root: Path | None) -> list[str]:
     return [str(v) for v in values if str(v).strip()]
 
 
+def load_project_outputs(repo_root: Path | None) -> list[str]:
+    """Read `[snapshot] outputs` from a repository's `.gpuq.toml`.
+
+    Paths the job *writes* through, as opposed to reads. On one machine the
+    distinction does not matter and every entry is simply a junction to live
+    data - which is exactly what makes them dangerous across two machines,
+    because a write target that exists on both resolves on both and the job
+    succeeds while leaving its results somewhere nobody is looking.
+
+    Declaring them is what lets worker-q copy the results home instead.
+    """
+    if repo_root is None:
+        return []
+    path = expand_path(repo_root) / ".gpuq.toml"
+    if not path.exists():
+        return []
+    import tomllib
+
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+    section = data.get("snapshot")
+    if not isinstance(section, dict):
+        return []
+    values = section.get("outputs")
+    if not isinstance(values, list):
+        return []
+    return [str(v) for v in values if str(v).strip()]
+
+
 def load_project_defaults(repo_root: Path | None) -> dict:
     """Read optional `[project]` defaults from a repository's `.gpuq.toml`."""
     if repo_root is None:

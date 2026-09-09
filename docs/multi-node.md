@@ -1103,20 +1103,53 @@ only appear against a real machine:
   not, which made the rule look optional until a log that plainly existed came
   back "No such file or directory".
 
-### Phase 4b — output reconciliation
+### Phase 4b — output reconciliation ✅ done
 
 Promoted out of a footnote by the finding in [§8.6](#86-not-all-passthrough-is-alike-and-one-kind-diverges-silently):
 every project staged so far writes through a passthrough, so without this there
-is nothing that can safely be dispatched at all.
+was nothing that could safely be dispatched at all.
 
-- `[snapshot] outputs` in `.gpuq.toml`, read alongside `passthrough`.
-- A job declaring outputs is pinned local until its outputs can be returned.
-- On completion, the declared output paths are copied back from the worker
-  before the job is marked terminal — a job is not `SUCCEEDED` until its
-  results are where the submitter can see them.
-- An **absolute** output path that resolves on both machines is refused at
-  submit time with an explicit message. Silently writing to the wrong machine
-  is the one failure this design must not ship.
+**The dangerous case is refused before a job is placed.** `workerq/travel.py`
+scans the command for absolute paths *inside the repository* and refuses to let
+the job travel:
+
+> the command writes to an absolute path inside the repository:
+> `C:/Users/samsu/Documents/biohub/outputs/submission.csv`. That path exists on
+> the other machine too, so the job would succeed there and leave its output on
+> a machine you are not looking at.
+
+A pin to a named node fails at **submit** time rather than waiting in the queue
+against a message the submitter never sees. The check is deliberately narrow:
+an absolute path *outside* the repo is left alone, because a missing dataset
+fails loudly and that is the safe direction — it is only the paths that
+*resolve* on both machines that diverge silently.
+
+**What the job writes comes home.** `[snapshot] outputs` in `.gpuq.toml` is
+read alongside `passthrough`, travels in the job spec, and is collected when
+the job ends — before it is recorded as finished, because a job marked
+`SUCCEEDED` whose results are still on the other machine is the exact failure
+this phase exists to prevent.
+
+Two decisions in the collector are worth knowing:
+
+- **Only files modified after the job started come back.** A declared output
+  path is a junction to the node's *live* repository, so both machines have
+  their own copy of that directory and a wholesale copy would clobber one with
+  the other. Verified both ways: a file written during the job is collected, and
+  the same file with a marker set after it was written is not.
+- **The comparison happens on the node, against the node's own clock.**
+  Comparing a remote file's timestamp against this machine's clock would
+  silently include or drop files whenever the two disagree, and
+  [§8.4](#84-clock-skew) says they will.
+
+Results return as one archive rather than file by file: at 6.1 MB/s and ~540 ms
+per connection, a hundred small result files copied individually would spend a
+minute in handshakes to move a megabyte. Extraction refuses any archive member
+that would land outside the repository.
+
+Collection failing does not fail the job — the results still exist on the node
+— but it is logged as *"results are still on `<node>`… they are not lost"*
+rather than passing quietly.
 
 ### Phase 5 — automatic placement
 

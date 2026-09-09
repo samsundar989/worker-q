@@ -25,6 +25,7 @@ from workerq.backends.base import (
     BackendUnavailable,
 )
 from workerq.backends.local_dispatcher import LocalDispatcherBackend, build_backend
+from workerq import travel
 from workerq.config import LOCAL_NODE, Config, load_config
 from workerq.db import Database, json_dumps
 from workerq.eta import command_signature
@@ -44,6 +45,7 @@ from workerq.snapshot import (
     create_git_snapshot,
     find_repo_root,
     load_project_defaults,
+    load_project_outputs,
     load_project_passthrough,
     remove_snapshot,
 )
@@ -369,8 +371,23 @@ class GPUQService:
             # dispatcher never reads this database - that separation is what
             # keeps the backend swappable. A job with no git snapshot has no
             # commit to ship, so it can only ever run here and gets no spec.
+            outputs = load_project_outputs(repo_root)
+            verdict = travel.assess(
+                list(request.command),
+                repo_root,
+                outputs=outputs,
+                snapshot_commit=snapshot.commit,
+            )
+            # A pin to a named machine is a promise worker-q must either keep or
+            # refuse. Discovering at dispatch time that the job cannot travel
+            # would leave it queued against a message the submitter never sees.
+            if pinned_node and not verdict.ok:
+                raise GPUQError(
+                    f"job cannot run on {pinned_node}: " + "; ".join(verdict.reasons)
+                )
+
             remote_spec: dict[str, Any] | None = None
-            if snapshot.commit and repo_root is not None:
+            if snapshot.commit and repo_root is not None and verdict.ok:
                 remote_spec = {
                     "project": project,
                     "argv": list(request.command),
@@ -391,6 +408,7 @@ class GPUQService:
                     "eta_seconds": request.eta_seconds,
                     "env": dict(request.env or {}),
                     "passthrough": list(snapshot.passthrough or []),
+                    "outputs": list(outputs),
                 }
 
             backend_job_id = self.backend.submit(

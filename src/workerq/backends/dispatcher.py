@@ -1133,7 +1133,10 @@ class Dispatcher:
                 if code is None:
                     code = 0 if state == "SUCCEEDED" else 1
                 self._collect_remote_log(node, row, entry)
+                collected = self._collect_remote_outputs(node, row)
                 self.store.finish(backend_id, exit_code=int(code))
+                if collected:
+                    self.log(f"job {backend_id}: {collected}")
                 self.log(f"job {backend_id}: finished on {node_name} exit={code}")
                 self.telemetry.record_event(
                     EVENT_FINISHED,
@@ -1141,6 +1144,53 @@ class Dispatcher:
                     detail=f"remote:{node_name} exit {code}",
                     data={"exit_code": int(code), "node": node_name},
                 )
+
+    def _collect_remote_outputs(self, node: Any, row: dict[str, Any]) -> str | None:
+        """Bring back what the job wrote, before it is recorded as finished.
+
+        Order matters. A job marked SUCCEEDED whose results are still on the
+        other machine is the failure this whole phase exists to prevent, so
+        collection happens first and its outcome is logged either way - a
+        silent partial success is worse than a loud one.
+        """
+        from workerq import staging
+
+        raw = row.get("remote_spec_json")
+        if not raw:
+            return None
+        try:
+            spec = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        outputs = list(spec.get("outputs") or [])
+        if not outputs:
+            return None
+
+        started = row.get("started_at")
+        if not started:
+            return None
+        try:
+            result = staging.collect_outputs(
+                node,
+                Path(spec["repo_root"]),
+                outputs,
+                job_id=int(spec.get("origin_job_id") or row["id"]),
+                since_utc=str(started),
+            )
+        except Exception as exc:
+            return f"could not collect results from {node.name}: {exc}"
+
+        if result.get("error"):
+            return (
+                f"results are still on {node.name}: {result['error']}. "
+                "They are not lost - fetch them by hand"
+            )
+        if not result.get("collected"):
+            return f"declared outputs, but nothing was written on {node.name}"
+        return (
+            f"collected {result['collected']} output file(s) from {node.name} "
+            f"({result['bytes']} bytes)"
+        )
 
     def _collect_remote_log(self, node: Any, row: dict[str, Any], entry: dict[str, Any]) -> None:
         """Bring a finished remote job's log home.

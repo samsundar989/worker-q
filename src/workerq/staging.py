@@ -459,3 +459,135 @@ def verify_passthrough(
     if not entries:
         return {}
     return inspect_repo(node, repo_root, entries).passthrough
+
+
+# --------------------------------------------------------------------------
+# Bringing results home
+# --------------------------------------------------------------------------
+
+#: Written next to the collected archive so the two halves cannot disagree
+#: about which files were considered.
+_COLLECT_SCRIPT = r'''
+param([string]$Root, [string]$Stage, [string]$Zip, [string]$SinceUtc, [string]$Paths)
+$since = [datetime]::Parse($SinceUtc).ToUniversalTime()
+Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue
+Remove-Item -Force $Zip -ErrorAction SilentlyContinue
+$count = 0
+foreach ($rel in ($Paths -split '\|')) {
+  if (-not $rel) { continue }
+  $src = Join-Path $Root $rel
+  if (-not (Test-Path $src)) { continue }
+  $items = if ((Get-Item $src).PSIsContainer) {
+    Get-ChildItem -LiteralPath $src -Recurse -File -Force -ErrorAction SilentlyContinue
+  } else { Get-Item -LiteralPath $src }
+  foreach ($f in $items) {
+    if ($f.LastWriteTimeUtc -le $since) { continue }
+    $r = $f.FullName.Substring($Root.Length).TrimStart('\')
+    $dest = Join-Path $Stage $r
+    New-Item -ItemType Directory -Force (Split-Path $dest) | Out-Null
+    Copy-Item -LiteralPath $f.FullName -Destination $dest -Force
+    $count++
+  }
+}
+if ($count -gt 0) {
+  Compress-Archive -Path (Join-Path $Stage '*') -DestinationPath $Zip -Force
+  Write-Output "COLLECTED $count"
+} else {
+  Write-Output "COLLECTED 0"
+}
+'''
+
+
+def collect_outputs(
+    node: NodeConfig,
+    repo_root: Path,
+    outputs: list[str],
+    *,
+    job_id: int,
+    since_utc: str,
+) -> dict[str, Any]:
+    """Copy back what a remote job wrote, and only what it wrote.
+
+    A declared output path is a junction to the node's *live* repository, so a
+    job writing `runs/records/x.json` writes into the node's real tree, not
+    into the disposable worktree. Both machines therefore have their own copy
+    of that directory and a wholesale copy would clobber one with the other.
+
+    So only files modified after the job started come back. The comparison
+    happens **on the node**, against the node's own clock, because comparing a
+    remote file's timestamp against this machine's clock would silently include
+    or drop files whenever the two disagree - and they will.
+
+    They return as one archive rather than file by file: at 6.1 MB/s and
+    ~540 ms per connection, a hundred small result files copied individually
+    would cost a minute of handshakes to move a megabyte.
+    """
+    result: dict[str, Any] = {
+        "collected": 0, "bytes": 0, "paths": list(outputs), "error": None,
+    }
+    if not outputs:
+        return result
+
+    remote_repo = remote_repo_path(node, repo_root)
+    stage_dir = expand_remote(node, REMOTE_STAGE_DIR)
+    remote_stage = f"{stage_dir}\out-{job_id:06d}"
+    remote_zip = f"{stage_dir}\out-{job_id:06d}.zip"
+    remote_script = f"{stage_dir}\collect-{job_id:06d}.ps1"
+
+    with tempfile.TemporaryDirectory(prefix="workerq-collect-") as tmp:
+        script = Path(tmp) / "collect.ps1"
+        script.write_text(_COLLECT_SCRIPT, encoding="utf-8")
+        nodes.run_remote(node, f"mkdir {_q(stage_dir)} 2>nul & exit /b 0")
+        sent = nodes.copy_to_node(node, script, remote_script)
+        if not sent.ok:
+            result["error"] = f"could not send the collector: {sent.error}"
+            return result
+
+        joined = "|".join(p.replace("/", "\\") for p in outputs)
+        run = nodes.run_remote(
+            node,
+            "powershell -NoProfile -ExecutionPolicy Bypass -File "
+            f'{_q(remote_script)} -Root {_q(remote_repo)} -Stage {_q(remote_stage)} '
+            f'-Zip {_q(remote_zip)} -SinceUtc "{since_utc}" -Paths "{joined}"',
+            timeout=max(node.timeout_seconds, 600.0),
+        )
+        if not run.ok:
+            result["error"] = f"collector failed: {run.error}"
+            return result
+
+        match = re.search(r"COLLECTED\s+(\d+)", run.stdout)
+        count = int(match.group(1)) if match else 0
+        result["collected"] = count
+        if count == 0:
+            nodes.run_remote(node, f"rmdir /s /q {_q(remote_stage)} 2>nul & exit /b 0")
+            return result
+
+        local_zip = Path(tmp) / "out.zip"
+        got = nodes.copy_from_node(node, remote_zip, local_zip)
+        if not got.ok or not local_zip.exists():
+            result["error"] = f"could not retrieve results: {got.error}"
+            return result
+        result["bytes"] = local_zip.stat().st_size
+
+        import zipfile
+
+        try:
+            with zipfile.ZipFile(local_zip) as archive:
+                # Never write outside the repository, whatever the archive says.
+                root = repo_root.resolve()
+                for member in archive.namelist():
+                    target = (root / member).resolve()
+                    if not str(target).startswith(str(root)):
+                        result["error"] = f"refused a path outside the repo: {member}"
+                        return result
+                archive.extractall(root)
+        except (OSError, zipfile.BadZipFile) as exc:
+            result["error"] = f"could not unpack results: {exc}"
+            return result
+
+    nodes.run_remote(
+        node,
+        f"rmdir /s /q {_q(remote_stage)} 2>nul & del {_q(remote_zip)} 2>nul & "
+        f"del {_q(remote_script)} 2>nul & exit /b 0",
+    )
+    return result
