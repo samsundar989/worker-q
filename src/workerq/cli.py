@@ -18,7 +18,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from workerq import __version__
+from workerq import __version__, theme
 from workerq.config import (
     ConfigError,
     Config,
@@ -49,15 +49,9 @@ app = typer.Typer(
 console = Console()
 err_console = Console(stderr=True)
 
-STATE_STYLES = {
-    "RUNNING": "bold green",
-    "QUEUED": "yellow",
-    "PREPARING": "cyan",
-    "SUCCEEDED": "green",
-    "FAILED": "bold red",
-    "CANCELLED": "magenta",
-    "LOST": "red",
-}
+#: Shared with `workerq top`, so a job is not one colour in the queue view
+#: and another in the dashboard. See workerq.theme.
+STATE_STYLES = theme.STATE_STYLES
 
 PRIORITY_STYLES = {
     "critical": "bold red",
