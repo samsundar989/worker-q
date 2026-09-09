@@ -879,7 +879,7 @@ and worker-q's rule becomes: **a job that declares outputs either runs on the
 primary, or has those outputs pulled back on completion.** Because every project
 here has write targets, this is not a refinement to add later — it is a
 prerequisite for dispatching anything, which is why it is now
-[Phase 4b](#phase-4b--output-reconciliation) rather than a footnote.
+[Phase 4b](#phase-4b--output-reconciliation--done) rather than a footnote.
 ---
 
 ## 9. CLI surface
