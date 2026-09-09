@@ -76,6 +76,8 @@ class SchedulerBackend(Protocol):
         cpus: int | None = None,
         preemptible: bool = False,
         gpu_mode: str = "exclusive",
+        pinned_node: str | None = None,
+        remote_spec: dict[str, Any] | None = None,
     ) -> int: ...
 
     def list_jobs(self) -> list[BackendJob]: ...

@@ -72,6 +72,18 @@ _ADDED_COLUMNS = (
     # Whether this job will share a GPU with another. The dispatcher needs it
     # for placement, so it has to live here and not only in the jobs table.
     ("gpu_mode", "TEXT NOT NULL DEFAULT 'exclusive'"),
+    # Multi-node. `pinned_node` is what the submitter asked for (NULL means
+    # worker-q chooses); `node` is where the job actually went, set when it
+    # starts (NULL means this machine). They are separate because a pin is a
+    # constraint and a placement is a decision, and from phase 5 on they will
+    # routinely differ.
+    ("pinned_node", "TEXT"),
+    ("node", "TEXT"),
+    ("remote_id", "INTEGER"),
+    # Everything a remote dispatch needs, written by core at enqueue time.
+    # The dispatcher never reads the core database - that separation is what
+    # keeps the backend swappable - so the row has to be self-contained.
+    ("remote_spec_json", "TEXT"),
 )
 
 _COLUMNS = (
@@ -79,7 +91,7 @@ _COLUMNS = (
     "log_path, state, exit_code, pid, pid_creation, assigned_devices, cancel_requested, "
     "cancel_force, cancel_at, wait_reason, enqueued_at, started_at, finished_at, "
     "ram_mib, vram_mib, cpus, preemptible, preempt_requested, preempt_by, preempt_at, "
-    "gpu_mode"
+    "gpu_mode, pinned_node, node, remote_id, remote_spec_json"
 )
 
 
@@ -164,6 +176,8 @@ class QueueStore:
         cpus: int | None = None,
         preemptible: bool = False,
         gpu_mode: str = "exclusive",
+        pinned_node: str | None = None,
+        remote_spec: dict[str, Any] | None = None,
     ) -> int:
         with self.transaction() as conn:
             row = conn.execute("SELECT COALESCE(MAX(position), 0) AS p FROM bjobs").fetchone()
@@ -171,8 +185,8 @@ class QueueStore:
             cur = conn.execute(
                 "INSERT INTO bjobs (label, argv_json, cwd, env_json, gpu_count, slots, "
                 "priority_rank, position, log_path, state, enqueued_at, ram_mib, "
-                "vram_mib, cpus, preemptible, gpu_mode) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "vram_mib, cpus, preemptible, gpu_mode, pinned_node, remote_spec_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     label,
                     json.dumps(argv, ensure_ascii=False),
@@ -190,6 +204,8 @@ class QueueStore:
                     cpus,
                     1 if preemptible else 0,
                     gpu_mode,
+                    pinned_node,
+                    json.dumps(remote_spec, ensure_ascii=False) if remote_spec else None,
                 ),
             )
             return int(cur.lastrowid)
@@ -253,6 +269,37 @@ class QueueStore:
                 (BACKEND_RUNNING, utcnow_iso(), backend_id, BACKEND_QUEUED),
             )
             return cur.rowcount == 1
+
+    def claim_for_remote_start(self, backend_id: int, node: str, remote_id: int) -> bool:
+        """Mark a job as running on `node`, atomically.
+
+        The same conditional update as `claim_for_start` and for the same
+        reason - two dispatchers could not double-start a job even if two
+        somehow existed. It records the placement in the same statement that
+        claims it, so there is no window in which a job is RUNNING with nothing
+        saying where.
+        """
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE bjobs SET state = ?, started_at = ?, node = ?, remote_id = ?, "
+                "wait_reason = NULL WHERE id = ? AND state = ?",
+                (BACKEND_RUNNING, utcnow_iso(), node, int(remote_id), backend_id, BACKEND_QUEUED),
+            )
+            return cur.rowcount == 1
+
+    def remote_running(self) -> list[dict[str, Any]]:
+        """Jobs executing on another machine.
+
+        Deliberately not part of `running()`'s accounting use: their footprint
+        is on the other machine, so counting them against this one's headroom
+        would idle the local GPU for work that is not here.
+        """
+        rows = self.conn.execute(
+            f"SELECT {_COLUMNS} FROM bjobs WHERE state = ? AND node IS NOT NULL "
+            "ORDER BY id",
+            (BACKEND_RUNNING,),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def finish(self, backend_id: int, exit_code: int | None) -> None:
         with self.transaction() as conn:

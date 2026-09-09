@@ -1090,12 +1090,7 @@ node awareness in its dispatch loop, and remote jobs are excluded from local
 slot and reservation accounting, because their footprint is on the other
 machine.
 
-#### Still to do in this phase
-
-The dispatcher integration itself: a `node` column on `bjobs`, remote start
-inside `_start_ready_jobs`, remote reaping, and exclusion from local
-accounting. The lifecycle it will drive is proven; what is missing is the loop
-that drives it.
+#### Path bugs found here
 
 Two more path bugs of the same family were found and fixed here, both of which
 only appear against a real machine:

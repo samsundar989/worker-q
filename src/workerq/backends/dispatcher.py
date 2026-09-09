@@ -30,7 +30,7 @@ from typing import Any, TextIO
 
 from workerq.backends.base import BACKEND_QUEUED, BACKEND_RUNNING
 from workerq.backends.queue_store import QueueStore
-from workerq.config import Config
+from workerq.config import Config, load_config
 from workerq import host, resources as res
 from workerq.gpu import query_gpus
 from workerq.telemetry import (
@@ -148,6 +148,18 @@ class _RunningJob:
     cancel_signalled_at: float | None = None
 
 
+#: Remote job states that mean "stop asking". Mirrors models.ALLOWED_TRANSITIONS
+#: having no successors for these, and deliberately excludes QUEUED and RUNNING
+#: - and anything unrecognised, so a state added by a newer worker-q is treated
+#: as "still going" rather than silently finished.
+_REMOTE_TERMINAL = frozenset({"SUCCEEDED", "FAILED", "CANCELLED", "LOST"})
+
+
+#: How often the node registry is re-read from the config file. Nodes are
+#: added by hand, so this only has to be faster than a person gets impatient.
+_NODE_RELOAD_SECONDS = 15.0
+
+
 class Dispatcher:
     def __init__(self, config: Config) -> None:
         self.config = config
@@ -176,6 +188,11 @@ class Dispatcher:
         #: Consecutive samples under the memory floor, for the pressure guard.
         self._pressure_strikes = 0
         self._stop = False
+        #: Node reports, cached with their age. Built lazily: a single-machine
+        #: install must not pay for multi-node machinery it never uses.
+        self._reports: Any | None = None
+        #: When the node registry was last re-read from the config file.
+        self._nodes_loaded_at = 0.0
 
     # -- logging ----------------------------------------------------------
     def log(self, message: str) -> None:
@@ -838,6 +855,30 @@ class Dispatcher:
                     self._record_wait(int(rest["id"]), reason)
                 return
 
+            # A pinned job is judged against the machine it is pinned to,
+            # not this one. Its resources are not ours to account for.
+            pinned = row.get("pinned_node")
+            if pinned:
+                node = self.config.node(str(pinned))
+                if node is None or not node.enabled:
+                    self._record_wait(
+                        backend_id,
+                        f"pinned to {pinned}, which is not a registered, enabled node",
+                    )
+                    skipped += 1
+                    if skipped > sched.backfill_max_skip:
+                        return
+                    continue
+                ok, why = self._remote_admits(node, row)
+                if ok and self._start_remote(row, node):
+                    self._blocked.pop(backend_id, None)
+                else:
+                    self._record_wait(backend_id, why or f"waiting for {node.name}")
+                    skipped += 1
+                    if skipped > sched.backfill_max_skip:
+                        return
+                continue
+
             # Admission control: does this job's declared RAM/CPU/VRAM fit in
             # the headroom that is actually free, once running reservations and
             # foreign workloads are accounted for?
@@ -901,6 +942,225 @@ class Dispatcher:
                 self._blocked.pop(backend_id, None)
                 in_flight += 1
 
+
+    # -- remote placement -------------------------------------------------
+    #
+    # A remote job never enters `self.running` or `self.adopted`, so it is
+    # already excluded from local slot counting and from `_running_requests`.
+    # That is deliberate rather than incidental: its footprint is on the other
+    # machine, and charging it against this one's headroom would idle the 5090
+    # for work that is not here.
+
+    def _refresh_nodes(self) -> None:
+        """Re-read the node registry from disk.
+
+        Nodes live in the config file, which the dispatcher reads once at
+        start-up - so a node registered while it was running was invisible, and
+        a job pinned to it waited forever against a message saying it was not
+        registered. That is exactly the silent no-op the reserve and the slot
+        count are re-read every tick to avoid.
+
+        Cheap enough at this interval, and it only replaces the node list:
+        everything else still needs a deliberate `workerq restart`, because
+        changing it under a running scheduler is not obviously safe.
+        """
+        now = time.monotonic()
+        if now - self._nodes_loaded_at < _NODE_RELOAD_SECONDS:
+            return
+        self._nodes_loaded_at = now
+        try:
+            fresh = load_config(self.config.source_path, profile=self.config.profile)
+        except Exception as exc:
+            self.log(f"could not re-read the node registry: {exc}")
+            return
+        before = {n.name for n in self.config.nodes}
+        after = {n.name for n in fresh.nodes}
+        if before != after:
+            self.log(f"node registry changed: {sorted(before)} -> {sorted(after)}")
+            if self._reports is not None:
+                for gone in before - after:
+                    self._reports.invalidate(gone)
+        self.config.nodes = fresh.nodes
+
+    def _node_report(self, node: Any) -> Any:
+        from workerq import nodes as nodemod
+
+        if self._reports is None:
+            self._reports = nodemod.ReportCache()
+        return self._reports.get(node)
+
+    def _remote_admits(self, node: Any, row: dict[str, Any]) -> tuple[bool, str | None]:
+        """Would that machine start this job right now?
+
+        A prediction, made from a report up to `poll_interval_seconds` old and
+        judged with the very same `resources.admit()` the node itself will
+        re-run against live numbers before starting anything. So a stale
+        prediction fails safe: the node refuses, and the job is placed again on
+        a later tick rather than being wedged onto a machine that filled up.
+
+        This is also what keeps the promise that nodes never hold a backlog -
+        work is pushed only in the tick the node is expected to take it.
+        """
+        report = self._node_report(node)
+        if not report.online:
+            return False, f"node {node.name} is unreachable ({report.error})"
+        snapshot = report.snapshot(self.config)
+        if snapshot is None:
+            return False, f"node {node.name} reported no capacity"
+        decision = res.admit(
+            self.config,
+            self._request_for(row),
+            list(report.running),
+            node=snapshot,
+        )
+        if decision.admit:
+            return True, None
+        return False, f"on {node.name}: {decision.reason}"
+
+    def _start_remote(self, row: dict[str, Any], node: Any) -> bool:
+        """Ship this job's source to `node` and queue it there."""
+        from workerq import remote as remotemod
+        from workerq import staging
+
+        backend_id = int(row["id"])
+        raw = row.get("remote_spec_json")
+        if not raw:
+            self._record_wait(
+                backend_id,
+                "cannot run on another machine: no git snapshot to ship "
+                "(submitted --no-snapshot or --live-worktree)",
+            )
+            return False
+        try:
+            spec_data = json.loads(raw)
+        except (TypeError, ValueError):
+            self._record_wait(backend_id, "remote spec is unreadable")
+            return False
+
+        repo_root = Path(spec_data["repo_root"])
+        origin_job_id = int(spec_data.get("origin_job_id") or backend_id)
+        try:
+            shipped = staging.ship_snapshot(
+                node,
+                repo_root,
+                job_id=origin_job_id,
+                commit=spec_data["snapshot_commit"],
+                ref=spec_data.get("snapshot_ref"),
+            )
+            spec = remotemod.JobSpec(
+                project=spec_data.get("project") or "unknown",
+                argv=list(spec_data.get("argv") or []),
+                cwd=shipped["worktree"],
+                origin_job_id=origin_job_id,
+                ram_gb=spec_data.get("ram_gb"),
+                vram_gb=spec_data.get("vram_gb"),
+                cpus=spec_data.get("cpus"),
+                gpus=spec_data.get("gpus"),
+                preemptible=spec_data.get("preemptible"),
+                share_gpu=bool(spec_data.get("share_gpu")),
+                priority=spec_data.get("priority"),
+                shell=spec_data.get("shell"),
+                describe=spec_data.get("describe"),
+                blocks=spec_data.get("blocks"),
+                eta_seconds=spec_data.get("eta_seconds"),
+                env=dict(spec_data.get("env") or {}),
+                passthrough=list(spec_data.get("passthrough") or []),
+            )
+            submitted = remotemod.submit(node, spec)
+        except Exception as exc:
+            # Placement failing is not the job failing. It goes back to the
+            # queue with a reason and is tried again - possibly here.
+            self._record_wait(backend_id, f"could not place on {node.name}: {exc}")
+            self.log(f"job {backend_id}: placement on {node.name} failed: {exc}")
+            return False
+
+        remote_id = int(submitted["job_id"])
+        if not self.store.claim_for_remote_start(backend_id, node.name, remote_id):
+            # Something else claimed it first. Cancel what we just queued
+            # rather than leaving an orphan running on the node.
+            remotemod.cancel(node, remote_id, force=True)
+            return False
+
+        self.log(
+            f"job {backend_id}: placed on {node.name} as its job {remote_id} "
+            f"({shipped['bundle_bytes']} bytes shipped)"
+        )
+        self.telemetry.record_event(
+            EVENT_STARTED,
+            backend_job_id=backend_id,
+            detail=f"remote:{node.name}",
+            data={"node": node.name, "remote_id": remote_id,
+                  "bundle_bytes": shipped["bundle_bytes"]},
+        )
+        return True
+
+    def _reap_remote(self) -> None:
+        """Ask each node how its jobs are doing.
+
+        One call per node, not one per job: the connection is the cost. A node
+        that cannot be reached leaves its jobs RUNNING - unreachable is not
+        finished, and guessing otherwise is how a live training run gets
+        recorded as failed and started again somewhere else.
+        """
+        from workerq import remote as remotemod
+
+        rows = self.store.remote_running()
+        if not rows:
+            return
+        by_node: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            by_node.setdefault(str(row["node"]), []).append(row)
+
+        for node_name, node_rows in by_node.items():
+            node = self.config.node(node_name)
+            if node is None:
+                continue
+            try:
+                listing = remotemod.list_jobs(node)
+            except Exception as exc:
+                self.log(f"node {node_name}: could not be polled ({exc})")
+                continue
+            for row in node_rows:
+                backend_id = int(row["id"])
+                remote_id = row.get("remote_id")
+                entry = listing.get(int(remote_id)) if remote_id is not None else None
+                if entry is None:
+                    continue
+                state = str(entry.get("state") or "")
+                if state not in _REMOTE_TERMINAL:
+                    continue
+                code = entry.get("exit_code")
+                if code is None:
+                    code = 0 if state == "SUCCEEDED" else 1
+                self._collect_remote_log(node, row, entry)
+                self.store.finish(backend_id, exit_code=int(code))
+                self.log(f"job {backend_id}: finished on {node_name} exit={code}")
+                self.telemetry.record_event(
+                    EVENT_FINISHED,
+                    backend_job_id=backend_id,
+                    detail=f"remote:{node_name} exit {code}",
+                    data={"exit_code": int(code), "node": node_name},
+                )
+
+    def _collect_remote_log(self, node: Any, row: dict[str, Any], entry: dict[str, Any]) -> None:
+        """Bring a finished remote job's log home.
+
+        Best-effort by design: the log still exists on the node, so failing to
+        fetch it must never stop the job being recorded as finished. But
+        without this a job's output disappears the moment the worker is
+        switched off, and `workerq logs` would have nothing to show.
+        """
+        from workerq import remote as remotemod
+
+        local_path = row.get("log_path")
+        remote_path = entry.get("log_path")
+        if not local_path or not remote_path:
+            return
+        try:
+            remotemod.fetch_log(node, str(remote_path), Path(str(local_path)))
+        except Exception:
+            pass
+
     # -- reap -------------------------------------------------------------
     def _reap(self) -> None:
         for backend_id in list(self.running):
@@ -937,6 +1197,7 @@ class Dispatcher:
             )
 
         self._reap_adopted()
+        self._reap_remote()
 
     def _reap_adopted(self) -> None:
         """Reap jobs inherited from a previous dispatcher.
@@ -1046,6 +1307,7 @@ class Dispatcher:
                     self._last_tick = time.monotonic()
                     self._heartbeat()
                     self._sample_resources()
+                    self._refresh_nodes()
                     self._reap()
                     self._service_cancellations()
                     self._service_preemptions()

@@ -227,6 +227,12 @@ def submit(
         "--live-worktree",
         help="Run against the live directory (it may change before the job starts).",
     ),
+    node: Optional[str] = typer.Option(
+        None,
+        "--node",
+        help="Pin to one machine, e.g. --node 3080ti. 'local' keeps it here. "
+             "Omit to let worker-q choose.",
+    ),
     shell: Optional[str] = typer.Option(
         None, "--shell", help="Run a shell command string instead of an argv vector."
     ),
@@ -279,6 +285,7 @@ def submit(
         cwd=cwd,
         snapshot=snapshot,
         live_worktree=live_worktree,
+        node=node,
         shell=shell,
         env=env_map,
         passthrough=list(passthrough or []),

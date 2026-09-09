@@ -229,3 +229,27 @@ def fetch_log(node: NodeConfig, remote_log_path: str, dest: Path) -> bool:
     dest.parent.mkdir(parents=True, exist_ok=True)
     result = nodes.copy_from_node(node, remote_log_path, dest)
     return result.ok and dest.exists()
+
+
+def list_jobs(node: NodeConfig, limit: int = 500) -> dict[int, dict[str, Any]]:
+    """Every job the node knows about, keyed by its id.
+
+    One call for all of them. Polling per job would cost a whole SSH
+    connection each - about 540 ms - so a node running three jobs would spend
+    more time being asked than working.
+    """
+    result = nodes.run_remote(
+        node, f"{node.workerq_path} list --all --limit {int(limit)} --json"
+    )
+    if not result.ok:
+        raise RemoteJobError(result.error or "remote list failed")
+    payload = _json_object(result.stdout)
+    if payload is None:
+        raise RemoteJobError(f"unparseable reply: {result.out[:200]}")
+    out: dict[int, dict[str, Any]] = {}
+    for entry in payload.get("jobs", []):
+        try:
+            out[int(entry["id"])] = entry
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out

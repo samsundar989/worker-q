@@ -307,6 +307,8 @@ class LocalDispatcherBackend:
         cpus: int | None = None,
         preemptible: bool = False,
         gpu_mode: str = "exclusive",
+        pinned_node: str | None = None,
+        remote_spec: dict[str, Any] | None = None,
     ) -> int:
         """Enqueue an argv vector. No shell, no string concatenation."""
         argv = [str(a) for a in argv]
@@ -330,6 +332,8 @@ class LocalDispatcherBackend:
             cpus=cpus,
             preemptible=preemptible,
             gpu_mode=gpu_mode,
+            pinned_node=pinned_node,
+            remote_spec=remote_spec,
         )
 
     def list_jobs(self, *, limit: int | None = None) -> list[BackendJob]:

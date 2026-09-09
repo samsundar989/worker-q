@@ -25,7 +25,7 @@ from workerq.backends.base import (
     BackendUnavailable,
 )
 from workerq.backends.local_dispatcher import LocalDispatcherBackend, build_backend
-from workerq.config import Config, load_config
+from workerq.config import LOCAL_NODE, Config, load_config
 from workerq.db import Database, json_dumps
 from workerq.eta import command_signature
 from workerq.gpu import GpuInfo, query_gpus
@@ -113,6 +113,8 @@ class SubmitRequest:
     blocks: str | None = None
     #: Expected wall time in seconds, if the worker knows it.
     eta_seconds: float | None = None
+    #: Pin to one machine. None means worker-q chooses; "local" means here.
+    node: str | None = None
 
 
 @dataclass
@@ -269,6 +271,20 @@ class GPUQService:
         priority = self.resolve_priority(project, request.priority, repo_root)
         preemptible = self.resolve_preemptible(request.preemptible, repo_root)
 
+        # Validate the pin before a row is written: a job queued against a
+        # machine that does not exist would wait forever with a wait reason
+        # nobody can act on.
+        pinned_node = (request.node or "").strip() or None
+        if pinned_node and pinned_node != LOCAL_NODE:
+            if self.config.node(pinned_node) is None:
+                known = ", ".join(n.name for n in self.config.nodes) or "none registered"
+                raise GPUQError(
+                    f"unknown node {pinned_node!r} (registered: {known}). "
+                    "Add it with `workerq node add`."
+                )
+        if pinned_node == LOCAL_NODE:
+            pinned_node = None
+
         passthrough = list(request.passthrough or [])
         passthrough += [p for p in load_project_passthrough(repo_root) if p not in passthrough]
 
@@ -348,6 +364,35 @@ class GPUQService:
 
             # ---- 4. enqueue ------------------------------------------
             label = self.backend_label(job_id, project, priority.value)
+
+            # Everything a remote dispatch would need, decided here because the
+            # dispatcher never reads this database - that separation is what
+            # keeps the backend swappable. A job with no git snapshot has no
+            # commit to ship, so it can only ever run here and gets no spec.
+            remote_spec: dict[str, Any] | None = None
+            if snapshot.commit and repo_root is not None:
+                remote_spec = {
+                    "project": project,
+                    "argv": list(request.command),
+                    "repo_root": str(repo_root),
+                    "snapshot_commit": snapshot.commit,
+                    "snapshot_ref": snapshot.ref,
+                    "origin_job_id": job_id,
+                    "priority": priority.value,
+                    "ram_gb": (ram_mib / 1024.0) if ram_mib else None,
+                    "vram_gb": (vram_mib / 1024.0) if vram_mib else None,
+                    "cpus": cpus,
+                    "gpus": gpus,
+                    "preemptible": preemptible,
+                    "share_gpu": request.share_gpu,
+                    "shell": request.shell,
+                    "describe": request.describe,
+                    "blocks": request.blocks,
+                    "eta_seconds": request.eta_seconds,
+                    "env": dict(request.env or {}),
+                    "passthrough": list(snapshot.passthrough or []),
+                }
+
             backend_job_id = self.backend.submit(
                 self.runner_argv(job_id),
                 label=label,
@@ -362,6 +407,8 @@ class GPUQService:
                 cpus=cpus,
                 preemptible=preemptible,
                 gpu_mode=gpu_mode,
+                pinned_node=pinned_node,
+                remote_spec=remote_spec,
             )
 
             # ---- 5/6. record backend id, mark QUEUED -----------------
