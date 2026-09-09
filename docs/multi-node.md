@@ -943,10 +943,34 @@ is left is behaviour. **The step-by-step runbook is
    [§6.1](#61-the-snapshot-ships-source-not-environment), and it is the second
    most likely thing to go wrong after Session 0.
 
-### Phase 1 — see both machines (no dispatch)
+### Phase 1 — see both machines (no dispatch) ✅ registry and reports done
 
-Node registry, `workerq node add/list/check`, `_node-report`, and both machines
-shown in `status` and `top`. No job ever leaves the primary.
+Node registry, `workerq node add/list/check`, `_node-report`. No job ever
+leaves the primary.
+
+Shipped: `[[node]]` tables in `config.toml` (`local` reserved, duplicates and
+malformed entries refused, unknown keys inside a node dropped so a newer
+config cannot brick an older worker-q); `workerq.nodes` with `NodeReport`,
+`local_payload`/`remote_report`, a `ReportCache` that stamps every reading with
+its age, and `compatibility()` gating on `NODE_PROTOCOL_VERSION` rather than
+`__version__`; `workerq node add/rm/list/check`; and the hidden
+`_node-report --json`.
+
+`NodeReport.snapshot()` returns the `NodeSnapshot` from
+[Phase 2](#phase-2--node-agnostic-admission--done), which is the join between
+the two phases: a report from the worker feeds the same `admit()` that guards
+the primary. A test asserts a 20 GiB job is refused against a *reported*
+12 GiB card.
+
+Two things learned by pointing it at the real machine. An unreachable node
+must report **no** capacity rather than zero capacity, or a scheduler reads
+"switched off" as "idle and empty". And "offline" covers several problems that
+need different fixes — wrong key, no sshd, machine asleep, worker-q too old —
+so the reason is classified rather than echoed; the first version surfaced a
+Rich box-drawing border as the error text, because the reason was in the
+middle of the output and the border was the last line.
+
+Still to do in this phase: surfacing nodes in `status` and `top`.
 
 This ships real value on its own — one dashboard for both machines — at
 essentially zero risk, and it exercises the transport, the report format, the

@@ -2287,6 +2287,212 @@ def internal_stop_daemon() -> None:
     service.close()
 
 
+# --------------------------------------------------------------------------
+# Nodes (multi-node phase 1: visibility only, nothing is dispatched)
+# --------------------------------------------------------------------------
+
+node_app = typer.Typer(
+    help="Register and inspect other machines. Phase 1: visibility only.",
+    no_args_is_help=True,
+)
+app.add_typer(node_app, name="node")
+
+
+def _node_or_fail(config, name: str):
+    node = config.node(name)
+    if node is None:
+        known = ", ".join(n.name for n in config.nodes) or "none registered"
+        fail(f"unknown node {name!r} (known: {known})")
+    return node
+
+
+@node_app.command("add")
+def node_add(
+    name: str = typer.Argument(..., help="Short name you will type, e.g. 3080ti."),
+    address: str = typer.Option(..., "--address", "-a", help="Hostname or IP. A Tailscale MagicDNS name survives DHCP changes."),
+    user: str = typer.Option(None, "--user", "-u", help="SSH user, if not the local one."),
+    port: int = typer.Option(22, "--port", help="SSH port."),
+    workerq_path: str = typer.Option(None, "--workerq-path", help="Path to workerq.exe there. The default resolves through the remote PATH, which a non-interactive SSH session may not have."),
+    poll: float = typer.Option(3.0, "--poll", help="Seconds between node reports."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Register a machine. This does not dispatch to it."""
+    from workerq.config import NodeConfig
+
+    config = load_config()
+    if config.node(name) is not None:
+        fail(f"node {name!r} is already registered; remove it first")
+    node = NodeConfig(name=name, address=address, user=user, port=port, poll_interval_seconds=poll)
+    if workerq_path:
+        node.workerq_path = workerq_path
+    config.nodes.append(node)
+    try:
+        config.validate()
+    except Exception as exc:
+        fail(str(exc))
+    path = config.save()
+
+    if json_output:
+        emit_json({"added": name, "config": str(path)})
+        return
+    console.print(f"[bold green]registered[/bold green] {name} -> {node.target}")
+    console.print(f"  config: {path}")
+    console.print(f"\nNext: [bold]workerq node check {name}[/bold]")
+
+
+@node_app.command("rm")
+def node_rm(
+    name: str = typer.Argument(..., help="Node to remove."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Unregister a machine."""
+    config = load_config()
+    _node_or_fail(config, name)
+    config.nodes = [n for n in config.nodes if n.name != name]
+    path = config.save()
+    if json_output:
+        emit_json({"removed": name, "config": str(path)})
+        return
+    console.print(f"removed {name} ({path})")
+
+
+@node_app.command("list")
+def node_list(
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+    probe: bool = typer.Option(True, "--probe/--no-probe", help="Contact each node. --no-probe just lists the registry."),
+) -> None:
+    """Show every machine worker-q knows about, including this one."""
+    from workerq import nodes as nodemod
+
+    config = load_config()
+    reports = [nodemod.local_report(config)]
+    for node in config.nodes:
+        reports.append(
+            nodemod.remote_report(node) if probe
+            else nodemod.NodeReport(name=node.name, error="not probed")
+        )
+
+    if json_output:
+        emit_json({"nodes": [r.to_dict() for r in reports]})
+        return
+
+    table = Table(box=None, pad_edge=False, header_style=theme.MUTED)
+    for col in ("NODE", "STATE", "VERSION", "CPU", "RAM FREE", "GPU", "VRAM FREE", "RUN", "AGE"):
+        table.add_column(col, justify="right" if col in {"CPU", "RUN", "AGE"} else "left")
+
+    # Offline reasons are printed under the table, not inside it. They are
+    # sentences, and a sentence squeezed into a "RAM FREE" column wraps into
+    # something nobody can read.
+    problems: list[tuple[str, str]] = []
+
+    for r in reports:
+        if not r.online:
+            problems.append((r.name, r.error or "unreachable"))
+            table.add_row(r.name, Text("offline", style="red"), "-", "-", "-", "-", "-", "-", "-")
+            continue
+        mem = r.host_memory
+        dev = (r.gpu.devices[0] if r.gpu and r.gpu.devices else None)
+        free_gb = f"{(mem.available_mib or 0) / 1024:.1f} / {(mem.total_mib or 0) / 1024:.0f} GiB" if mem else "-"
+        vram = (f"{(dev.memory_free_mib or 0) / 1024:.1f} / {(dev.memory_total_mib or 0) / 1024:.0f} GiB"
+                if dev else "-")
+        table.add_row(
+            Text(r.name, style="bold" if r.is_local else None),
+            Text("local" if r.is_local else "online", style="green"),
+            r.version or "?",
+            str(r.cpus or "-"),
+            free_gb,
+            (dev.name.replace("NVIDIA GeForce ", "") if dev else "-"),
+            vram,
+            str(len(r.running)),
+            "-" if r.is_local else f"{r.latency_seconds:.1f}s",
+        )
+    console.print(table)
+    for name, reason in problems:
+        console.print(f"[red]{name}[/red]: {reason}")
+    if not config.nodes:
+        console.print(
+            f"\n[{theme.MUTED}]No other machines registered. "
+            "Add one with[/] [bold]workerq node add <name> --address <host>[/bold]"
+        )
+
+
+@node_app.command("check")
+def node_check(
+    name: str = typer.Argument(None, help="Node to check. Omit for all."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Verify a node is reachable, compatible, and configured sanely."""
+    from workerq import nodes as nodemod
+
+    config = load_config()
+    targets = [_node_or_fail(config, name)] if name else config.nodes
+    if not targets:
+        fail("no nodes registered; add one with `workerq node add`")
+
+    local = nodemod.local_report(config)
+    results = []
+    ok_all = True
+    for node in targets:
+        remote = nodemod.remote_report(node)
+        ok, why = nodemod.compatibility(local, remote)
+        ok_all = ok_all and ok
+        results.append({"node": node.name, "ok": ok, "reason": why, "report": remote.to_dict()})
+
+    if json_output:
+        emit_json({"compatible": ok_all, "local": local.to_dict(), "nodes": results})
+        raise typer.Exit(0 if ok_all else 1)
+
+    for entry in results:
+        remote_dict = entry["report"]
+        mark = Text("PASS", style="green") if entry["ok"] else Text("FAIL", style="bold red")
+        console.print(f"{mark} {entry['node']}")
+        if not entry["ok"]:
+            console.print(f"       [red]{entry['reason']}[/red]")
+        console.print(f"       reachable   {remote_dict['online']}"
+                      f"  ({(remote_dict.get('latency_seconds') or 0):.2f}s)")
+        console.print(f"       version     {remote_dict.get('version')} "
+                      f"(this machine {local.version})")
+        console.print(f"       protocol    {remote_dict.get('protocol')} "
+                      f"(this machine {local.protocol})")
+        console.print(f"       hostname    {remote_dict.get('hostname')}")
+        console.print(f"       dispatcher  {remote_dict.get('daemon_running')}"
+                      f", {remote_dict.get('slots')} slot(s)")
+        if remote_dict.get("version") != local.version:
+            console.print(
+                f"       [yellow]note[/yellow] versions differ. A matching version is "
+                "not proof of matching code - compare protocol, which is what gates "
+                "dispatch."
+            )
+    raise typer.Exit(0 if ok_all else 1)
+
+
+@app.command("_node-report", hidden=True)
+def internal_node_report(
+    json_output: bool = typer.Option(True, "--json", help="Machine-readable output."),
+) -> None:
+    """Internal: describe this machine for a remote worker-q.
+
+    One command answering everything, because a round trip over Windows
+    OpenSSH costs ~543 ms against 19 ms of network and cannot be multiplexed.
+    """
+    from workerq import nodes as nodemod
+
+    config = load_config()
+    service = None
+    try:
+        service = get_service()
+    except Exception:
+        service = None
+    try:
+        emit_json(nodemod.local_payload(config, service))
+    finally:
+        if service is not None:
+            try:
+                service.close()
+            except Exception:
+                pass
+
+
 @app.command()
 def version(
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),

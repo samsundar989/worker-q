@@ -15,6 +15,9 @@ from typing import Any
 from workerq.util import atomic_write_text, ensure_dir, expand_path
 
 VALID_PRIORITIES = ("critical", "high", "normal", "low")
+
+#: Reserved node name meaning "this machine". Never a registry entry.
+LOCAL_NODE = "local"
 VALID_SNAPSHOT_MODES = ("git", "none", "copy")
 
 
@@ -238,6 +241,43 @@ class ClaudeConfig:
 
 
 @dataclass
+class NodeConfig:
+    """A second machine worker-q can see, and later dispatch to.
+
+    Registered as repeated `[[node]]` tables rather than a fixed section,
+    because there is no sensible default node and the count is not known in
+    advance. `local` is reserved: it always means this host, so a registry
+    entry can never shadow it.
+
+    `address` is deliberately not called `host` - `workerq.host` is the local
+    memory-inspection module, and a job row already has a `host` column meaning
+    the machine that submitted it. Three different senses of the word in one
+    codebase is one too many.
+    """
+
+    name: str
+    address: str
+    user: str | None = None
+    port: int = 22
+    #: Remote polling is a whole SSH connection - measured at ~543 ms on this
+    #: pair, against 19 ms of network - so this is seconds, not the 0.25 s
+    #: local dispatch tick. See docs/multi-node.md 5.3.
+    poll_interval_seconds: float = 3.0
+    #: Seconds to wait for a node report before treating the node as offline.
+    timeout_seconds: float = 20.0
+    #: Path to `workerq.exe` on that machine. The default resolves through the
+    #: remote PATH, which a non-interactive SSH session does not always have.
+    workerq_path: str = "%USERPROFILE%\\.local\\bin\\workerq.exe"
+    #: Set false to keep a node registered but ignored, without deleting it.
+    enabled: bool = True
+
+    @property
+    def target(self) -> str:
+        """The `user@address` (or bare address) an ssh command takes."""
+        return f"{self.user}@{self.address}" if self.user else self.address
+
+
+@dataclass
 class Config:
     core: CoreConfig = field(default_factory=CoreConfig)
     gpu: GpuConfig = field(default_factory=GpuConfig)
@@ -247,6 +287,10 @@ class Config:
     preemption: PreemptionConfig = field(default_factory=PreemptionConfig)
     gaming: GamingConfig = field(default_factory=GamingConfig)
     claude: ClaudeConfig = field(default_factory=ClaudeConfig)
+
+    #: Registered remote machines, in `[[node]]` order. Empty means worker-q
+    #: behaves exactly as a single-machine install.
+    nodes: list[NodeConfig] = field(default_factory=list)
 
     #: Path the config was loaded from (may not exist yet).
     source_path: Path | None = None
@@ -381,6 +425,27 @@ class Config:
             if not 0 <= value <= 100:
                 raise ConfigError(f"resources.{name} must be between 0 and 100")
 
+        seen: set[str] = set()
+        for node in self.nodes:
+            if not node.name:
+                raise ConfigError("every [[node]] needs a name")
+            if node.name == LOCAL_NODE:
+                raise ConfigError(
+                    f"{LOCAL_NODE!r} is reserved for this machine and cannot be "
+                    "used as a node name"
+                )
+            if node.name in seen:
+                raise ConfigError(f"duplicate node name: {node.name}")
+            seen.add(node.name)
+            if not node.address:
+                raise ConfigError(f"node {node.name!r} needs an address")
+            if not 0 < node.port < 65536:
+                raise ConfigError(f"node {node.name!r} has an invalid port")
+            if node.poll_interval_seconds <= 0:
+                raise ConfigError(f"node {node.name!r} poll_interval_seconds must be > 0")
+            if node.timeout_seconds <= 0:
+                raise ConfigError(f"node {node.name!r} timeout_seconds must be > 0")
+
     # -- serialization ----------------------------------------------------
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -394,6 +459,15 @@ class Config:
             "claude": asdict(self.claude),
         }
 
+    def node(self, name: str) -> NodeConfig | None:
+        for n in self.nodes:
+            if n.name == name:
+                return n
+        return None
+
+    def active_nodes(self) -> list[NodeConfig]:
+        return [n for n in self.nodes if n.enabled]
+
     def to_toml(self) -> str:
         lines: list[str] = [
             "# worker-q configuration",
@@ -403,6 +477,13 @@ class Config:
         for section, values in self.to_dict().items():
             lines.append(f"[{section}]")
             for key, value in values.items():
+                lines.append(f"{key} = {_toml_value(value)}")
+            lines.append("")
+        for node in self.nodes:
+            lines.append("[[node]]")
+            for key, value in asdict(node).items():
+                if value is None:
+                    continue
                 lines.append(f"{key} = {_toml_value(value)}")
             lines.append("")
         return "\n".join(lines)
@@ -550,6 +631,7 @@ def _from_dict(
         preemption=PreemptionConfig(**data.get("preemption", {})),
         gaming=GamingConfig(**data.get("gaming", {})),
         claude=ClaudeConfig(**data.get("claude", {})),
+        nodes=[NodeConfig(**entry) for entry in data.get("node", [])],
         source_path=source_path,
         profile=profile,
     )
@@ -562,6 +644,9 @@ def _from_dict(
 
 def _apply_file(data: dict[str, Any], raw: dict[str, Any], path: Path) -> None:
     for section, values in raw.items():
+        if section == "node":
+            data["node"] = _read_nodes(values, path)
+            continue
         if not isinstance(values, dict):
             raise ConfigError(f"{path}: top-level key {section!r} must be a table")
         for key, value in values.items():
@@ -572,6 +657,27 @@ def _apply_file(data: dict[str, Any], raw: dict[str, Any], path: Path) -> None:
                 # by a newer gpuq does not brick an older one.
                 continue
             data[sect][k] = coerce_value(sect, k, value)
+
+
+def _read_nodes(values: Any, path: Path) -> list[dict[str, Any]]:
+    """Parse `[[node]]` tables.
+
+    Unknown keys *inside* a node are dropped, for the same reason unknown
+    section keys are: a config written by a newer worker-q must not brick an
+    older one. A malformed node is fatal, though - silently skipping it would
+    leave someone with a node they registered and worker-q cannot see.
+    """
+    if not isinstance(values, list):
+        raise ConfigError(f"{path}: [node] must be written as repeated [[node]] tables")
+    known = {f.name for f in fields(NodeConfig)}
+    out: list[dict[str, Any]] = []
+    for entry in values:
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{path}: each [[node]] must be a table")
+        if not entry.get("name"):
+            raise ConfigError(f"{path}: every [[node]] needs a name")
+        out.append({k: v for k, v in entry.items() if k in known})
+    return out
 
 
 _ENV_ALIASES = {

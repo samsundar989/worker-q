@@ -97,6 +97,45 @@ class GpuInfo:
             "devices": [d.to_dict() for d in self.devices],
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> GpuInfo:
+        """Rebuild from `to_dict`, so a node's GPU inventory can cross a wire.
+
+        Tolerant of unknown and missing keys in both directions: a report from
+        a newer worker-q must not fail to parse on an older one, and a device
+        that reported nothing for a field keeps `None` rather than becoming 0 -
+        the two mean different things everywhere else in this codebase.
+        """
+        devices: list[GpuDevice] = []
+        for raw in data.get("devices") or []:
+            devices.append(
+                GpuDevice(
+                    index=int(raw.get("index", 0)),
+                    uuid=str(raw.get("uuid", "")),
+                    name=str(raw.get("name", "")),
+                    memory_total_mib=raw.get("memory_total_mib"),
+                    memory_used_mib=raw.get("memory_used_mib"),
+                    memory_free_mib=raw.get("memory_free_mib"),
+                    utilization_percent=raw.get("utilization_percent"),
+                    processes=[
+                        GpuProcess(
+                            pid=p.get("pid"),
+                            process_name=str(p.get("process_name", "")),
+                            used_memory_mib=p.get("used_memory_mib"),
+                            gpu_uuid=p.get("gpu_uuid"),
+                        )
+                        for p in (raw.get("processes") or [])
+                    ],
+                )
+            )
+        return cls(
+            available=bool(data.get("available", False)),
+            devices=devices,
+            driver_version=data.get("driver_version"),
+            cuda_version=data.get("cuda_version"),
+            error=data.get("error"),
+        )
+
 
 # --------------------------------------------------------------------------
 # Parsing helpers
