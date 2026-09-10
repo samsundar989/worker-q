@@ -385,6 +385,112 @@ class Database:
             params.append(limit)
         return [_row_to_job(r) for r in self.conn.execute(sql, params).fetchall()]
 
+    #: Columns a caller may sort history by. An allowlist rather than string
+    #: interpolation of whatever arrived, because this one is reachable from a
+    #: query string.
+    SORTABLE = {
+        "id": "id",
+        "project": "project",
+        "state": "state",
+        "priority": "priority",
+        "queued_at": "queued_at",
+        "started_at": "started_at",
+        "finished_at": "finished_at",
+        "runtime": "(julianday(finished_at) - julianday(started_at))",
+        "wait": "(julianday(started_at) - julianday(queued_at))",
+        "peak_ram_mib": "peak_ram_mib",
+        "requested_ram_mib": "requested_ram_mib",
+        "node": "COALESCE(node, 'local')",
+    }
+
+    def query_jobs(
+        self,
+        *,
+        states: Iterable[str] | None = None,
+        projects: Iterable[str] | None = None,
+        nodes: Iterable[str] | None = None,
+        priorities: Iterable[str] | None = None,
+        signature: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        search: str | None = None,
+        sort: str = "id",
+        descending: bool = True,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[list[Job], int]:
+        """Filtered history, plus the total the filter matched.
+
+        The jobs table is never pruned, so this reaches back to the first job
+        ever submitted. That is the whole reason a history view is worth
+        building - but it also means it has to page rather than fetch.
+
+        `nodes` matches on COALESCE(node, 'local'): NULL means this machine and
+        the column must stay that way, because `eta._durations_for` matches
+        `node IS NULL` to find same-machine history.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+
+        def _in(column: str, values: Iterable[str] | None) -> None:
+            if values is None:
+                return
+            items = [str(v) for v in values]
+            if not items:
+                # An empty filter means "none of them", not "no filter".
+                clauses.append("0")
+                return
+            clauses.append(f"{column} IN (" + ",".join("?" for _ in items) + ")")
+            params.extend(items)
+
+        _in("state", states)
+        _in("project", projects)
+        _in("COALESCE(node, 'local')", nodes)
+        _in("priority", priorities)
+        if signature:
+            clauses.append("command_signature = ?")
+            params.append(signature)
+        if since:
+            clauses.append("queued_at >= ?")
+            params.append(since)
+        if until:
+            clauses.append("queued_at <= ?")
+            params.append(until)
+        if search:
+            like = f"%{search}%"
+            clauses.append(
+                "(project LIKE ? OR COALESCE(description,'') LIKE ? "
+                "OR command_json LIKE ? OR COALESCE(label,'') LIKE ? "
+                "OR COALESCE(blocks,'') LIKE ?)"
+            )
+            params.extend([like] * 5)
+
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        total = int(
+            self.conn.execute(
+                f"SELECT COUNT(*) FROM jobs{where}", params
+            ).fetchone()[0]
+        )
+        order = self.SORTABLE.get(sort, "id")
+        direction = "DESC" if descending else "ASC"
+        # Ties on any other column would page unstably; id is the tiebreak.
+        sql = (
+            f"SELECT {_JOB_COLUMNS} FROM jobs{where} "
+            f"ORDER BY {order} {direction}, id {direction} LIMIT ? OFFSET ?"
+        )
+        rows = self.conn.execute(sql, [*params, int(limit), int(offset)]).fetchall()
+        return [_row_to_job(r) for r in rows], total
+
+    def distinct_values(self, column: str) -> list[str]:
+        """Facet values for the history filters."""
+        if column not in {"project", "state", "priority", "node"}:
+            return []
+        expr = "COALESCE(node, 'local')" if column == "node" else column
+        rows = self.conn.execute(
+            f"SELECT {expr} AS v, COUNT(*) AS n FROM jobs GROUP BY v ORDER BY n DESC"
+        ).fetchall()
+        return [str(r["v"]) for r in rows if r["v"] is not None]
+
     def active_jobs(self) -> list[Job]:
         return self.list_jobs(states=[s.value for s in ACTIVE_STATES])
 

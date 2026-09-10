@@ -1,11 +1,14 @@
-# worker-q web - plan
+# worker-q web
 
-A locally-served, dependency-free web UI that replaces `workerq top` as the
-primary way to watch the queue, and adds the two things a TUI frame cannot
-give: **history you can interrogate**, and **a verdict on whether declarations
-match reality**.
+A locally-served, dependency-free web UI that sits beside `workerq top` and
+adds the two things a TUI frame cannot give: **history you can interrogate**,
+and **a verdict on whether declarations match reality**.
 
-This is a plan, not a description of something that exists.
+    workerq web
+
+Serves on `127.0.0.1:7676` (`[core] web_port`), opens a browser, and reads the
+same databases the CLI does. This document is the design record; everything it
+describes is implemented.
 
 ## Why not just improve the TUI
 
@@ -24,7 +27,7 @@ pointer you can hover. That is a browser's job.
 The TUI stays. It is the right tool over SSH and on a wedged box, and it is
 already the fastest way to see the machine falling over.
 
-## What the data says today
+## What the data said before any of this was built
 
 Measured against the live store, 486 jobs, 328 of them successful:
 
@@ -47,8 +50,10 @@ draw the picture.** Phase 0 exists to fix that first.
 
 ## Phase 0 - fix the record
 
-A view cannot show what was never written down. Each item below is a
-prerequisite for a specific view, and each is small.
+A view cannot show what was never written down. Each item below was a
+prerequisite for a specific view. All five landed before anything rendered a
+number, and each improves the CLI too - `workerq resources --verify` is more
+correct now whether or not the web UI is running.
 
 ### 0.1 Separate the commit ledger from the RAM ledger
 
@@ -151,8 +156,10 @@ server is why the dispatcher has no socket. A local UI does not breach that
 rule as long as it cannot be reached from off the machine. Refuse a
 non-loopback `--host` unless a config key explicitly allows it.
 
-Port 8787 is already taken on this machine by an unrelated project. Default to
-7676 and make it a `[web]` config key.
+Port 8787 is already taken on this machine by an unrelated project, so the
+default is 7676. It is `[core] web_port` rather than a section of its own,
+because `config.to_toml` regenerates the file on every `config set` and one
+more key is a far smaller change than one more section.
 
 ### How it talks to the queue
 
@@ -330,15 +337,34 @@ Cover:
 The existing fixtures in `tests/conftest.py` already build a temporary state
 directory, so most of this is assembly rather than new scaffolding.
 
-## Order of work
+## What the first run found
 
-Phase 0 first, and 0.1 before anything renders a number. The rest of phase 0
-can go in any order and each is independently useful to the CLI as well.
-`workerq resources --verify` gets more correct the moment 0.1 and 0.2 land,
-whether or not the webapp exists.
+The views were pointed at this machine's own 519 jobs as soon as they
+rendered, which is the only real test of whether they say anything:
 
-Then phase 1, then History and Job detail, then Accuracy, then Machines and
-Efficiency.
+- the median job uses **22%** of the footprint it declares, and **1,500
+  GiB-hours** of declared budget has been held and never touched;
+- ten jobs went over the footprint they declared, and after the phase 0.1
+  correction that list is *ten*, not the thirty-one a naive comparison
+  produced - the other twenty-one were well-sized GPU jobs;
+- the median job finishes in **16%** of its declared ETA;
+- the second machine was idle for essentially every telemetry sample in which
+  the queue had work waiting, against 11% for this one.
+
+The last of those is the one worth acting on, and it is not something any
+single job's record could have shown.
+
+## One measurement that had to be thrown away
+
+The first version of "idle while the queue had work" joined through
+`job_samples`, and reported the second machine as idle 100% of the time. That
+was not a finding - `job_samples` is written by the local dispatcher for jobs
+it is running, and a remote job never enters `self.running`, so the number was
+guaranteed by construction.
+
+It now measures against the jobs' own start and finish times. The lesson
+generalises: a metric that can only produce one answer is worse than no
+metric, because it looks like a result.
 
 ## Noticed in passing
 

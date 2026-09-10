@@ -68,6 +68,10 @@ class CoreConfig:
     cleanup_successful_snapshots_after_days: int = 7
     cleanup_failed_snapshots_after_days: int = 14
     cancel_grace_seconds: int = 15
+    #: Port for `workerq web`. Lives in [core] rather than a section of its
+    #: own because `to_toml` regenerates this file on every `config set`, and
+    #: one more key is a far smaller change than one more section.
+    web_port: int = 7676
 
 
 @dataclass

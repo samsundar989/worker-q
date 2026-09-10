@@ -346,6 +346,7 @@ the job changes if it never writes the file.
 
 ```bash
 workerq top        # live dashboard: queue, machine pressure, who holds memory
+workerq web        # local web UI: history, machines, declaration accuracy
 workerq report     # why recent jobs failed, and whose workload it was
 workerq resources  # capacity, headroom, and the limits being enforced
 ```
@@ -360,6 +361,51 @@ you want in a script.
 That `foreign` tag is usually the answer when the box falls over: it is a heavy
 workload running outside the queue, which worker-q can see but cannot schedule
 around.
+
+### The web UI
+
+```bash
+workerq web        # http://127.0.0.1:7676, opens a browser
+```
+
+`top` answers what is happening now. `web` answers what has been happening,
+which needs sorting, filtering and a time axis. It serves on loopback only -
+binding an address the network can reach is refused, not warned about - and
+adds no dependencies: the server is `http.server` from the standard library
+and the page is plain JavaScript with hand-drawn SVG.
+
+Five views:
+
+- **Now** - what `top` shows, with both machines side by side.
+- **History** - every job ever submitted, filterable, over a timeline with one
+  lane per machine. The jobs table is never pruned, so this is complete.
+- **Accuracy** - what jobs declared against what they actually used, ranked by
+  what it cost the queue, with the exact `workerq requests` command to fix each
+  one. Over- and under-declaration are ranked **separately**: one makes other
+  people wait, the other takes the machine down.
+- **Machines** - where work ran, and how often each machine sat idle while the
+  queue had work waiting. That last number is the honest test of whether the
+  second machine is earning its place.
+- **Efficiency** - queue wait against runtime per project, and what the queue
+  was actually blocked on.
+
+Every panel carries a **where this comes from** disclosure naming the call that
+produced it and showing the raw payload, and every action prints the `workerq`
+command it is equivalent to. Nothing in the browser is unreproducible in a
+terminal.
+
+#### A note on the numbers
+
+The measured column is labelled **peak commit**, not peak RAM, and it is
+compared against **declared RAM plus declared VRAM**. This is not pedantry. The
+sampler records commit charge for the whole process tree, and under WDDM the
+driver backs video allocations with system commit - so a GPU job's commit is
+roughly its RAM plus its VRAM. Comparing that peak against declared RAM alone
+reports well-sized GPU jobs as dangerously under-declared: on this machine, 21
+jobs looked over their RAM declaration and only 10 actually were.
+
+A peak drawn from fewer than three samples is shown greyed with a `?` and never
+argued from.
 
 `workerq report` classifies every recent failure - CUDA OOM, host OOM, killed,
 missing file, import error, application exception - and groups them by project
@@ -831,6 +877,7 @@ See [docs/architecture.md](docs/architecture.md),
 | `workerq submit [--ram N --vram N --cpus N] [--describe T --blocks W --eta D] -- CMD` | Queue a job and return immediately. |
 | `workerq status` / `workerq list` | Show the queue. `--json` for agents. |
 | `workerq top` | Live dashboard: queue, pressure, memory owners. |
+| `workerq web` | Local web UI: history, per-machine placement, declaration accuracy. |
 | `workerq report` | Why recent jobs failed, grouped by cause and project. |
 | `workerq resources` | Capacity, headroom and enforced limits. |
 | `workerq show ID` | Full detail and source provenance. |

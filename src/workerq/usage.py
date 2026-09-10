@@ -346,9 +346,15 @@ def group_by(rows: Iterable[Usage], key: str) -> list[dict[str, Any]]:
     out = []
     for name, group in buckets.items():
         summary = summarise(group, worst=3)
+        # A signature is a hash, which is unreadable as a row label. Carry the
+        # most recent description alongside it so the grouping can be acted on
+        # without opening a job to find out what the command was.
+        described = next((g.description for g in group if g.description), None)
         out.append(
             {
                 "key": name,
+                "label": described or name,
+                "projects": sorted({g.project for g in group}),
                 "runs": len(group),
                 **summary.to_dict(),
             }

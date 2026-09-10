@@ -314,3 +314,58 @@ def test_throughput_on_an_empty_queue(service: GPUQService):
     assert stats["finished"] == 0
     assert stats["success_rate"] == 100.0
     assert stats["median_wait_seconds"] is None
+
+
+# --------------------------------------------------------------------------
+# retention, per kind
+# --------------------------------------------------------------------------
+
+
+def test_routine_noise_cannot_evict_the_record_of_what_jobs_did(
+    telemetry: Telemetry,
+):
+    """One flat cap does not survive contact with a busy queue.
+
+    A blocked job repeats its reason every few seconds for as long as it
+    waits. Under a single 50,000-row limit that left 49,454 `job_blocked` rows
+    and 239 `job_started` rows here - for 486 jobs - so the lifecycle record of
+    most jobs that ever ran had already been spent on a stalled queue saying
+    the same thing over and over.
+    """
+    for i in range(40):
+        telemetry.record_event(EVENT_STARTED, job_id=i, backend_job_id=i)
+    for i in range(500):
+        telemetry.record_event(EVENT_BLOCKED, backend_job_id=i, detail="waiting")
+
+    telemetry.prune(keep_samples=10, keep_events=100, keep_noise_events=25)
+
+    started = telemetry.recent_events(limit=1000, kinds=[EVENT_STARTED])
+    blocked = telemetry.recent_events(limit=1000, kinds=[EVENT_BLOCKED])
+    assert len(started) == 40, "lifecycle events must survive a flood of noise"
+    assert len(blocked) == 25
+
+
+def test_an_event_can_be_found_by_the_job_it_belongs_to(telemetry: Telemetry):
+    """`events.job_id` was NULL in every row ever written, because only the
+    backend id was being passed. A per-job timeline needs the worker-q id."""
+    telemetry.record_event(EVENT_STARTED, job_id=7, backend_job_id=99)
+    telemetry.record_event(EVENT_BLOCKED, backend_job_id=99, detail="waiting")
+
+    found = telemetry.events_for_job(7, 99)
+    assert [e["kind"] for e in found] == [EVENT_STARTED, EVENT_BLOCKED]
+    assert found[0]["job_id"] == 7
+    assert telemetry.events_for_job(None, None) == []
+
+
+def test_a_jobs_series_finds_samples_it_shared_with_other_jobs(
+    telemetry: Telemetry,
+):
+    """`samples.running_job_id` names an arbitrary one of the jobs running at
+    that instant, so a job sharing the machine would appear to have no series
+    at all. The join goes through `job_samples`."""
+    telemetry.record_sample(
+        host_total_mib=1000.0, host_available_mib=400.0, running_job_ids=[3, 4]
+    )
+    assert len(telemetry.job_series(3)) == 1
+    assert len(telemetry.job_series(4)) == 1
+    assert telemetry.job_series(99) == []

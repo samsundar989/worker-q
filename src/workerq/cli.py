@@ -999,6 +999,48 @@ def top(
 
 
 @app.command()
+def web(
+    port: int = typer.Option(None, "--port", "-p", help="Port to listen on."),
+    host: str = typer.Option("127.0.0.1", "--host", help="Loopback address to bind."),
+    open_browser: bool = typer.Option(
+        True, "--open/--no-open", help="Open a browser once the server is up."
+    ),
+) -> None:
+    """Local web UI: history, per-machine placement, and declaration accuracy.
+
+    `top` answers what is happening now. This answers what has been happening -
+    which needs sorting, filtering and a time axis, and so needs a browser.
+    """
+    from workerq.web import DEFAULT_PORT
+    from workerq.web.server import LoopbackOnly, serve
+
+    config = load_config()
+    chosen = port if port is not None else int(
+        getattr(config.core, "web_port", None) or DEFAULT_PORT
+    )
+    try:
+        server = serve(config, host=host, port=chosen, open_browser=open_browser)
+    except LoopbackOnly as exc:
+        fail(str(exc))
+    except OSError as exc:
+        fail(
+            f"could not listen on {host}:{chosen} ({exc}). "
+            f"Another program may hold that port; try --port {chosen + 1}."
+        )
+    url = f"http://{host}:{server.server_address[1]}/"
+    console.print(f"[bold]worker-q[/bold] web UI on [cyan]{url}[/cyan]")
+    console.print("[dim]Reads the queue directly; actions go through the same "
+                  "service the CLI uses. Ctrl-C to stop.[/dim]")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        console.print("\nstopped")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@app.command()
 def report(
     hours: float = typer.Option(24.0, "--hours", "-H", help="Window to analyse."),
     limit: int = typer.Option(50, "--limit", help="Maximum failures to list."),

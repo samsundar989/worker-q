@@ -231,3 +231,124 @@ def test_a_finished_job_is_not_treated_as_a_duplicate():
 
 def test_no_earlier_submission_is_none():
     assert remote.existing_submission([FakeJob(1, "other")], "wanted") is None
+
+
+# --------------------------------------------------------------------------
+# bringing a node's measurements home
+# --------------------------------------------------------------------------
+#
+# A remote job has no runner on this machine, so nothing local ever fills in
+# its peaks. The node measured them perfectly well; they just lived in *its*
+# core database. Without this path every travelled job is a blank row in the
+# one comparison a second machine makes worth doing.
+
+
+def _store(tmp_path):
+    from workerq.backends.queue_store import QueueStore
+
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    store.initialize()
+    return store
+
+
+def _enqueue(store, label):
+    return store.enqueue(
+        argv=["python", "train.py"], label=label, gpu_count=0, slots=1,
+        priority_rank=100, log_path=None, cwd=None, env={},
+    )
+
+
+def test_a_nodes_measurements_are_parked_on_the_queue_row(tmp_path):
+    from workerq.backends.queue_store import row_to_backend_job
+
+    store = _store(tmp_path)
+    backend_id = _enqueue(store, "worker-q:42:p:normal")
+    store.record_remote_usage(backend_id, {
+        "peak_ram_mib": 4096.0,
+        "peak_vram_mib": 2048.0,
+        "usage_samples": 33,
+        "peak_source": "measured",
+        "vram_source": "device_delta",
+        "progress_fraction": 0.5,
+        "state": "SUCCEEDED",       # not a usage field; must not travel
+        "exit_code": 0,             # nor this - state comes from the backend
+    })
+    bjob = row_to_backend_job(store.get(backend_id))
+    measured = bjob.extra["remote_usage"]
+    assert measured["peak_ram_mib"] == 4096.0
+    assert measured["usage_samples"] == 33
+    assert measured["vram_source"] == "device_delta"
+    assert "state" not in measured and "exit_code" not in measured
+    store.close()
+
+
+def test_nothing_is_parked_when_the_node_measured_nothing(tmp_path):
+    from workerq.backends.queue_store import row_to_backend_job
+
+    store = _store(tmp_path)
+    backend_id = _enqueue(store, "worker-q:1:p:normal")
+    store.record_remote_usage(backend_id, {"state": "SUCCEEDED"})
+    assert row_to_backend_job(store.get(backend_id)).extra["remote_usage"] is None
+    store.close()
+
+
+def test_core_adopts_a_nodes_measurements(service):
+    from workerq.models import JobState
+    from workerq.util import utcnow_iso
+
+    job_id = service.db.insert_job(
+        backend="local_dispatcher", project="demo", priority="normal",
+        submitted_cwd=str(service.config.state_dir),
+        command_json=json.dumps(["python", "train.py"]),
+        snapshot_mode="none", host="testhost",
+        state=JobState.RUNNING.value, started_at=utcnow_iso(),
+        node="3080ti",
+    )
+    job = service.db.get_job(job_id)
+    assert job.peak_ram_mib is None
+
+    service._adopt_remote_usage(job, {
+        "peak_ram_mib": 8192.0, "usage_samples": 12, "peak_source": "measured",
+    })
+    refreshed = service.db.get_job(job_id)
+    assert refreshed.peak_ram_mib == 8192.0
+    assert refreshed.usage_samples == 12
+    assert refreshed.peak_source == "measured"
+
+
+def test_a_locally_measured_peak_is_never_overwritten_by_a_nodes(service):
+    """Should be impossible - a remote job has no local runner - but a job
+    adopted after a restart could have both, and the local figure is the one
+    drawn from a process tree this machine could actually see."""
+    from workerq.models import JobState
+    from workerq.util import utcnow_iso
+
+    job_id = service.db.insert_job(
+        backend="local_dispatcher", project="demo", priority="normal",
+        submitted_cwd=str(service.config.state_dir),
+        command_json=json.dumps(["python", "train.py"]),
+        snapshot_mode="none", host="testhost",
+        state=JobState.RUNNING.value, started_at=utcnow_iso(),
+        peak_ram_mib=1234.0, usage_samples=99, peak_source="measured",
+    )
+    job = service.db.get_job(job_id)
+    service._adopt_remote_usage(job, {"peak_ram_mib": 8192.0, "usage_samples": 1})
+    assert service.db.get_job(job_id).peak_ram_mib == 1234.0
+
+
+def test_adopting_junk_never_breaks_reconciliation(service):
+    """Measurement is a nicety; getting a finished job out of RUNNING is not."""
+    from workerq.models import JobState
+    from workerq.util import utcnow_iso
+
+    job_id = service.db.insert_job(
+        backend="local_dispatcher", project="demo", priority="normal",
+        submitted_cwd=str(service.config.state_dir),
+        command_json=json.dumps(["true"]),
+        snapshot_mode="none", host="testhost",
+        state=JobState.RUNNING.value, started_at=utcnow_iso(),
+    )
+    job = service.db.get_job(job_id)
+    for junk in (None, {}, "nonsense", [1, 2], {"unknown_column": 1}):
+        service._adopt_remote_usage(job, junk)
+    assert service.db.get_job(job_id).peak_ram_mib is None

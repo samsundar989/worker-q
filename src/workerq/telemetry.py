@@ -308,6 +308,67 @@ class Telemetry:
             return []
         return [dict(r) for r in rows]
 
+    def job_series(self, job_id: int, *, limit: int = 2000) -> list[dict[str, Any]]:
+        """Machine samples taken while this job was running.
+
+        Via `job_samples`, not `samples.running_job_id`: that column names an
+        arbitrary one of however many jobs were running, so a job sharing the
+        machine would appear to have no series at all.
+
+        These are whole-machine figures, not the job's own. On a box running
+        several jobs plus a desktop they show the context a job ran in, which
+        is what explains a slow run - they are not an attribution of its usage.
+        """
+        try:
+            rows = self.conn.execute(
+                f"SELECT s.{_SAMPLE_COLUMNS.replace(', ', ', s.')} FROM samples s "
+                "JOIN job_samples js ON js.sample_id = s.id "
+                "WHERE js.job_id = ? ORDER BY s.id ASC LIMIT ?",
+                (int(job_id), int(limit)),
+            ).fetchall()
+        except Exception:
+            return []
+        return [dict(r) for r in rows]
+
+    def events_for_job(
+        self, job_id: int | None, backend_job_id: int | None = None
+    ) -> list[dict[str, Any]]:
+        """One job's lifecycle, found by either id.
+
+        Both, because `job_id` was NULL in every event written before it
+        started being populated, and that history is worth keeping readable.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if job_id is not None:
+            clauses.append("job_id = ?")
+            params.append(int(job_id))
+        if backend_job_id is not None:
+            clauses.append("backend_job_id = ?")
+            params.append(int(backend_job_id))
+        if not clauses:
+            return []
+        try:
+            rows = self.conn.execute(
+                "SELECT id, at, kind, job_id, backend_job_id, detail, data_json "
+                "FROM events WHERE " + " OR ".join(clauses) + " ORDER BY id ASC",
+                params,
+            ).fetchall()
+        except Exception:
+            return []
+        return [dict(r) for r in rows]
+
+    def samples_since(self, since: str, *, limit: int = 5000) -> list[dict[str, Any]]:
+        try:
+            rows = self.conn.execute(
+                f"SELECT {_SAMPLE_COLUMNS} FROM samples WHERE at >= ? "
+                "ORDER BY id ASC LIMIT ?",
+                (since, int(limit)),
+            ).fetchall()
+        except Exception:
+            return []
+        return [dict(r) for r in rows]
+
     # -- retention --------------------------------------------------------
     def prune(
         self,

@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>worker-q</title>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='4' fill='%232a78d6'/><rect x='3.5' y='4' width='9' height='2' rx='1' fill='white'/><rect x='3.5' y='7' width='6' height='2' rx='1' fill='white' opacity='0.75'/><rect x='3.5' y='10' width='4' height='2' rx='1' fill='white' opacity='0.5'/></svg>">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">worker-q<span id="version"></span></div>
+    <nav class="tabs" id="tabs"></nav>
+    <div class="top-right">
+      <span class="small muted" id="status"></span>
+      <button class="ghost" id="refresh" title="Reload this view">Refresh</button>
+      <button class="ghost" id="theme" title="Switch between light and dark">◐</button>
+    </div>
+  </header>
+  <main id="main"></main>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
