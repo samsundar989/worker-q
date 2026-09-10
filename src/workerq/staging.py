@@ -40,6 +40,10 @@ from workerq.winproc import no_window_kwargs
 #: Where bundles land on the far side before being unpacked.
 REMOTE_STAGE_DIR = "%TEMP%\\workerq-bundles"
 
+#: Where a job's snapshot is materialised on the node, under the project repo
+#: rather than worker-q's state dir - see `_drop_remote_worktree`.
+WORKTREE_DIR = ".gpuq-work"
+
 #: A source delta above this is not a delta, it is an accident - a large
 #: untracked file swept in by `git add -A`. At 6.1 MB/s this is ten seconds,
 #: and far larger than any honest snapshot of source.
@@ -458,6 +462,20 @@ def link_passthrough(
     return result
 
 
+def worktree_path(node: NodeConfig, repo_root: Path, job_id: int) -> str:
+    """Where this job's snapshot is materialised on the node.
+
+    One definition, because three callers must agree on it: `ship_snapshot`
+    creates the tree, `collect_outputs` searches it for results, and
+    `remove_worktree` deletes it. While the path was built by hand in each,
+    results written to a relative path were looked for in the wrong tree and
+    quietly not found.
+    """
+    sep = chr(92)
+    return sep.join([remote_repo_path(node, repo_root), WORKTREE_DIR,
+                     f"job-{job_id:06d}"])
+
+
 def ship_snapshot(
     node: NodeConfig,
     repo_root: Path,
@@ -498,7 +516,7 @@ def ship_snapshot(
             if not sent.ok:
                 raise StagingError(f"bundle transfer failed: {sent.error}")
 
-    worktree = f"{remote_repo}\\.gpuq-work\\job-{job_id:06d}"
+    worktree = worktree_path(node, repo_root, job_id)
     steps = [f"cd /d {_q(remote_repo)}"]
     if not already:
         steps.append(f"git fetch {_q(remote_bundle)} {ref}:{ref}")
@@ -574,7 +592,7 @@ def remove_worktree(node: NodeConfig, repo_root: Path, job_id: int) -> bool:
     disk, and is never worth taking a job down for.
     """
     remote_repo = remote_repo_path(node, repo_root)
-    worktree = f"{remote_repo}\\.gpuq-work\\job-{job_id:06d}"
+    worktree = worktree_path(node, repo_root, job_id)
     stage_dir = expand_remote(node, REMOTE_STAGE_DIR)
     script_path = f"{stage_dir}\\unlink-{job_id:06d}.ps1"
 
@@ -638,25 +656,31 @@ def verify_passthrough(
 #: Written next to the collected archive so the two halves cannot disagree
 #: about which files were considered.
 _COLLECT_SCRIPT = r'''
-param([string]$Root, [string]$Stage, [string]$Zip, [string]$SinceUtc, [string]$Paths)
+param([string]$Roots, [string]$Stage, [string]$Zip, [string]$SinceUtc, [string]$Paths)
 $since = [datetime]::Parse($SinceUtc).ToUniversalTime()
 Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue
 Remove-Item -Force $Zip -ErrorAction SilentlyContinue
 $count = 0
-foreach ($rel in ($Paths -split '\|')) {
-  if (-not $rel) { continue }
-  $src = Join-Path $Root $rel
-  if (-not (Test-Path $src)) { continue }
-  $items = if ((Get-Item $src).PSIsContainer) {
-    Get-ChildItem -LiteralPath $src -Recurse -File -Force -ErrorAction SilentlyContinue
-  } else { Get-Item -LiteralPath $src }
-  foreach ($f in $items) {
-    if ($f.LastWriteTimeUtc -le $since) { continue }
-    $r = $f.FullName.Substring($Root.Length).TrimStart('\')
-    $dest = Join-Path $Stage $r
-    New-Item -ItemType Directory -Force (Split-Path $dest) | Out-Null
-    Copy-Item -LiteralPath $f.FullName -Destination $dest -Force
-    $count++
+foreach ($root in ($Roots -split '\|')) {
+  if (-not $root) { continue }
+  if (-not (Test-Path -LiteralPath $root)) { continue }
+  $rootFull = (Get-Item -LiteralPath $root).FullName.TrimEnd('\')
+  foreach ($rel in ($Paths -split '\|')) {
+    if (-not $rel) { continue }
+    $src = Join-Path $rootFull $rel
+    if (-not (Test-Path -LiteralPath $src)) { continue }
+    $items = if ((Get-Item -LiteralPath $src).PSIsContainer) {
+      Get-ChildItem -LiteralPath $src -Recurse -File -Force -ErrorAction SilentlyContinue
+    } else { Get-Item -LiteralPath $src }
+    foreach ($f in $items) {
+      if ($f.LastWriteTimeUtc -le $since) { continue }
+      $r = $f.FullName.Substring($rootFull.Length).TrimStart('\')
+      $dest = Join-Path $Stage $r
+      if (Test-Path -LiteralPath $dest) { continue }
+      New-Item -ItemType Directory -Force (Split-Path $dest) | Out-Null
+      Copy-Item -LiteralPath $f.FullName -Destination $dest -Force
+      $count++
+    }
   }
 }
 if ($count -gt 0) {
@@ -678,10 +702,26 @@ def collect_outputs(
 ) -> dict[str, Any]:
     """Copy back what a remote job wrote, and only what it wrote.
 
-    A declared output path is a junction to the node's *live* repository, so a
-    job writing `runs/records/x.json` writes into the node's real tree, not
-    into the disposable worktree. Both machines therefore have their own copy
-    of that directory and a wholesale copy would clobber one with the other.
+    **Two trees are searched, worktree first.** Where a job's results land
+    depends on how the path was written, and both spellings are legitimate:
+
+    * a *relative* path lands in the disposable worktree, unless it passes
+      through a passthrough junction, in which case it lands in the live tree;
+    * an *absolute* path under the repository lands in the live tree, which is
+      what `arc-whest` and `biohub` deliberately require, because a relative
+      artifact would sit in the snapshot and be deleted when it expires.
+
+    Searching only the live tree missed the first case entirely - results were
+    looked for beside the worktree rather than inside it, and a job reported
+    "declared outputs, but nothing was written". Searching both, worktree
+    first, is what makes either spelling come home. A file already staged from
+    an earlier root is not overwritten, so the job's own copy beats a stale one.
+
+    Only files modified after the job started come back, so naming a path that
+    turns out to be an input costs nothing. The comparison happens **on the
+    node**, against the node's own clock, because comparing a remote file's
+    timestamp against this machine's clock would silently include or drop files
+    whenever the two disagree - and they will.
 
     So only files modified after the job started come back. The comparison
     happens **on the node**, against the node's own clock, because comparing a
@@ -698,11 +738,17 @@ def collect_outputs(
     if not outputs:
         return result
 
-    remote_repo = remote_repo_path(node, repo_root)
+    # Worktree first: see the docstring. A job that wrote a relative path
+    # has its results inside the worktree, which is not under any declared
+    # output path in the live tree.
+    roots = [
+        worktree_path(node, repo_root, job_id),
+        remote_repo_path(node, repo_root),
+    ]
     stage_dir = expand_remote(node, REMOTE_STAGE_DIR)
-    remote_stage = f"{stage_dir}\out-{job_id:06d}"
-    remote_zip = f"{stage_dir}\out-{job_id:06d}.zip"
-    remote_script = f"{stage_dir}\collect-{job_id:06d}.ps1"
+    remote_stage = f"{stage_dir}" + chr(92) + f"out-{job_id:06d}"
+    remote_zip = f"{stage_dir}" + chr(92) + f"out-{job_id:06d}.zip"
+    remote_script = f"{stage_dir}" + chr(92) + f"collect-{job_id:06d}.ps1"
 
     with tempfile.TemporaryDirectory(prefix="workerq-collect-") as tmp:
         script = Path(tmp) / "collect.ps1"
@@ -713,11 +759,12 @@ def collect_outputs(
             result["error"] = f"could not send the collector: {sent.error}"
             return result
 
-        joined = "|".join(p.replace("/", "\\") for p in outputs)
+        joined = "|".join(p.replace("/", chr(92)) for p in outputs)
+        joined_roots = "|".join(roots)
         run = nodes.run_remote(
             node,
             "powershell -NoProfile -ExecutionPolicy Bypass -File "
-            f'{_q(remote_script)} -Root {_q(remote_repo)} -Stage {_q(remote_stage)} '
+            f'{_q(remote_script)} -Roots "{joined_roots}" -Stage {_q(remote_stage)} '
             f'-Zip {_q(remote_zip)} -SinceUtc "{since_utc}" -Paths "{joined}"',
             timeout=max(node.timeout_seconds, 600.0),
         )

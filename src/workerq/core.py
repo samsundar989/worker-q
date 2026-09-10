@@ -386,6 +386,16 @@ class GPUQService:
                     f"job cannot run on {pinned_node}: " + "; ".join(verdict.reasons)
                 )
 
+            # An absolute write path under the repository is adopted as a
+            # declared output rather than refused, which is what lets projects
+            # that mandate absolute paths - arc-whest, biohub - use a second
+            # machine at all. Acting on this is not optional: without it the job
+            # would run there and leave its results behind. See `travel`.
+            if verdict.adopt_outputs:
+                outputs = list(outputs) + [
+                    o for o in verdict.adopt_outputs if o not in outputs
+                ]
+
             remote_spec: dict[str, Any] | None = None
             if snapshot.commit and repo_root is not None and verdict.ok:
                 remote_spec = {

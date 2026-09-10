@@ -17,8 +17,24 @@ snapshot and is deleted when the snapshot expires. The absolute path is the fix
 for that, and it is what makes the job unsafe to move.
 
 A missing dataset fails loudly and is therefore not the dangerous case. This
-one succeeds wrongly, so it is refused before a job is placed rather than
+one succeeds wrongly, so it must be handled before a job is placed rather than
 detected afterwards.
+
+**Handled, not refused.** Refusing was the first answer, and it was too strict:
+`arc-whest` and `biohub` both *instruct* their jobs to write absolute paths,
+for the good reason above, so refusing them meant those projects could never
+use a second machine at all. But the path is already known precisely - it was
+found in order to refuse it - and its repo-relative form is exactly what
+`staging.collect_outputs` indexes by. So the write target is adopted as a
+declared output instead, and the results are copied home.
+
+Declaring a path costs nothing if the guess is wrong: collection only returns
+files modified after the job started, so a path that turns out to be an input
+is skipped. That asymmetry is what makes adoption safe where permissiveness
+would not be.
+
+One refusal remains, because it cannot be repaired this way: a job with no git
+snapshot has no commit to ship.
 """
 
 from __future__ import annotations
@@ -51,9 +67,18 @@ class TravelVerdict:
     reasons: list[str] = field(default_factory=list)
     #: Absolute paths found inside the repository, which is the sharp case.
     repo_paths: list[str] = field(default_factory=list)
+    #: Repo-relative forms of `repo_paths`, to be declared as outputs so the
+    #: results are copied home. This is what turns the hazard into a handled
+    #: case rather than a refusal.
+    adopt_outputs: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"ok": self.ok, "reasons": self.reasons, "repo_paths": self.repo_paths}
+        return {
+            "ok": self.ok,
+            "reasons": self.reasons,
+            "repo_paths": self.repo_paths,
+            "adopt_outputs": self.adopt_outputs,
+        }
 
 
 def _within(path: Path, root: Path) -> bool:
@@ -62,6 +87,21 @@ def _within(path: Path, root: Path) -> bool:
         return True
     except (ValueError, OSError):
         return False
+
+
+def repo_relative(path_text: str, repo_root: Path) -> str | None:
+    """`C:/.../arc-whest/experiments/x.json` -> `experiments/x.json`.
+
+    Forward slashes, because that is how `.gpuq.toml` spells outputs and the
+    collector converts to the node's separator itself. Returns None when the
+    path cannot be expressed against the repository, which is the only case
+    where a job still has to stay home.
+    """
+    try:
+        resolved = Path(os.path.expandvars(path_text)).expanduser()
+        return resolved.resolve().relative_to(repo_root.resolve()).as_posix()
+    except (ValueError, OSError):
+        return None
 
 
 def absolute_repo_paths(argv: list[str], repo_root: Path) -> list[str]:
@@ -122,12 +162,12 @@ def assess(
     outputs: list[str] | None = None,
     snapshot_commit: str | None = None,
 ) -> TravelVerdict:
-    """May this job be run on another machine?
+    """May this job run on another machine, and what must be brought back?
 
-    Deliberately conservative. Being wrong in the permissive direction produces
-    a job that reports success and puts its results somewhere else; being wrong
-    in the restrictive direction just keeps a job on the machine it would have
-    run on anyway.
+    Returns `adopt_outputs`: repo-relative paths the caller should add to the
+    job's declared outputs. Acting on them is not optional - a job placed
+    remotely without them is the silent-success case this module exists to
+    prevent.
     """
     reasons: list[str] = []
 
@@ -138,18 +178,36 @@ def assess(
         return TravelVerdict(False, reasons)
 
     repo_paths = absolute_repo_paths(list(argv), repo_root)
-    if repo_paths:
-        shown = ", ".join(repo_paths[:3])
-        more = f" (and {len(repo_paths) - 3} more)" if len(repo_paths) > 3 else ""
-        reasons.append(
-            f"the command writes to an absolute path inside the repository: {shown}{more}. "
-            "That path resolves on the other machine too, so the job would succeed "
-            "there and leave its output on a machine you are not looking at. Use a "
-            "path relative to the repository and declare it in [snapshot] outputs, "
-            "or pin the job with --node local"
-        )
 
-    return TravelVerdict(not reasons, reasons, repo_paths)
+    declared = [
+        str(o).replace(chr(92), "/").strip("/") for o in (outputs or []) if str(o).strip()
+    ]
+    adopt: list[str] = []
+    unreachable: list[str] = []
+    for raw in repo_paths:
+        rel = repo_relative(raw, repo_root)
+        if rel is None:
+            # Inside the repository by `_within`, yet not expressible against
+            # it. Nothing could collect this, so the job stays home.
+            unreachable.append(raw)
+            continue
+        if rel in adopt:
+            continue
+        # Already covered, either exactly or by a declared parent directory.
+        if any(rel == d or rel.startswith(d + "/") for d in declared):
+            continue
+        adopt.append(rel)
+
+    if unreachable:
+        shown = ", ".join(unreachable[:3])
+        reasons.append(
+            f"the command writes to {shown}, which is under the repository but "
+            "cannot be expressed relative to it, so results could not be copied "
+            "back. Use a path relative to the repository instead"
+        )
+        return TravelVerdict(False, reasons, repo_paths)
+
+    return TravelVerdict(True, [], repo_paths, adopt)
 
 
 def describe_outputs(outputs: list[str] | None) -> str | None:

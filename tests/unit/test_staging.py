@@ -351,3 +351,65 @@ def test_removal_is_abandoned_if_the_unlinker_cannot_be_sent(monkeypatch, tmp_pa
     monkeypatch.setattr(staging.nodes, "copy_to_node", fail_copy)
 
     assert staging.remove_worktree(node(), tmp_path / "proj", 42) is False
+
+
+# --------------------------------------------------------------------------
+# Where results are looked for
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def staged(monkeypatch, tmp_path):
+    """A repo whose far-side path needs no scan, and a scripted remote."""
+    repo = tmp_path / "arc-whest"
+    repo.mkdir()
+    fake = FakeRemote(default="COLLECTED 0")
+    monkeypatch.setattr(staging, "origin_url", lambda _r: None)
+    monkeypatch.setattr(staging.nodes, "run_remote", fake)
+    monkeypatch.setattr(
+        staging.nodes, "copy_to_node", lambda *a, **k: RemoteResult(True, 0, "", "")
+    )
+    return repo, fake
+
+
+def test_the_worktree_path_has_a_single_definition(staged):
+    """Three callers have to agree on this, so it is worth pinning."""
+    repo, _ = staged
+    assert staging.worktree_path(node(), repo, 450) == (
+        "D:" + chr(92) + "repos" + chr(92) + "arc-whest" + chr(92)
+        + ".gpuq-work" + chr(92) + "job-000450"
+    )
+
+
+def test_the_collector_searches_the_worktree_before_the_live_tree(staged):
+    """The bug this fixes: results written to a *relative* path live in the
+    worktree, and searching only the live tree reported "nothing was written".
+
+    Worktree first, so a job's own copy beats a stale one in the live tree.
+    """
+    import re
+
+    repo, fake = staged
+    staging.collect_outputs(
+        node(),
+        repo,
+        ["experiments/x.json"],
+        job_id=450,
+        since_utc="2026-09-09T20:00:00+00:00",
+    )
+
+    collect = [c for c in fake.calls if "-Roots" in c]
+    assert collect, f"no collector invocation in {fake.calls}"
+    roots = re.search(r'-Roots "([^"]+)"', collect[0]).group(1).split("|")
+    assert len(roots) == 2, roots
+    assert roots[0] == staging.worktree_path(node(), repo, 450)
+    assert roots[1] == staging.remote_repo_path(node(), repo)
+
+
+def test_declaring_no_outputs_still_costs_no_round_trip(staged):
+    repo, fake = staged
+    result = staging.collect_outputs(
+        node(), repo, [], job_id=1, since_utc="2026-09-09T20:00:00+00:00"
+    )
+    assert result["collected"] == 0
+    assert not [c for c in fake.calls if "-Roots" in c]

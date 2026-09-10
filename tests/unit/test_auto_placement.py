@@ -210,3 +210,73 @@ def test_a_drained_node_is_not_offered_to_placement(dispatcher):
     dispatcher.config.nodes = [NodeConfig(name="w", address="h", enabled=False)]
     chosen, _ = dispatcher._choose_node(row(1, cpus=8), [row(1, cpus=8)], 0, True)
     assert chosen is None
+
+
+# --------------------------------------------------------------------------
+# A full machine is a fact about this machine, not about the queue
+# --------------------------------------------------------------------------
+
+
+def _enqueue_travelling(dispatcher, *, cpus: int = 1) -> int:
+    """A queued job that has somewhere else it could run."""
+    return dispatcher.store.enqueue(
+        ["python", "-c", "pass"],
+        label=None,
+        gpu_count=0,
+        slots=1,
+        priority_rank=100,
+        log_path=None,
+        cwd=None,
+        env=None,
+        ram_mib=GIB,
+        cpus=cpus,
+        remote_spec={"repo_root": "C:/Users/samsu/Documents/x", "outputs": []},
+    )
+
+
+def test_a_full_machine_still_sends_work_to_another(dispatcher, monkeypatch):
+    """The bug: local slot exhaustion ended the scan for the whole queue.
+
+    A remote job consumes no local slot - the dispatcher says so itself - so
+    returning here idles the second machine at exactly the moment the queue is
+    fullest, which is when it is most needed.
+    """
+    dispatcher.config.core.max_concurrent_jobs = 1
+    job = _enqueue_travelling(dispatcher)
+    dispatcher.adopted[999] = object()  # the one slot is occupied
+
+    offered: list[tuple[int, bool]] = []
+    placed: list[int] = []
+
+    def fake_choose(row, queued, position, local_ok):
+        offered.append((int(row["id"]), local_ok))
+        return object(), None
+
+    def fake_start_remote(row, node):
+        placed.append(int(row["id"]))
+        return True
+
+    monkeypatch.setattr(dispatcher, "_choose_node", fake_choose)
+    monkeypatch.setattr(dispatcher, "_start_remote", fake_start_remote)
+    dispatcher._start_ready_jobs()
+
+    assert offered == [(job, False)], "offered for placement, and told it cannot run here"
+    assert placed == [job], "and actually placed, rather than left queued"
+
+
+def test_a_full_machine_never_starts_a_job_locally(dispatcher, monkeypatch):
+    """The guard that must survive the fix: no slot still means no local start."""
+    dispatcher.config.core.max_concurrent_jobs = 1
+    job = _enqueue_travelling(dispatcher)
+    dispatcher.adopted[999] = object()
+
+    started: list[int] = []
+    monkeypatch.setattr(dispatcher, "_choose_node", lambda *a, **k: (None, None))
+    monkeypatch.setattr(
+        dispatcher, "_start_job", lambda row, devices: started.append(int(row["id"])) or True
+    )
+    dispatcher._start_ready_jobs()
+
+    assert started == [], "a job must never start without a slot"
+    row = dispatcher.store.get(job)
+    assert "free slot" in str(row["wait_reason"]), row["wait_reason"]

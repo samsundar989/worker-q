@@ -888,15 +888,12 @@ class Dispatcher:
         for position, row in enumerate(queued):
             backend_id = int(row["id"])
 
-            if in_flight >= slots:
-                # Every slot is busy. Nothing further down can start either, so
-                # say so for the rest of the queue rather than leaving it blank.
-                reason = f"waiting for a free slot ({in_flight} of {slots} in use)"
-                if head_blocked is None:
-                    self._consider_preemption(row, reason)
-                for rest in queued[position:]:
-                    self._record_wait(int(rest["id"]), reason)
-                return
+            # Every local slot is busy. That is a fact about *this* machine, so
+            # it must not end the scan: a job with somewhere else to go needs no
+            # slot here, and returning now is precisely what leaves the second
+            # machine idle at the moment the queue is fullest. The job is marked
+            # unable to start *locally* and still offered to `_choose_node`.
+            slots_full = in_flight >= slots
 
             # A pinned job is judged against the machine it is pinned to,
             # not this one. Its resources are not ours to account for.
@@ -926,17 +923,23 @@ class Dispatcher:
             # the headroom that is actually free, once running reservations and
             # foreign workloads are accounted for?
             devices: list[int] | None = []
-            decision = self._admit(row)
-            if not decision.admit:
-                blocked_reason = decision.reason
+            if slots_full:
+                # No slot to admit into, so the resource question is moot. The
+                # reason still has to be recorded, because it is what `status`
+                # shows for every job behind the full machine.
+                blocked_reason = f"waiting for a free slot ({in_flight} of {slots} in use)"
             else:
-                devices, blocked_reason = self._allocate_devices(
-                    int(row.get("gpu_count") or 0),
-                    gpu_mode=str(row.get("gpu_mode") or "exclusive"),
-                    vram_mib=float(row.get("vram_mib") or 0.0),
-                )
-                if devices is not None:
-                    blocked_reason = None
+                decision = self._admit(row)
+                if not decision.admit:
+                    blocked_reason = decision.reason
+                else:
+                    devices, blocked_reason = self._allocate_devices(
+                        int(row.get("gpu_count") or 0),
+                        gpu_mode=str(row.get("gpu_mode") or "exclusive"),
+                        vram_mib=float(row.get("vram_mib") or 0.0),
+                    )
+                    if devices is not None:
+                        blocked_reason = None
 
             # Placement. Asked whether or not this machine could take the job,
             # because "it fits here" is not the same as "here is the right
