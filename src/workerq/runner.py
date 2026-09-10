@@ -39,6 +39,16 @@ _PROGRESS_POLL_SECONDS = 3.0
 #: fine resolution; not perturbing the job does.
 _USAGE_POLL_SECONDS = 15.0
 
+#: For the first half minute, though, sample hard. At a flat 15 s a 41-second
+#: job records two samples, and a two-sample peak is whatever the process tree
+#: happened to hold at two arbitrary instants - it has been seen both to miss
+#: the real peak and to land on a transient. A quarter of all measured jobs
+#: here had two samples or fewer. The extra cost is small and front-loaded:
+#: `host.memory` is a ctypes call into GlobalMemoryStatusEx, and the process
+#: tree walk is already cached for three seconds.
+_USAGE_FAST_POLL_SECONDS = 2.0
+_USAGE_FAST_WINDOW_SECONDS = 30.0
+
 
 class RunnerError(RuntimeError):
     pass
@@ -376,8 +386,16 @@ def run_job(
                 baseline_device = int(os.environ["WORKERQ_VRAM_DEVICE"])
         except (TypeError, ValueError, KeyError):
             baseline_mib = baseline_device = None
+        watch_started = time.monotonic()
         try:
-            while not stop_watch.wait(_USAGE_POLL_SECONDS):
+            while True:
+                elapsed = time.monotonic() - watch_started
+                if stop_watch.wait(
+                    _USAGE_FAST_POLL_SECONDS
+                    if elapsed < _USAGE_FAST_WINDOW_SECONDS
+                    else _USAGE_POLL_SECONDS
+                ):
+                    break
                 try:
                     pids = host.descendants_of(roots)
                     ram = host.tree_memory_mib(roots)

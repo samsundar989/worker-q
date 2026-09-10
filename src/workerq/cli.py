@@ -1710,6 +1710,7 @@ def reserve(
 
 def _render_usage_accuracy(service: GPUQService, *, json_output: bool) -> None:
     """`workerq resources --verify` - declared footprint versus measured peak."""
+    from workerq import usage
     from workerq.report import declared_vs_observed
 
     service.ensure_ready()
@@ -1728,9 +1729,11 @@ def _render_usage_accuracy(service: GPUQService, *, json_output: bool) -> None:
     table = Table(box=None, pad_edge=False)
     table.add_column("ID", justify="right")
     table.add_column("PROJECT")
-    table.add_column("RAM DECL", justify="right")
-    table.add_column("RAM PEAK", justify="right")
+    table.add_column("NODE")
+    table.add_column("BUDGET", justify="right")
+    table.add_column("PEAK CMT", justify="right")
     table.add_column("USED", justify="right")
+    table.add_column("N", justify="right")
     table.add_column("SUGGEST", justify="right")
     table.add_column("VRAM DECL", justify="right")
     table.add_column("VRAM PEAK", justify="right")
@@ -1738,21 +1741,33 @@ def _render_usage_accuracy(service: GPUQService, *, json_output: bool) -> None:
     def _gib(value: float | None) -> str:
         return f"{value / 1024:.1f}" if value is not None else "-"
 
+    # Verdict, not a raw threshold on the ratio. The classifier is the one
+    # place that knows a GPU job's commit legitimately includes its VRAM.
+    styles = {
+        usage.VERDICT_UNDER: "red",
+        usage.VERDICT_SEVERELY_OVER: "yellow",
+        usage.VERDICT_OVER: "yellow",
+        usage.VERDICT_OK: "green",
+    }
     for row in data["jobs"][:40]:
-        ratio = row["ram_ratio"]
+        ratio = row["commit_ratio"]
+        verdict = row["verdict"]
         if ratio is None:
             used = "-"
+        elif verdict in usage.INCONCLUSIVE:
+            # Shown, but greyed and never argued from: too few samples to say.
+            used = f"[dim]{ratio:.0%}?[/dim]"
         else:
-            # Under-declaring is the dangerous direction: the ledger hands out
-            # capacity the job then exceeds.
-            style = "red" if ratio > 1.0 else ("yellow" if ratio < 0.4 else "green")
+            style = styles.get(verdict, "dim")
             used = f"[{style}]{ratio:.0%}[/{style}]"
         table.add_row(
             str(row["id"]),
             row["project"],
-            _gib(row["declared_ram_mib"]),
-            _gib(row["peak_ram_mib"]),
+            row["node"],
+            _gib(row["commit_budget_mib"]),
+            _gib(row["peak_commit_mib"]),
             used,
+            str(row["samples"] or "-"),
             (
                 f"{row['suggested_ram_gb']:.0f}"
                 if row.get("suggested_ram_gb") is not None
@@ -1763,11 +1778,40 @@ def _render_usage_accuracy(service: GPUQService, *, json_output: bool) -> None:
         )
 
     console.print(table)
-    median = data["median_ram_ratio"]
+    console.print(
+        "[dim]BUDGET is declared RAM plus declared VRAM: the measured peak is "
+        "commit charge, and under WDDM a GPU job's commit includes its video "
+        "memory. USED is peak commit over that budget; a trailing ? means too "
+        "few samples to conclude anything from.[/dim]"
+    )
+    median = data["median_commit_ratio"]
     if median is not None:
+        console.print()
         console.print(
-            f"\nMedian job uses [bold]{median:.0%}[/bold] of the RAM it declares "
-            f"across {data['measured']} measured job(s)."
+            f"Median job uses [bold]{median:.0%}[/bold] of the footprint it "
+            f"declares across {data['measured']} measured job(s)."
+        )
+    under = data.get("worst_under") or []
+    if under:
+        console.print()
+        console.print(
+            f"[red]{len(under)} job(s) exceeded the footprint they declared.[/red]"
+            " That is the direction that takes the machine down:"
+        )
+        for row in under[:5]:
+            console.print(
+                f"  [red]#{row['job_id']}[/red] {row['project']} used "
+                f"{row['commit_ratio']:.0%} of its budget "
+                f"({_gib(row['peak_commit_mib'])} of "
+                f"{_gib(row['commit_budget_mib'])} GiB)"
+            )
+    held = data.get("unused_gib_hours") or 0.0
+    if held > 0:
+        console.print()
+        console.print(
+            f"[dim]{held:,.0f} GiB-hours of declared footprint was reserved and "
+            "never touched. That is queue time other work spent waiting for "
+            "nothing.[/dim]"
         )
     waste = data["mean_overdeclared_ram_mib"]
     if waste and waste > 0:

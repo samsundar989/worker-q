@@ -1512,6 +1512,44 @@ class GPUQService:
     # ------------------------------------------------------------------
     # Reconciliation (spec section 11.9)
     # ------------------------------------------------------------------
+    #: Columns a node is allowed to fill in on a job that ran there. Nothing
+    #: about state, timing or exit code is in this list: those come through
+    #: the backend's own state machine, which validates transitions.
+    _REMOTE_USAGE_COLUMNS = (
+        "peak_ram_mib",
+        "peak_vram_mib",
+        "usage_samples",
+        "peak_source",
+        "vram_source",
+        "progress_fraction",
+    )
+
+    def _adopt_remote_usage(self, job: Job, measured: Any) -> None:
+        """Copy a node's measurements onto the local record.
+
+        Deliberately does not overwrite a peak this machine measured itself.
+        That should be impossible - a remote job has no local runner - but a
+        job adopted after a restart could have both, and the local figure is
+        the one drawn from a process tree we could actually see.
+        """
+        if not isinstance(measured, dict) or not measured:
+            return
+        if job.peak_ram_mib is not None and job.usage_samples:
+            return
+        updates = {
+            key: measured[key]
+            for key in self._REMOTE_USAGE_COLUMNS
+            if measured.get(key) is not None
+        }
+        if not updates:
+            return
+        try:
+            self.db.update_job(job.id, **updates)
+        except Exception:
+            # Measurement is a nicety. It must never block reconciliation,
+            # which is what actually gets a finished job out of RUNNING.
+            pass
+
     def reconcile_job(self, job: Job, *, mutate: bool = True) -> str | None:
         """Align one DB row with backend truth. Returns a change description."""
         if job.is_terminal:
@@ -1544,6 +1582,12 @@ class GPUQService:
         placed_on = bjob.extra.get("node")
         if mutate and placed_on and placed_on != job.node:
             self.db.update_job(job.id, node=str(placed_on))
+
+        # Same reasoning, for what the node measured. A remote job has no
+        # runner on this machine, so nothing else would ever fill these in and
+        # every travelled job would read as unmeasured.
+        if mutate:
+            self._adopt_remote_usage(job, bjob.extra.get("remote_usage"))
 
         target = map_backend_state(bjob.state, bjob.exit_code)
         if target is None or target is job.state_enum:

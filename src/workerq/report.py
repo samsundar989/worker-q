@@ -318,68 +318,50 @@ def declared_vs_observed(service: GPUQService, *, limit: int = 200) -> dict[str,
     it could. This is the evidence for correcting them - and for trusting the
     ledger enough to run jobs in parallel at all.
 
+    The comparison is against the *commit budget*, not declared RAM alone. See
+    `workerq.usage` for why: the measured peak is commit charge, and under WDDM
+    a GPU job's commit is roughly its RAM plus its VRAM, so judging one against
+    the other reports well-declared GPU jobs as dangerously under-declared.
+
     Jobs sampled before observed-usage recording existed are skipped rather
     than counted as zero.
     """
-    from workerq.eta import suggested_ram_gb, suggested_vram_gb
+    from workerq import usage as usage_mod
 
     # Same ceiling the CLI applies to a single job: a SUGGEST column that names
     # more than the machine has is advice nobody can take.
     ram_ceiling, vram_ceiling = service._suggestion_ceiling()
 
     rows: list[dict[str, Any]] = []
+    measured: list[Any] = []
     for job in service.db.list_jobs(limit=limit):
         # A running job's peak is provisional - it may not have reached full
         # size yet - and a suggestion drawn from a partial peak is worse than
         # none at all.
         if job.peak_ram_mib is None or not job.is_terminal:
             continue
-        declared_ram = job.requested_ram_mib
-        declared_vram = job.requested_vram_mib
-        rows.append(
-            {
-                "id": job.id,
-                "project": job.project,
-                "command_signature": job.command_signature,
-                "declared_ram_mib": declared_ram,
-                "peak_ram_mib": job.peak_ram_mib,
-                "ram_ratio": (
-                    job.peak_ram_mib / declared_ram
-                    if declared_ram and job.peak_ram_mib is not None
-                    else None
-                ),
-                "declared_vram_mib": declared_vram,
-                "peak_vram_mib": job.peak_vram_mib,
-                "vram_ratio": (
-                    job.peak_vram_mib / declared_vram
-                    if declared_vram and job.peak_vram_mib is not None
-                    else None
-                ),
-                "samples": job.usage_samples,
-                "peak_source": job.peak_source,
-                "vram_source": job.vram_source,
-                "suggested_vram_gb": (
-                    suggested_vram_gb(job.peak_vram_mib, vram_ceiling)
-                    if job.peak_vram_mib is not None
-                    else None
-                ),
-                "suggested_ram_gb": (
-                    suggested_ram_gb(job.peak_ram_mib, ram_ceiling)
-                    if job.peak_ram_mib is not None
-                    else None
-                ),
-            }
+        row = usage_mod.for_job(
+            job, ram_ceiling=ram_ceiling, vram_ceiling=vram_ceiling
         )
+        measured.append(row)
+        entry = row.to_dict()
+        entry["id"] = row.job_id
+        # Retained under its old name for anything still reading it, but it is
+        # the misleading number: peak commit over declared RAM, which ignores
+        # that a GPU job's commit includes its VRAM. Prefer `commit_ratio`.
+        entry["ram_ratio"] = (
+            row.peak_commit_mib / row.declared_ram_mib
+            if row.declared_ram_mib and row.peak_commit_mib is not None
+            else None
+        )
+        entry["peak_ram_mib"] = row.peak_commit_mib
+        rows.append(entry)
 
-    ratios = [r["ram_ratio"] for r in rows if r["ram_ratio"] is not None]
-    ratios.sort()
-    median = ratios[len(ratios) // 2] if ratios else None
-    # Reclaimable headroom is what the ledger is holding back for RAM that the
-    # jobs demonstrably never touched.
+    summary = usage_mod.summarise(measured)
     waste = [
-        r["declared_ram_mib"] - r["peak_ram_mib"]
+        r["unused_mib"]
         for r in rows
-        if r["declared_ram_mib"] and r["peak_ram_mib"] is not None
+        if r.get("unused_mib") is not None and r["unused_mib"] > 0
     ]
     vram_waste = [
         r["declared_vram_mib"] - r["peak_vram_mib"]
@@ -389,14 +371,18 @@ def declared_vs_observed(service: GPUQService, *, limit: int = 200) -> dict[str,
     return {
         "jobs": rows,
         "measured": len(rows),
-        "median_ram_ratio": median,
+        "median_ram_ratio": summary.median_commit_ratio,
+        "median_commit_ratio": summary.median_commit_ratio,
+        "median_eta_ratio": summary.median_eta_ratio,
+        "counts": summary.counts,
+        "unused_gib_hours": summary.unused_gib_hours,
+        "worst_over": [u.to_dict() for u in summary.worst_over],
+        "worst_under": [u.to_dict() for u in summary.worst_under],
         "mean_overdeclared_ram_mib": (sum(waste) / len(waste)) if waste else None,
         "vram_measurable": any(r["peak_vram_mib"] is not None for r in rows),
         # True when the only VRAM figures available came from whole-card deltas
         # rather than per-process readings, which the display must say out loud.
-        "vram_from_device_delta": bool(rows)
-        and any(r["vram_source"] == "device_delta" for r in rows)
-        and not any(r["vram_source"] == "measured" for r in rows),
+        "vram_from_device_delta": summary.vram_from_device_delta,
         "mean_overdeclared_vram_mib": (
             (sum(vram_waste) / len(vram_waste)) if vram_waste else None
         ),

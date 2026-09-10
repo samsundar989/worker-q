@@ -149,6 +149,31 @@ def _reason_key(reason: str) -> str:
     return "".join("#" if c.isdigit() else c for c in reason)
 
 
+#: How core marks a queue row as belonging to one of its jobs. Parsed rather
+#: than imported, because the dispatcher deliberately never reads the core
+#: database and importing core here would be the first step towards it.
+_LABEL_PREFIX = "worker-q:"
+
+
+def job_id_from_label(label: str | None) -> int | None:
+    """The worker-q job id a queue row belongs to.
+
+    Events recorded against a backend id alone cannot be joined to a job
+    without going through the jobs table, and nothing did - so `events.job_id`
+    was NULL in every row ever written, and a per-job timeline was impossible
+    to build. The label already carries the id; it just was not being read.
+    """
+    if not label or not label.startswith(_LABEL_PREFIX):
+        return None
+    parts = label.split(":")
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
+
+
 @dataclass
 class _RunningJob:
     backend_id: int
@@ -252,6 +277,35 @@ class Dispatcher:
         except OSError:
             pass
         print(line, flush=True)
+
+    def _event(
+        self,
+        kind: str,
+        *,
+        backend_id: int | None = None,
+        row: dict[str, Any] | None = None,
+        detail: str | None = None,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        """Record an event against both ids, so it can be found by either.
+
+        The backend id is what the dispatcher works in; the worker-q job id is
+        what a person and every other view work in. Resolving it here, once, is
+        what makes a per-job timeline possible at all.
+        """
+        job_id = None
+        if backend_id is not None:
+            label = (row or {}).get("label")
+            if label is None:
+                label = (self.store.get(backend_id) or {}).get("label")
+            job_id = job_id_from_label(label)
+        self.telemetry.record_event(
+            kind,
+            job_id=job_id,
+            backend_job_id=backend_id,
+            detail=detail,
+            data=data,
+        )
 
     # -- gpu --------------------------------------------------------------
     def _gpu_info(self) -> Any:
@@ -503,9 +557,7 @@ class Dispatcher:
 
         self._blocked[backend_id] = (first, key, now + _BLOCKED_REPEAT_SECONDS)
         self.log(f"job {backend_id}: waiting - {reason}")
-        self.telemetry.record_event(
-            EVENT_BLOCKED, backend_job_id=backend_id, detail=reason
-        )
+        self._event(EVENT_BLOCKED, backend_id=backend_id, detail=reason)
 
     # -- preemption ---------------------------------------------------------
     def _preemption_candidates(self, waiter: dict[str, Any]) -> list[dict[str, Any]]:
@@ -599,9 +651,10 @@ class Dispatcher:
                     f"(rank {waiter.get('priority_rank')} beats {victim.get('priority_rank')}); "
                     f"{reason or 'higher priority'}"
                 )
-                self.telemetry.record_event(
+                self._event(
                     EVENT_PREEMPTED,
-                    backend_job_id=victim_id,
+                    backend_id=victim_id,
+                    row=victim,
                     detail=f"displaced by backend job {waiter['id']}",
                     data={
                         "by_backend_job_id": int(waiter["id"]),
@@ -738,8 +791,8 @@ class Dispatcher:
         )
         if self.store.request_preempt(victim_id, by_backend_id=None):
             self.log(detail)
-            self.telemetry.record_event(
-                EVENT_PRESSURE, backend_job_id=victim_id, detail=detail
+            self._event(
+                EVENT_PRESSURE, backend_id=victim_id, row=victim, detail=detail
             )
         self._pressure_strikes = 0
 
@@ -841,9 +894,10 @@ class Dispatcher:
             f"job {backend_id}: started pid={proc.pid} devices={devices or '-'} "
             f"ram={request.ram_mib / 1024:.1f}GiB cpus={request.cpus} cmd={argv[:4]}"
         )
-        self.telemetry.record_event(
+        self._event(
             EVENT_STARTED,
-            backend_job_id=backend_id,
+            backend_id=backend_id,
+            row=row,
             detail=f"pid {proc.pid}",
             data={"devices": devices, "request": request.to_dict()},
         )
@@ -1393,9 +1447,10 @@ class Dispatcher:
             f"job {backend_id}: placed on {node.name} as its job {remote_id} "
             f"({shipped['bundle_bytes']} bytes shipped)"
         )
-        self.telemetry.record_event(
+        self._event(
             EVENT_STARTED,
-            backend_job_id=backend_id,
+            backend_id=backend_id,
+            row=row,
             detail=f"remote:{node.name}",
             data={"node": node.name, "remote_id": remote_id,
                   "bundle_bytes": shipped["bundle_bytes"]},
@@ -1443,13 +1498,18 @@ class Dispatcher:
                 self._collect_remote_log(node, row, entry)
                 collected = self._collect_remote_outputs(node, row)
                 self._drop_remote_worktree(node, row)
+                # Before finish, not after: core stops revisiting a job the
+                # moment it is terminal, so usage recorded afterwards is never
+                # adopted.
+                self.store.record_remote_usage(backend_id, entry)
                 self.store.finish(backend_id, exit_code=int(code))
                 if collected:
                     self.log(f"job {backend_id}: {collected}")
                 self.log(f"job {backend_id}: finished on {node_name} exit={code}")
-                self.telemetry.record_event(
+                self._event(
                     EVENT_FINISHED,
-                    backend_job_id=backend_id,
+                    backend_id=backend_id,
+                    row=row,
                     detail=f"remote:{node_name} exit {code}",
                     data={"exit_code": int(code), "node": node_name},
                 )
@@ -1577,16 +1637,16 @@ class Dispatcher:
             if row.get("preempt_requested"):
                 self.store.requeue(backend_id)
                 self.log(f"job {backend_id}: requeued after preemption (exit={code})")
-                self.telemetry.record_event(
-                    EVENT_PREEMPTED, backend_job_id=backend_id,
+                self._event(
+                    EVENT_PREEMPTED, backend_id=backend_id, row=row,
                     detail="requeued", data={"exit_code": code},
                 )
                 continue
 
             self.store.finish(backend_id, exit_code=code)
             self.log(f"job {backend_id}: finished exit={code}")
-            self.telemetry.record_event(
-                EVENT_FINISHED, backend_job_id=backend_id, detail=f"exit {code}",
+            self._event(
+                EVENT_FINISHED, backend_id=backend_id, detail=f"exit {code}",
                 data={"exit_code": code},
             )
 

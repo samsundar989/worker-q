@@ -78,6 +78,20 @@ EVENT_DAEMON = "daemon"
 EVENT_RESERVE = "reserve"
 EVENT_PRESSURE = "resource_pressure"
 
+#: Kinds that repeat while a condition persists rather than marking something
+#: happening once. They are worth keeping - a stalled queue's reasons are how
+#: you find out what it is stalled on - but on their own retention budget, or
+#: they bury the events that describe individual jobs. See `Telemetry.prune`.
+NOISY_EVENT_KINDS = (EVENT_BLOCKED, EVENT_PRESSURE)
+
+#: The record of what happened to jobs. Never evicted by queue noise.
+LIFECYCLE_EVENT_KINDS = (
+    EVENT_STARTED,
+    EVENT_FINISHED,
+    EVENT_CANCEL,
+    EVENT_PREEMPTED,
+)
+
 _SAMPLE_COLUMNS = (
     "id, at, gpu_used_mib, gpu_total_mib, gpu_free_percent, gpu_utilization, "
     "host_total_mib, host_available_mib, host_free_percent, commit_used_mib, "
@@ -295,7 +309,28 @@ class Telemetry:
         return [dict(r) for r in rows]
 
     # -- retention --------------------------------------------------------
-    def prune(self, *, keep_samples: int = 200_000, keep_events: int = 50_000) -> None:
+    def prune(
+        self,
+        *,
+        keep_samples: int = 200_000,
+        keep_events: int = 50_000,
+        keep_noise_events: int = 10_000,
+    ) -> None:
+        """Trim the store, keeping each kind of event on its own budget.
+
+        A single shared cap does not survive contact with a busy queue. One
+        flat 50,000-row limit here left 49,454 `job_blocked` rows and 239
+        `job_started` rows - for 486 jobs. A blocked job repeats its reason
+        every few seconds for as long as it waits, so the routine noise
+        evicted the lifecycle record of most jobs that ever ran, and the
+        events table reached back six days while samples reached back eight.
+
+        Lifecycle events are the history. They get their own budget, and the
+        noisy kinds get a smaller one, so a stalled queue can no longer spend
+        the record of what actually happened.
+        """
+        noise = list(NOISY_EVENT_KINDS)
+        placeholders = ",".join("?" for _ in noise)
         try:
             self.conn.execute(
                 "DELETE FROM samples WHERE id NOT IN "
@@ -303,9 +338,16 @@ class Telemetry:
                 (keep_samples,),
             )
             self.conn.execute(
-                "DELETE FROM events WHERE id NOT IN "
-                "(SELECT id FROM events ORDER BY id DESC LIMIT ?)",
-                (keep_events,),
+                f"DELETE FROM events WHERE kind IN ({placeholders}) AND id NOT IN "
+                f"(SELECT id FROM events WHERE kind IN ({placeholders}) "
+                "ORDER BY id DESC LIMIT ?)",
+                (*noise, *noise, keep_noise_events),
+            )
+            self.conn.execute(
+                f"DELETE FROM events WHERE kind NOT IN ({placeholders}) AND id NOT IN "
+                f"(SELECT id FROM events WHERE kind NOT IN ({placeholders}) "
+                "ORDER BY id DESC LIMIT ?)",
+                (*noise, *noise, keep_events),
             )
         except Exception:
             pass

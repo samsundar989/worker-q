@@ -84,6 +84,14 @@ _ADDED_COLUMNS = (
     # The dispatcher never reads the core database - that separation is what
     # keeps the backend swappable - so the row has to be self-contained.
     ("remote_spec_json", "TEXT"),
+    # What the node measured while the job ran, parked here on the way home.
+    # The node samples usage perfectly well, but those numbers live in *its*
+    # core database, and nothing carried them back - so every job that
+    # travelled was a blank row in the one comparison a second machine makes
+    # worth doing. The dispatcher cannot write the core database itself, so it
+    # leaves the figures here and core picks them up at reconcile, exactly as
+    # it already does for `node`.
+    ("remote_usage_json", "TEXT"),
 )
 
 _COLUMNS = (
@@ -91,7 +99,7 @@ _COLUMNS = (
     "log_path, state, exit_code, pid, pid_creation, assigned_devices, cancel_requested, "
     "cancel_force, cancel_at, wait_reason, enqueued_at, started_at, finished_at, "
     "ram_mib, vram_mib, cpus, preemptible, preempt_requested, preempt_by, preempt_at, "
-    "gpu_mode, pinned_node, node, remote_id, remote_spec_json"
+    "gpu_mode, pinned_node, node, remote_id, remote_spec_json, remote_usage_json"
 )
 
 
@@ -301,6 +309,40 @@ class QueueStore:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    #: Usage fields worth carrying back from a node. Named explicitly rather
+    #: than copying the node's whole job record, because most of that record
+    #: describes the node's own bookkeeping and would overwrite ours.
+    REMOTE_USAGE_FIELDS = (
+        "peak_ram_mib",
+        "peak_vram_mib",
+        "usage_samples",
+        "peak_source",
+        "vram_source",
+        "progress_fraction",
+    )
+
+    def record_remote_usage(self, backend_id: int, entry: dict[str, Any]) -> None:
+        """Park what a node measured, for core to adopt at reconcile.
+
+        Written *before* `finish`, so the figures are already in place by the
+        time core notices the job has ended. The other order leaves a window
+        where a job is terminal with no usage, and terminal rows are never
+        revisited - `reconcile_job` returns immediately for them - so the
+        measurement would be lost for good.
+        """
+        payload = {
+            key: entry[key]
+            for key in self.REMOTE_USAGE_FIELDS
+            if entry.get(key) is not None
+        }
+        if not payload:
+            return
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE bjobs SET remote_usage_json = ? WHERE id = ?",
+                (json.dumps(payload), backend_id),
+            )
+
     def finish(self, backend_id: int, exit_code: int | None) -> None:
         with self.transaction() as conn:
             conn.execute(
@@ -490,5 +532,18 @@ def row_to_backend_job(row: dict[str, Any]) -> BackendJob:
             # monitoring problem a second machine creates.
             "node": row.get("node"),
             "remote_id": row.get("remote_id"),
+            # What the node measured. Core copies it onto the job row so a
+            # travelled job is not a blank line in the accuracy view.
+            "remote_usage": _decode_usage(row.get("remote_usage_json")),
         },
     )
+
+
+def _decode_usage(raw: Any) -> dict[str, Any] | None:
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
