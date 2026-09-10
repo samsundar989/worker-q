@@ -1344,9 +1344,20 @@ class Dispatcher:
                 ref=spec_data.get("snapshot_ref"),
                 passthrough=list(spec_data.get("passthrough") or []),
             )
+            # The node's copy of this repository may not share its directory
+            # name - matching is by git origin - so in-repo absolute paths must
+            # point at the node's copy. Otherwise an adopted output is written
+            # outside the node's repo and `collect_outputs` never finds it.
+            from workerq import travel as travelmod
+
+            argv = travelmod.rebase_repo_paths(
+                list(spec_data.get("argv") or []),
+                repo_root,
+                staging.remote_repo_path(node, repo_root),
+            )
             spec = remotemod.JobSpec(
                 project=spec_data.get("project") or "unknown",
-                argv=list(spec_data.get("argv") or []),
+                argv=argv,
                 cwd=shipped["worktree"],
                 origin_job_id=origin_job_id,
                 ram_gb=spec_data.get("ram_gb"),

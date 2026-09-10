@@ -134,3 +134,43 @@ def test_the_verdict_is_serialisable(repo):
 
 def test_repo_relative_refuses_a_path_it_cannot_express(repo):
     assert travel.repo_relative("C:/elsewhere/x.json", repo) is None
+
+
+# --------------------------------------------------------------------------
+# Pointing a job at the node's own copy of the repository
+# --------------------------------------------------------------------------
+
+
+def test_paths_are_rebased_when_the_node_spells_the_repo_differently(repo):
+    """worker-q's own repo is `gpu-queue` here and `worker-q` on the node,
+    because the far side is matched by git origin, not directory name.
+
+    Without rebasing, an adopted absolute write lands outside the node's
+    repository and the collector never sees it."""
+    argv = [
+        str(repo / ".venv" / "python.exe"),
+        "--out",
+        str(repo / "outputs" / "a.json"),
+        f"--report={repo / 'outputs' / 'b.json'}",
+        "--data",
+        "D:/elsewhere/set.npz",
+    ]
+    out = travel.rebase_repo_paths(argv, repo, r"D:\repos\worker-q")
+
+    assert out[0] == r"D:\repos\worker-q\.venv\python.exe"
+    assert out[2] == r"D:\repos\worker-q\outputs\a.json"
+    assert out[3] == r"--report=D:\repos\worker-q\outputs\b.json"
+    assert out[5] == "D:/elsewhere/set.npz", "a path outside the repo is not ours to move"
+
+
+def test_rebasing_is_a_no_op_when_both_machines_agree(repo):
+    """The common case, and it must not churn the command line."""
+    argv = ["python", "x.py", "--out", str(repo / "outputs" / "a.json")]
+    assert travel.rebase_repo_paths(argv, repo, str(repo)) == argv
+
+
+def test_a_path_merely_sharing_a_prefix_is_not_rebased(repo, tmp_path):
+    """`biohub-old` must not be rewritten because `biohub` is the repo."""
+    sibling = str(tmp_path / "biohub-old" / "x.json")
+    out = travel.rebase_repo_paths(["python", sibling], repo, r"D:\repos\w")
+    assert out[1] == sibling

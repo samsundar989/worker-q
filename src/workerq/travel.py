@@ -155,6 +155,48 @@ def absolute_repo_paths(argv: list[str], repo_root: Path) -> list[str]:
     return found
 
 
+def rebase_repo_paths(argv: list[str], repo_root: Path, new_root: str) -> list[str]:
+    """Point this job's in-repo absolute paths at the node's own copy.
+
+    Repos usually live at the same path on both machines, and then this is a
+    no-op. They do not always: worker-q's own repository is `gpu-queue` here and
+    `worker-q` on the node, because `remote_repo_path` matches on the git origin
+    rather than the directory name.
+
+    Without this, an adopted absolute write resolves *outside* the node's
+    repository - it creates a stray `...\gpu-queue\` tree - and
+    `collect_outputs`, which searches the node's repo, would never find it. That
+    is the silent-success case again, reintroduced by the back door.
+
+    Reads are rebased too, and should be: the node's interpreter and data live
+    under the node's copy of the repository, not under this machine's name for
+    it.
+    """
+    root = str(repo_root).replace("/", chr(92)).rstrip(chr(92))
+    target = str(new_root).rstrip(chr(92))
+    if root.lower() == target.lower():
+        return list(argv)
+
+    def rebase(text: str) -> str:
+        probe = text.replace("/", chr(92))
+        if probe.lower() == root.lower():
+            return target
+        if probe.lower().startswith(root.lower() + chr(92)):
+            return target + probe[len(root):]
+        return text
+
+    out: list[str] = []
+    for token in argv:
+        text = str(token)
+        # `--out=C:/...` carries the path in its value, not the whole token.
+        if "=" in text and _ABSOLUTE.match(text.partition("=")[2]):
+            flag, _, value = text.partition("=")
+            out.append(f"{flag}={rebase(value)}")
+            continue
+        out.append(rebase(text) if _ABSOLUTE.match(text) else text)
+    return out
+
+
 def assess(
     argv: list[str],
     repo_root: Path | None,
