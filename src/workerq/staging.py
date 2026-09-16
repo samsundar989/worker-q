@@ -912,29 +912,14 @@ def passthrough_inputs(
     return files
 
 
-def sync_inputs(
-    node: NodeConfig, repo_root: Path, argv: list[str], passthrough: list[str]
-) -> dict[str, Any]:
-    """Send the passthrough files a command names to the node's copy of the repo.
+def _send_files(node: NodeConfig, repo_root: Path, files: list[str]) -> None:
+    """Copy repo-relative files into the node's copy of the repository.
 
     One archive and one extraction, because the link is 6 MB/s at ~540 ms a
-    connection. This machine is authoritative for these inputs, so the node's
-    copies are overwritten. Raises `StagingError` when the inputs are too large
-    to send, so placement fails and the job stays here rather than running
-    against stale or missing data there.
+    connection. This machine is authoritative for these files, so the node's
+    copies are overwritten.
     """
     import zipfile
-
-    files = passthrough_inputs(argv, repo_root, passthrough)
-    result: dict[str, Any] = {"files": 0, "bytes": 0}
-    if not files:
-        return result
-    total = sum((repo_root / f).stat().st_size for f in files)
-    if total > _SYNC_MAX_BYTES:
-        raise StagingError(
-            f"the command names {len(files)} passthrough file(s) totalling "
-            f"{total / 1024 / 1024:.0f} MiB; too large to send to {node.name} per job"
-        )
 
     live = remote_repo_path(node, repo_root)
     stage_dir = expand_remote(node, REMOTE_STAGE_DIR)
@@ -948,7 +933,7 @@ def sync_inputs(
         nodes.run_remote(node, f"mkdir {_q(stage_dir)} 2>nul & exit /b 0")
         sent = nodes.copy_to_node(node, archive, remote_zip)
         if not sent.ok:
-            raise StagingError(f"could not send inputs to {node.name}: {sent.error}")
+            raise StagingError(f"could not send files to {node.name}: {sent.error}")
     run = nodes.run_remote(
         node,
         "powershell -NoProfile -Command \"Expand-Archive -LiteralPath "
@@ -957,7 +942,84 @@ def sync_inputs(
         timeout=max(node.timeout_seconds, 300.0),
     )
     if not run.ok:
-        raise StagingError(f"could not unpack inputs on {node.name}: {run.error}")
+        raise StagingError(f"could not unpack files on {node.name}: {run.error}")
+
+
+def sync_inputs(
+    node: NodeConfig, repo_root: Path, argv: list[str], passthrough: list[str]
+) -> dict[str, Any]:
+    """Send the passthrough files a command names to the node's copy of the repo.
+
+    Raises `StagingError` when the inputs are too large to send, so placement
+    fails and the job stays here rather than running against stale or missing
+    data there.
+    """
+    files = passthrough_inputs(argv, repo_root, passthrough)
+    result: dict[str, Any] = {"files": 0, "bytes": 0}
+    if not files:
+        return result
+    total = sum((repo_root / f).stat().st_size for f in files)
+    if total > _SYNC_MAX_BYTES:
+        raise StagingError(
+            f"the command names {len(files)} passthrough file(s) totalling "
+            f"{total / 1024 / 1024:.0f} MiB; too large to send to {node.name} per job"
+        )
+    _send_files(node, repo_root, files)
     result["files"] = len(files)
     result["bytes"] = total
     return result
+
+
+def pushable_passthrough(
+    repo_root: Path, missing: list[str], *, max_bytes: int = _SYNC_MAX_BYTES
+) -> list[str] | None:
+    """The files that would supply these missing passthrough entries, if small.
+
+    A passthrough entry added to `.gpuq.toml` exists here and nowhere else until
+    somebody copies it, and until then placement refuses the *whole project*:
+    on 2026-09-16 a 300 KB `engine/bin` and a 2 MB `benchmarks/panels` kept
+    every kaggriculture job off the 3080 Ti. Small entries are simply sent.
+
+    Returns None when any entry cannot be sent - absolute, absent here, a
+    virtualenv (a per-machine install), or too large together - because a
+    partial push would leave the project refused anyway.
+    """
+    files: list[str] = []
+    total = 0
+    for raw in missing:
+        entry = _norm_rel(raw)
+        if not entry or Path(entry).is_absolute() or ":" in entry or ".." in Path(entry).parts:
+            return None
+        local = repo_root / entry
+        if local.is_file():
+            candidates = [local]
+        elif local.is_dir():
+            if (local / "pyvenv.cfg").is_file():
+                return None
+            candidates = [f for f in local.rglob("*") if f.is_file()]
+            if not candidates:
+                # An archive cannot carry an empty folder, so it would stay missing.
+                return None
+        else:
+            return None
+        for f in candidates:
+            if _inside_venv(f, repo_root):
+                return None
+            total += f.stat().st_size
+            if total > max_bytes:
+                return None
+            files.append(f.relative_to(repo_root).as_posix())
+    return files
+
+
+def push_passthrough(node: NodeConfig, repo_root: Path, missing: list[str]) -> int:
+    """Send small missing passthrough entries to the node. Returns bytes sent."""
+    files = pushable_passthrough(repo_root, missing)
+    if files is None:
+        raise StagingError(
+            f"{', '.join(missing[:3])} cannot be sent to {node.name} automatically "
+            "(too large, absolute, or a virtualenv) - copy it there by hand"
+        )
+    if files:
+        _send_files(node, repo_root, files)
+    return sum((repo_root / f).stat().st_size for f in files)

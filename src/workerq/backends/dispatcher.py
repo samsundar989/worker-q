@@ -1154,14 +1154,39 @@ class Dispatcher:
                     f"(workerq node stage {node.name} --clone)",
                 )
             elif status.missing:
-                shown = ", ".join(status.missing[:3])
-                more = f" and {len(status.missing) - 3} more" if len(status.missing) > 3 else ""
-                answer = (False, f"{node.name} is missing {shown}{more}")
+                answer = self._push_missing(node, Path(repo_root), spec, list(status.missing))
             else:
                 answer = (True, None)
 
         self._repo_ready_cache[key] = (now, answer[0], answer[1])
         return answer
+
+    def _push_missing(
+        self, node: Any, repo_root: Path, spec: dict[str, Any], missing: list[str]
+    ) -> tuple[bool, str | None]:
+        """Send missing passthrough data that is small enough, then look again.
+
+        A path newly declared in `.gpuq.toml` refuses the whole project on that
+        node until someone copies it over, and nobody is told to. Large data
+        still has to be staged by hand; the reason says which.
+        """
+        from workerq import staging
+
+        shown = ", ".join(missing[:3])
+        more = f" and {len(missing) - 3} more" if len(missing) > 3 else ""
+        refused = (False, f"{node.name} is missing {shown}{more}")
+        if staging.pushable_passthrough(repo_root, missing) is None:
+            return refused
+        try:
+            sent = staging.push_passthrough(node, repo_root, missing)
+            status = staging.inspect_repo(node, repo_root, list(spec.get("passthrough") or []))
+        except Exception as exc:
+            self.log(f"could not send {shown} to {node.name}: {exc}")
+            return refused
+        self.log(f"sent missing passthrough {shown}{more} to {node.name} ({sent} bytes)")
+        if status.error or not status.exists or status.missing:
+            return (False, f"{node.name} is missing {', '.join(status.missing[:3]) or shown}")
+        return (True, None)
 
     def _would_block_the_queue(
         self, row: dict[str, Any], queued: list[dict[str, Any]], position: int

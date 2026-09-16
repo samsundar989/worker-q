@@ -539,3 +539,33 @@ def test_the_interpreter_and_its_venv_are_never_sent(tmp_path):
     })
     argv = [".venv/Scripts/python.exe", ".venv/Scripts/tool.py", ".venv/Lib/site-packages/mod.py"]
     assert staging.passthrough_inputs(argv, tmp_path, [".venv"]) == []
+
+
+# --------------------------------------------------------------------------
+# Missing passthrough data small enough to send
+# --------------------------------------------------------------------------
+
+
+def test_small_missing_passthrough_is_pushable(tmp_path):
+    """300 KB of engine/bin kept every kaggriculture job off the 3080 Ti."""
+    _tree(tmp_path, {"engine/bin/kagx.pyd": "x", "benchmarks/panels/a.json": "{}"})
+    files = staging.pushable_passthrough(tmp_path, ["engine/bin", "benchmarks/panels"])
+    assert sorted(files) == ["benchmarks/panels/a.json", "engine/bin/kagx.pyd"]
+
+
+@pytest.mark.parametrize(
+    "setup, missing",
+    [
+        ({".venv/pyvenv.cfg": "h", ".venv/Scripts/python.exe": "b"}, [".venv"]),
+        ({}, ["not-here"]),
+        ({"data/x.bin": "x"}, ["C:/abs/data"]),
+    ],
+)
+def test_what_cannot_be_pushed_is_refused_whole(tmp_path, setup, missing):
+    _tree(tmp_path, setup)
+    assert staging.pushable_passthrough(tmp_path, missing) is None
+
+
+def test_large_passthrough_is_not_pushed(tmp_path):
+    _tree(tmp_path, {"weights/w.f32": "x" * 100})
+    assert staging.pushable_passthrough(tmp_path, ["weights"], max_bytes=10) is None

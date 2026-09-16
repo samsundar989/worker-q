@@ -411,3 +411,40 @@ def test_cancelling_a_remote_job_asks_the_node_once(dispatcher, monkeypatch):
     dispatcher._service_cancellations()
     assert calls == [42]
     assert dispatcher.store.get(job)["state"] == "RUNNING", "finished by the reaper, not here"
+
+
+def test_small_missing_passthrough_is_sent_rather_than_refusing_the_project(
+    dispatcher, monkeypatch, tmp_path
+):
+    from workerq import staging
+    from workerq.config import NodeConfig
+
+    (tmp_path / "engine" / "bin").mkdir(parents=True)
+    (tmp_path / "engine" / "bin" / "kagx.pyd").write_text("x", encoding="utf-8")
+    pushed: list[list[str]] = []
+    monkeypatch.setattr(
+        staging, "push_passthrough", lambda node, repo, missing: pushed.append(missing) or 1
+    )
+    monkeypatch.setattr(
+        staging, "inspect_repo",
+        lambda node, repo, passthrough: staging.RepoStatus(
+            node="w", project="p", remote_path="x", exists=True,
+            passthrough={"engine/bin": True},
+        ),
+    )
+    ok, why = dispatcher._push_missing(
+        NodeConfig(name="w", address="h"), tmp_path, {"passthrough": ["engine/bin"]},
+        ["engine/bin"],
+    )
+    assert ok and why is None and pushed == [["engine/bin"]]
+
+
+def test_large_missing_passthrough_still_refuses(dispatcher, monkeypatch, tmp_path):
+    from workerq import staging
+    from workerq.config import NodeConfig
+
+    monkeypatch.setattr(staging, "pushable_passthrough", lambda repo, missing: None)
+    ok, why = dispatcher._push_missing(
+        NodeConfig(name="w", address="h"), tmp_path, {}, ["weights"]
+    )
+    assert not ok and "missing weights" in why
