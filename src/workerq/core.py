@@ -395,6 +395,19 @@ class GPUQService:
                 outputs = list(outputs) + [
                     o for o in verdict.adopt_outputs if o not in outputs
                 ]
+            # Same reasoning for a passthrough that could not be linked because
+            # the snapshot already had that path: writes there were meant for
+            # the real repository, and on another machine they would otherwise
+            # be deleted with the worktree.
+            outputs = list(outputs) + [
+                o for o in travel.shadowed_passthrough(
+                    passthrough,
+                    list(snapshot.passthrough or []),
+                    repo_root,
+                    snapshot.path,
+                )
+                if o not in outputs
+            ]
 
             remote_spec: dict[str, Any] | None = None
             if snapshot.commit and repo_root is not None and verdict.ok:

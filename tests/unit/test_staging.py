@@ -42,6 +42,9 @@ class FakeRemote:
 def clear_caches():
     staging._REPO_INDEX.clear()
     staging._EXPANDED.clear()
+    # The scripted remotes below answer every command generically, so the
+    # staging directory is resolved up front, as a live node would resolve it.
+    staging._EXPANDED["w"] = {staging.REMOTE_STAGE_DIR: r"C:\T\workerq-bundles"}
     yield
     staging._REPO_INDEX.clear()
     staging._EXPANDED.clear()
@@ -142,6 +145,42 @@ def test_percent_variables_are_resolved_before_anything_reaches_scp(monkeypatch)
     # cached
     staging.expand_remote(node(), "%TEMP%")
     assert len(fake.calls) == 1
+
+
+def test_a_node_that_cannot_answer_is_not_remembered_as_the_answer(monkeypatch):
+    """The 3-day outage of 2026-09-13..16.
+
+    The dispatcher started while the node was powered off. Expansion failed,
+    fell back to the literal `%USERPROFILE%\\Documents`, and cached it - so
+    every job afterwards shipped a working directory the node's Python could
+    not resolve, and every placement was refused until the process restarted.
+    """
+    down = lambda node, command, *, timeout=None: RemoteResult(False, 255, "", "", "timed out")
+    monkeypatch.setattr(staging.nodes, "run_remote", down)
+    with pytest.raises(staging.StagingError, match="could not resolve"):
+        staging.expand_remote(node(), "%USERPROFILE%")
+
+    up = FakeRemote({"echo": r"C:\Users\me"})
+    monkeypatch.setattr(staging.nodes, "run_remote", up)
+    assert staging.expand_remote(node(), "%USERPROFILE%") == r"C:\Users\me"
+
+
+def test_an_unexpanded_echo_is_not_an_answer(monkeypatch):
+    """cmd.exe echoes an undefined variable back verbatim."""
+    monkeypatch.setattr(staging.nodes, "run_remote", FakeRemote({"echo": "%NOPE%"}))
+    with pytest.raises(staging.StagingError):
+        staging.expand_remote(node(), "%NOPE%")
+
+
+def test_a_failed_repo_scan_is_not_cached_as_an_empty_index(monkeypatch):
+    """An empty index maps every repo to its directory name for good."""
+    down = lambda node, command, *, timeout=None: RemoteResult(False, 255, "", "", "timed out")
+    monkeypatch.setattr(staging.nodes, "run_remote", down)
+    assert staging.index_repos(node()) == {}
+
+    up = FakeRemote({"Get-ChildItem": "worker-q|git@github.com:me/worker-q"})
+    monkeypatch.setattr(staging.nodes, "run_remote", up)
+    assert staging.index_repos(node()) == {"worker-q": "github.com/me/worker-q"}
 
 
 def test_a_path_with_no_variable_costs_no_round_trip(monkeypatch):
@@ -372,6 +411,27 @@ def staged(monkeypatch, tmp_path):
     return repo, fake
 
 
+def test_a_worktree_left_by_a_failed_placement_is_reused(staged, monkeypatch):
+    """A bare `git worktree add` failed every retry with "already exists".
+
+    The tree is left behind whenever placement fails after materialising it,
+    and biohub job 1438 was retried 187 times against its own leftover.
+    """
+    repo, fake = staged
+    monkeypatch.setattr(staging, "bundle_bases", lambda *_a: [])
+    monkeypatch.setattr(
+        staging, "build_bundle",
+        lambda *_a: (_ for _ in ()).throw(staging.StagingError("EMPTY_BUNDLE")),
+    )
+    staging.ship_snapshot(node(), repo, job_id=450, commit="abc123")
+
+    add = [c for c in fake.calls if "worktree add" in c]
+    assert len(add) == 1
+    worktree = staging.worktree_path(node(), repo, 450)
+    assert f"if exist {worktree}\\.git" in add[0]
+    assert "findstr /b abc123" in add[0], "reused only when it is the same commit"
+
+
 def test_the_worktree_path_has_a_single_definition(staged):
     """Three callers have to agree on this, so it is worth pinning."""
     repo, _ = staged
@@ -413,3 +473,69 @@ def test_declaring_no_outputs_still_costs_no_round_trip(staged):
     )
     assert result["collected"] == 0
     assert not [c for c in fake.calls if "-Roots" in c]
+
+
+# --------------------------------------------------------------------------
+# Inputs named on the command line that live in passthrough data
+# --------------------------------------------------------------------------
+
+
+def _tree(root, files):
+    for rel, body in files.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body, encoding="utf-8")
+
+
+def test_a_script_in_passthrough_data_travels_with_its_folder(tmp_path):
+    """Four jobs failed on the 3080 Ti with "can't open file ...run_arms.py".
+
+    The harness was written into `.cache/market_20260916/` minutes before it
+    was submitted, and the node's `.cache` had never heard of it.
+    """
+    _tree(tmp_path, {
+        ".cache/market_20260916/run_arms.py": "x",
+        ".cache/market_20260916/patch_builder.py": "y",
+        ".cache/other/huge.bin": "z",
+        "benchmarks/panels/field.json": "{}",
+        "benchmarks/panels/unrelated.json": "{}",
+        "agents/tracked.py": "t",
+    })
+    argv = [
+        ".venv/Scripts/python.exe", ".cache/market_20260916/run_arms.py",
+        "--manifest", "benchmarks/panels/field.json", "agents/tracked.py",
+        "--out=.cache/other/huge.bin",
+    ]
+    files = staging.passthrough_inputs(
+        argv, tmp_path, [".venv", ".cache", "benchmarks/panels"]
+    )
+    assert sorted(files) == [
+        ".cache/market_20260916/patch_builder.py",
+        ".cache/market_20260916/run_arms.py",
+        ".cache/other/huge.bin",
+        "benchmarks/panels/field.json",
+    ], "siblings in a small folder come along; a passthrough root is never sent whole"
+
+
+def test_nothing_is_sent_for_a_command_naming_no_passthrough_files(tmp_path):
+    _tree(tmp_path, {"tools/x.py": "x"})
+    assert staging.passthrough_inputs(["python", "tools/x.py"], tmp_path, [".cache"]) == []
+
+
+def test_inputs_too_large_to_send_keep_the_job_home(monkeypatch, tmp_path):
+    _tree(tmp_path, {".cache/big.bin": "x"})
+    monkeypatch.setattr(staging, "_SYNC_MAX_BYTES", 0)
+    with pytest.raises(staging.StagingError, match="too large"):
+        staging.sync_inputs(node(), tmp_path, ["python", ".cache/big.bin"], [".cache"])
+
+
+def test_the_interpreter_and_its_venv_are_never_sent(tmp_path):
+    """The first live run pushed a whole `.venv/Scripts` over the node's own."""
+    _tree(tmp_path, {
+        ".venv/pyvenv.cfg": "home = x",
+        ".venv/Scripts/python.exe": "bin",
+        ".venv/Scripts/tool.py": "t",
+        ".venv/Lib/site-packages/mod.py": "m",
+    })
+    argv = [".venv/Scripts/python.exe", ".venv/Scripts/tool.py", ".venv/Lib/site-packages/mod.py"]
+    assert staging.passthrough_inputs(argv, tmp_path, [".venv"]) == []

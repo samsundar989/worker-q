@@ -202,6 +202,10 @@ _NODE_PUBLISH_SECONDS = 2.0
 #: loop that ticks four times a second, to answer a question whose answer
 #: changes only when a human runs `workerq node stage`.
 _REPO_READY_SECONDS = 60.0
+#: First and longest delay before a failed placement is offered to that node
+#: again. Each attempt blocks the dispatch loop for several SSH round trips.
+_PLACEMENT_RETRY_SECONDS = 60.0
+_PLACEMENT_RETRY_MAX_SECONDS = 900.0
 
 #: How far two machines' clocks may differ before dispatch stops. Generous,
 #: because this is not about precision - it is about a clock that is wrong
@@ -261,6 +265,10 @@ class Dispatcher:
         #: Last placement explanation per job, so the reason is logged when it
         #: changes rather than four times a second.
         self._placement_logged: dict[int, str] = {}
+        #: (job, node) -> (retry_at, delay) for placements that failed.
+        self._placement_failures: dict[tuple[int, str], tuple[float, float]] = {}
+        #: backend_id -> when a remote cancel may next be sent (inf once sent).
+        self._remote_cancel_at: dict[int, float] = {}
 
     # -- logging ----------------------------------------------------------
     def log(self, message: str) -> None:
@@ -933,11 +941,20 @@ class Dispatcher:
         for stale in [k for k in self._hold_since if k not in live]:
             self._hold_since.pop(stale, None)
             self._hold_logged_at.pop(stale, None)
+        for key in [k for k in self._placement_failures if k[0] not in live]:
+            self._placement_failures.pop(key, None)
 
         #: Set once a job has been passed over, so the job that caused it can be
         #: told apart from the ones merely behind it.
         head_blocked: dict[str, Any] | None = None
         skipped = 0
+        #: Set once this machine may take nothing more this tick: the queue is
+        #: held for the head job, or backfill has looked as far as it may. Both
+        #: rules protect *local* headroom, so they must not end the scan - they
+        #: used to `return`, which left every job behind them unoffered to the
+        #: other machine while it sat idle. A job placed there takes nothing the
+        #: held job is waiting for.
+        local_closed = False
 
         for position, row in enumerate(queued):
             backend_id = int(row["id"])
@@ -961,16 +978,23 @@ class Dispatcher:
                     )
                     skipped += 1
                     if skipped > sched.backfill_max_skip:
-                        return
+                        local_closed = True
                     continue
-                ok, why = self._remote_admits(node, row)
+                why = self._placement_backoff_reason(backend_id, node)
+                ok = why is None
+                if ok:
+                    ok, why = self._remote_admits(node, row)
                 if ok and self._start_remote(row, node):
                     self._blocked.pop(backend_id, None)
                 else:
                     self._record_wait(backend_id, why or f"waiting for {node.name}")
                     skipped += 1
                     if skipped > sched.backfill_max_skip:
-                        return
+                        local_closed = True
+                continue
+
+            if local_closed:
+                self._offer_elsewhere(row, queued, position)
                 continue
 
             # Admission control: does this job's declared RAM/CPU/VRAM fit in
@@ -1012,7 +1036,7 @@ class Dispatcher:
                     self._record_wait(backend_id, blocked_reason or "placement failed")
                     skipped += 1
                     if skipped > sched.backfill_max_skip:
-                        return
+                        local_closed = True
                     continue
 
             if blocked_reason is not None:
@@ -1028,7 +1052,8 @@ class Dispatcher:
                 # and how long the blocked job has already waited - so a large
                 # job cannot be deferred forever by a stream of small ones.
                 if not sched.backfill:
-                    return
+                    local_closed = True
+                    continue
                 head_id = int(head_blocked["id"])
                 waited = self._blocked_wait_seconds(head_id)
                 # Holding is a bet that the machine will free up if we stop
@@ -1054,7 +1079,8 @@ class Dispatcher:
                                 "holding the queue for it instead of backfilling"
                             )
                             self._hold_logged_at[head_id] = now + _BLOCKED_REPEAT_SECONDS
-                        return
+                        local_closed = True
+                        continue
                     if now >= self._hold_logged_at.get(head_id, 0.0):
                         self.log(
                             f"job {head_id}: held the queue for "
@@ -1069,7 +1095,7 @@ class Dispatcher:
                     self._hold_since.pop(head_id, None)
                 skipped += 1
                 if skipped > sched.backfill_max_skip:
-                    return
+                    local_closed = True
                 continue
 
             if self._start_job(row, devices or []):
@@ -1207,6 +1233,10 @@ class Dispatcher:
 
         reasons: list[str] = []
         for node in candidates:
+            backoff = self._placement_backoff_reason(backend_id, node)
+            if backoff is not None:
+                reasons.append(backoff)
+                continue
             ready, why = self._repo_ready(node, spec)
             if not ready:
                 reasons.append(why or f"{node.name} is not ready")
@@ -1219,6 +1249,71 @@ class Dispatcher:
         if reasons:
             self._placement_note(backend_id, "no node took it: " + "; ".join(reasons))
         return None, "; ".join(reasons) if reasons else None
+
+    def _offer_elsewhere(
+        self, row: dict[str, Any], queued: list[dict[str, Any]], position: int
+    ) -> None:
+        """Try another machine for a job this machine is closed to this tick.
+
+        Nothing local is judged here - the scan has already decided this
+        machine takes nothing more - so the job keeps the local half of its
+        last reason and only the other machine's half is refreshed. Otherwise a
+        job deep in the queue shows whatever was true the last time the scan
+        reached it, which is how a node "missing engine/bin" was still reported
+        long after the file had been copied there.
+        """
+        backend_id = int(row["id"])
+        chosen, why = self._choose_node(row, queued, position, local_ok=False)
+        if chosen is not None:
+            if self._start_remote(row, chosen):
+                self._blocked.pop(backend_id, None)
+            return
+        local = str(row.get("wait_reason") or "waiting for this machine").split(" | ")[0]
+        self._record_wait(backend_id, f"{local} | {why}" if why else local)
+
+    def _placement_backoff_reason(self, backend_id: int, node: Any) -> str | None:
+        """Why this job may not be offered to `node` yet, if it may not.
+
+        A placement that failed will usually fail again on the next tick, and
+        each attempt is several SSH round trips *on the dispatch loop*: biohub
+        job 1438 was retried 187 times at ~15s each, stalling every other
+        decision for the whole time. So a failure is retried on a doubling
+        delay rather than four times a second.
+        """
+        entry = self._placement_failures.get((backend_id, node.name))
+        if entry is None:
+            return None
+        retry_at, _delay = entry
+        wait = retry_at - time.monotonic()
+        if wait <= 0:
+            return None
+        return f"placement on {node.name} failed; retrying in {wait:.0f}s"
+
+    def _note_placement_failed(self, backend_id: int, node: Any) -> None:
+        key = (backend_id, node.name)
+        _retry_at, delay = self._placement_failures.get(key, (0.0, 0.0))
+        delay = min(_PLACEMENT_RETRY_MAX_SECONDS, max(_PLACEMENT_RETRY_SECONDS, delay * 2))
+        self._placement_failures[key] = (time.monotonic() + delay, delay)
+
+    def _account_remote_start(self, node: Any, row: dict[str, Any]) -> None:
+        """Charge a job just placed on `node` against its cached report.
+
+        The report is refreshed once per `poll_interval_seconds` - a minute on
+        this installation - and did not change when work was sent. Every job
+        behind this one was therefore judged against the free memory the node
+        had *before* it, and a single tick could push several jobs at a machine
+        with room for one, leaving a backlog on the slower machine that the
+        faster one could have run.
+        """
+        if self._reports is None:
+            return
+        cached = self._reports.peek(node.name)
+        if cached is None:
+            return
+        try:
+            cached[1].running.append(self._request_for(row))
+        except Exception:
+            pass
 
     # -- remote placement -------------------------------------------------
     #
@@ -1354,6 +1449,10 @@ class Dispatcher:
         usable, why = self._node_usable(node, report)
         if not usable:
             return False, why
+        if report.queued:
+            # Work already waiting there is work this machine might have run
+            # sooner. Send more only once the node has started what it has.
+            return False, f"{node.name} already has {report.queued} job(s) waiting"
         snapshot = report.snapshot(self.config)
         if snapshot is None:
             return False, f"node {node.name} reported no capacity"
@@ -1402,6 +1501,19 @@ class Dispatcher:
             # name - matching is by git origin - so in-repo absolute paths must
             # point at the node's copy. Otherwise an adopted output is written
             # outside the node's repo and `collect_outputs` never finds it.
+            # Passthrough data is not in the snapshot, so a file the command
+            # names there must be brought up to date on the node first.
+            synced = staging.sync_inputs(
+                node,
+                repo_root,
+                list(spec_data.get("argv") or []),
+                list(spec_data.get("passthrough") or []),
+            )
+            if synced["files"]:
+                self.log(
+                    f"job {backend_id}: sent {synced['files']} passthrough input(s) "
+                    f"({synced['bytes']} bytes) to {node.name}"
+                )
             from workerq import travel as travelmod
 
             argv = travelmod.rebase_repo_paths(
@@ -1434,6 +1546,7 @@ class Dispatcher:
             # queue with a reason and is tried again - possibly here.
             self._record_wait(backend_id, f"could not place on {node.name}: {exc}")
             self.log(f"job {backend_id}: placement on {node.name} failed: {exc}")
+            self._note_placement_failed(backend_id, node)
             return False
 
         remote_id = int(submitted["job_id"])
@@ -1442,6 +1555,8 @@ class Dispatcher:
             # rather than leaving an orphan running on the node.
             remotemod.cancel(node, remote_id, force=True)
             return False
+        self._placement_failures.pop((backend_id, node.name), None)
+        self._account_remote_start(node, row)
 
         self.log(
             f"job {backend_id}: placed on {node.name} as its job {remote_id} "
@@ -1673,8 +1788,8 @@ class Dispatcher:
     # -- cancel -----------------------------------------------------------
     def _service_cancellations(self) -> None:
         rows = self.store.conn.execute(
-            "SELECT id, state, pid, pid_creation, cancel_force, cancel_at FROM bjobs "
-            "WHERE cancel_requested = 1 AND state IN (?, ?)",
+            "SELECT id, state, pid, pid_creation, cancel_force, cancel_at, node, remote_id "
+            "FROM bjobs WHERE cancel_requested = 1 AND state IN (?, ?)",
             (BACKEND_QUEUED, BACKEND_RUNNING),
         ).fetchall()
         grace = max(0, self.config.core.cancel_grace_seconds)
@@ -1684,6 +1799,12 @@ class Dispatcher:
             if row["state"] == BACKEND_QUEUED:
                 if self.store.remove_queued(backend_id):
                     self.log(f"job {backend_id}: removed while queued")
+                continue
+
+            if row["node"]:
+                self._cancel_remote(
+                    backend_id, str(row["node"]), row["remote_id"], bool(row["cancel_force"])
+                )
                 continue
 
             job = self.running.get(backend_id)
@@ -1718,6 +1839,41 @@ class Dispatcher:
                     f"job {backend_id}: process tree terminated "
                     f"({'forced' if force else f'grace {grace}s elapsed'})"
                 )
+
+    def _cancel_remote(
+        self, backend_id: int, node_name: str, remote_id: Any, force: bool
+    ) -> None:
+        """Pass a cancellation on to the machine the job is running on.
+
+        This used to fall into the local branch, find no pid, and log "cannot
+        verify pid None; refusing to kill" every tick while the job ran to
+        completion on the node - so an agent that cancelled and resubmitted got
+        both copies running there side by side.
+
+        The node is asked once, then again on a delay if it could not be
+        reached. The row is left RUNNING: `_reap_remote` finishes it when the
+        node reports the job terminal, which also brings its log home.
+        """
+        node = self.config.node(node_name)
+        if node is None or remote_id is None:
+            self.store.finish(backend_id, exit_code=-1)
+            self.log(f"job {backend_id}: cancelled; {node_name} is no longer registered")
+            return
+        now = time.monotonic()
+        if self._remote_cancel_at.get(backend_id, 0.0) > now:
+            return
+        from workerq import remote as remotemod
+
+        try:
+            ok = remotemod.cancel(node, int(remote_id), force=force)
+        except Exception as exc:
+            ok = False
+            self.log(f"job {backend_id}: cancel on {node_name} failed: {exc}")
+        if ok:
+            self._remote_cancel_at[backend_id] = float("inf")
+            self.log(f"job {backend_id}: cancelled on {node_name} (its job {remote_id})")
+        else:
+            self._remote_cancel_at[backend_id] = now + _PLACEMENT_RETRY_SECONDS
 
     # -- heartbeat --------------------------------------------------------
     def _heartbeat(self) -> None:
@@ -1806,6 +1962,13 @@ class Dispatcher:
         """
         for row in self.store.running():
             backend_id = int(row["id"])
+            if row.get("node"):
+                # Running on another machine, so there is no local process to
+                # find - its absence means nothing. `_reap_remote` asks the node.
+                # Treating it as gone marked live remote jobs FAILED on every
+                # restart and left them running there with no one to collect
+                # their results (job 1481, 2026-09-16).
+                continue
             pid, creation = row.get("pid"), row.get("pid_creation")
             if pid:
                 actual = process_creation_time(int(pid))

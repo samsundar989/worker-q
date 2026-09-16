@@ -280,3 +280,134 @@ def test_a_full_machine_never_starts_a_job_locally(dispatcher, monkeypatch):
     assert started == [], "a job must never start without a slot"
     row = dispatcher.store.get(job)
     assert "free slot" in str(row["wait_reason"]), row["wait_reason"]
+
+
+# --------------------------------------------------------------------------
+# Holding the queue here must not idle the other machine
+# --------------------------------------------------------------------------
+
+
+def test_jobs_past_the_backfill_limit_are_still_offered_elsewhere(dispatcher, monkeypatch):
+    """The scan used to `return` once backfill had skipped its limit.
+
+    That limit protects this machine's headroom, and a job placed on another
+    machine uses none of it - but every job past it went unoffered, so the
+    3080 Ti idled behind a full queue of work it could run.
+    """
+    dispatcher.config.core.max_concurrent_jobs = 1
+    dispatcher.config.scheduling.backfill_max_skip = 1
+    dispatcher.adopted[999] = object()
+    jobs = [_enqueue_travelling(dispatcher) for _ in range(4)]
+
+    offered: list[int] = []
+    monkeypatch.setattr(
+        dispatcher, "_choose_node",
+        lambda row, queued, position, local_ok: offered.append(int(row["id"])) or (None, "busy"),
+    )
+    dispatcher._start_ready_jobs()
+    assert offered == jobs
+
+
+def test_a_held_queue_still_places_later_jobs_elsewhere(dispatcher, monkeypatch):
+    """Holding drains this machine for the head; it is no reason to idle another."""
+    dispatcher.config.core.max_concurrent_jobs = 1
+    dispatcher.adopted[999] = object()
+    head = _enqueue_travelling(dispatcher)
+    later = _enqueue_travelling(dispatcher)
+    # The head has waited past the threshold, so the hold engages.
+    dispatcher._blocked[head] = (0.0, "blocked", float("inf"))
+    dispatcher.config.scheduling.backfill_head_wait_seconds = 0
+
+    placed: list[int] = []
+    monkeypatch.setattr(
+        dispatcher, "_choose_node",
+        lambda row, queued, position, local_ok: (object(), None)
+        if int(row["id"]) == later else (None, "no room"),
+    )
+    monkeypatch.setattr(
+        dispatcher, "_start_remote", lambda row, node: placed.append(int(row["id"])) or True
+    )
+    started: list[int] = []
+    monkeypatch.setattr(
+        dispatcher, "_start_job", lambda row, devices: started.append(int(row["id"])) or True
+    )
+    dispatcher._start_ready_jobs()
+    assert placed == [later]
+    assert started == []
+
+
+def test_a_failed_placement_backs_off_instead_of_retrying_every_tick(dispatcher):
+    """Each attempt is several SSH round trips on the dispatch loop."""
+    from workerq.config import NodeConfig
+
+    node = NodeConfig(name="w", address="h")
+    assert dispatcher._placement_backoff_reason(7, node) is None
+    dispatcher._note_placement_failed(7, node)
+    assert "retrying" in dispatcher._placement_backoff_reason(7, node)
+    first = dispatcher._placement_failures[(7, "w")][1]
+    dispatcher._note_placement_failed(7, node)
+    assert dispatcher._placement_failures[(7, "w")][1] == first * 2
+    assert dispatcher._placement_backoff_reason(8, node) is None, "per job, not per node"
+
+
+def test_a_placed_job_is_charged_against_the_cached_node_report(dispatcher):
+    """Otherwise one tick sends several jobs to a node with room for one."""
+    import time
+
+    from workerq import nodes as nodemod
+    from workerq.config import NodeConfig
+
+    node = NodeConfig(name="w", address="h")
+    dispatcher._reports = nodemod.ReportCache()
+    report = _report()
+    dispatcher._reports._reports["w"] = (time.monotonic(), report)
+    dispatcher._account_remote_start(node, row(1, cpus=3, ram_gb=5.0))
+    assert len(report.running) == 1
+    assert report.running[0].cpus == 3
+
+
+def test_a_node_with_work_already_waiting_is_sent_no_more(dispatcher, monkeypatch):
+    from workerq.config import NodeConfig
+
+    monkeypatch.setattr(dispatcher, "_node_report", lambda node: _report(queued=2))
+    ok, why = dispatcher._remote_admits(NodeConfig(name="w", address="h"), row(1, cpus=1))
+    assert not ok and "waiting" in why
+
+
+# --------------------------------------------------------------------------
+# A remote job survives a restart and can be cancelled
+# --------------------------------------------------------------------------
+
+
+def _remote_running(dispatcher, *, cancel: bool = False) -> int:
+    job = _enqueue_travelling(dispatcher)
+    assert dispatcher.store.claim_for_remote_start(job, "w", 42)
+    if cancel:
+        dispatcher.store.conn.execute(
+            "UPDATE bjobs SET cancel_requested = 1 WHERE id = ?", (job,)
+        )
+    return job
+
+
+def test_a_restart_does_not_fail_a_job_running_on_another_machine(dispatcher):
+    """There is no local process to find, and its absence means nothing."""
+    job = _remote_running(dispatcher)
+    dispatcher._recover_orphans()
+    assert dispatcher.store.get(job)["state"] == "RUNNING"
+
+
+def test_cancelling_a_remote_job_asks_the_node_once(dispatcher, monkeypatch):
+    """It used to log "cannot verify pid None" forever while the job ran on."""
+    from workerq import remote as remotemod
+    from workerq.config import NodeConfig
+
+    dispatcher.config.nodes = [NodeConfig(name="w", address="h")]
+    job = _remote_running(dispatcher, cancel=True)
+    calls: list[int] = []
+    monkeypatch.setattr(
+        remotemod, "cancel", lambda node, remote_id, force=False: calls.append(remote_id) or True
+    )
+    dispatcher._service_cancellations()
+    dispatcher._service_cancellations()
+    assert calls == [42]
+    assert dispatcher.store.get(job)["state"] == "RUNNING", "finished by the reaper, not here"

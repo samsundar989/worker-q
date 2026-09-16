@@ -174,3 +174,35 @@ def test_a_path_merely_sharing_a_prefix_is_not_rebased(repo, tmp_path):
     sibling = str(tmp_path / "biohub-old" / "x.json")
     out = travel.rebase_repo_paths(["python", sibling], repo, r"D:\repos\w")
     assert out[1] == sibling
+
+
+# --------------------------------------------------------------------------
+# A passthrough the snapshot already had
+# --------------------------------------------------------------------------
+
+
+def test_a_passthrough_shadowed_by_tracked_files_is_brought_home(tmp_path):
+    """kaggriculture passes `runs` through so results land in the real repo.
+
+    Once `runs/` held a committed file the snapshot had its own copy, nothing was
+    linked, and a job on the 3080 Ti wrote its results into a worktree that was
+    deleted the moment it finished.
+    """
+    live = tmp_path / "live"
+    snap = tmp_path / "snap"
+    for root in (live, snap):
+        (root / "runs").mkdir(parents=True)
+    (live / ".venv").mkdir()
+    (live / "only-live").mkdir()
+
+    shadowed = travel.shadowed_passthrough(
+        ["runs", ".venv", "only-live", "missing", "../escape", "C:/abs"],
+        linked=[".venv"],
+        repo_root=live,
+        snapshot_path=snap,
+    )
+    assert shadowed == ["runs"]
+
+
+def test_no_snapshot_means_nothing_is_shadowed(tmp_path):
+    assert travel.shadowed_passthrough(["runs"], [], tmp_path, None) == []

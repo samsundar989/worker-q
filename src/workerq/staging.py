@@ -172,14 +172,18 @@ def index_repos(node: NodeConfig, *, refresh: bool = False) -> dict[str, str]:
     result = nodes.run_remote(node, script, timeout=max(node.timeout_seconds, 60.0))
 
     index: dict[str, str] = {}
-    if result.ok:
-        for line in result.stdout.splitlines():
-            if "|" not in line:
-                continue
-            name, _, url = line.partition("|")
-            normalised = normalise_origin(url)
-            if normalised:
-                index[name.strip()] = normalised
+    if not result.ok:
+        # Not cached: an empty index silently maps every repository to its
+        # directory name for the life of the process, which is wrong for any
+        # repo the node spells differently (`gpu-queue` here, `worker-q` there).
+        return index
+    for line in result.stdout.splitlines():
+        if "|" not in line:
+            continue
+        name, _, url = line.partition("|")
+        normalised = normalise_origin(url)
+        if normalised:
+            index[name.strip()] = normalised
     _REPO_INDEX[node.name] = index
     return index
 
@@ -232,6 +236,12 @@ def expand_remote(node: NodeConfig, text: str) -> str:
     subsystem**, which does not - it took the literal string `%TEMP%\\...` as a
     directory name and failed to find it. Anything that will be handed to scp
     has to be a real path before it leaves here.
+
+    Only a successful answer is cached, and a failure raises. This used to fall
+    back to the literal text *and cache it*, so a dispatcher that started while
+    the node was powered off (2026-09-15) sent `%USERPROFILE%\\...` as every
+    job's working directory for the rest of its life. The node's Python does
+    not expand it, refused every submission, and nothing ran there for 3 days.
     """
     if "%" not in text:
         return text
@@ -239,7 +249,12 @@ def expand_remote(node: NodeConfig, text: str) -> str:
     if text in cache:
         return cache[text]
     result = nodes.run_remote(node, f"echo {text}")
-    expanded = result.out.splitlines()[0].strip() if result.ok and result.out else text
+    expanded = result.out.splitlines()[0].strip() if result.ok and result.out else ""
+    if not expanded or "%" in expanded:
+        raise StagingError(
+            f"could not resolve {text} on {node.name}: "
+            f"{result.error or result.out or 'no answer'}"
+        )
     cache[text] = expanded
     return expanded
 
@@ -520,9 +535,17 @@ def ship_snapshot(
     steps = [f"cd /d {_q(remote_repo)}"]
     if not already:
         steps.append(f"git fetch {_q(remote_bundle)} {ref}:{ref}")
-    steps += [
-        f"git worktree add --detach {_q(worktree)} {commit}",
-    ]
+    # Idempotent. A placement that fails *after* this step - the submission
+    # refused, the link dropping - leaves the worktree behind, and a bare
+    # `git worktree add` then fails every retry with "already exists": biohub
+    # job 1438 was retried 187 times that way. A tree already at this commit is
+    # exactly what we would have built, so it is reused; linking passthrough
+    # below skips entries that already exist.
+    steps.append(
+        f"(if exist {_q(worktree + chr(92) + '.git')} "
+        f"(cd /d {_q(worktree)} && git rev-parse HEAD | findstr /b {commit} >nul) "
+        f"else (git worktree add --detach {_q(worktree)} {commit}))"
+    )
     result = nodes.run_remote(
         node, " && ".join(steps), timeout=max(node.timeout_seconds, 300.0)
     )
@@ -807,4 +830,134 @@ def collect_outputs(
         f"rmdir /s /q {_q(remote_stage)} 2>nul & del {_q(remote_zip)} 2>nul & "
         f"del {_q(remote_script)} 2>nul & exit /b 0",
     )
+    return result
+
+
+# --------------------------------------------------------------------------
+# Inputs that live in passthrough data
+# --------------------------------------------------------------------------
+
+#: A folder of inputs is sent whole only while it is this small. Past it only
+#: the named files go, and past `_SYNC_MAX_BYTES` in total nothing does.
+_SYNC_DIR_MAX_BYTES = 20 * 1024 * 1024
+_SYNC_DIR_MAX_FILES = 500
+_SYNC_MAX_BYTES = 50 * 1024 * 1024
+
+
+def _norm_rel(text: str) -> str:
+    return str(text).strip().replace(chr(92), "/").strip("/")
+
+
+def _inside_venv(path: Path, repo_root: Path) -> bool:
+    """Is this file part of a virtualenv? Those are per-machine installs."""
+    for parent in path.parents:
+        if parent == repo_root or repo_root not in parent.parents:
+            return False
+        if (parent / "pyvenv.cfg").is_file():
+            return True
+    return False
+
+
+def passthrough_inputs(
+    argv: list[str], repo_root: Path, passthrough: list[str]
+) -> list[str]:
+    """Repo-relative files a command names that live under a passthrough path.
+
+    Passthrough data is not in the snapshot, so a job on another machine sees
+    *that machine's* copy - and nothing keeps the two in step. kaggriculture
+    writes a harness into `.cache/market_20260916/` minutes before submitting
+    it, so on 2026-09-16 four jobs placed on the 3080 Ti failed in under a
+    second with "can't open file ...run_arms.py".
+
+    A file named on the command line is the part that can be seen. Its folder
+    comes along when it is small, because a script's siblings - the modules it
+    imports, the manifest beside it - are what it reads next.
+    """
+    entries = [_norm_rel(p) for p in passthrough if _norm_rel(p)]
+    entries = [p for p in entries if not Path(p).is_absolute() and ":" not in p]
+    if not entries:
+        return []
+
+    tokens: list[str] = []
+    # argv[0] is the program. When it is `.venv/Scripts/python.exe` its folder
+    # is an interpreter, not a job's inputs, and must never be overwritten.
+    for arg in argv[1:]:
+        text = str(arg)
+        if text.startswith("-") and "=" in text:
+            text = text.split("=", 1)[1]
+        tokens.append(text)
+
+    files: list[str] = []
+    for token in tokens:
+        rel = _norm_rel(token)
+        if not rel or Path(rel).is_absolute() or ":" in rel or ".." in Path(rel).parts:
+            continue
+        root = next((p for p in entries if rel == p or rel.startswith(p + "/")), None)
+        if root is None:
+            continue
+        local = repo_root / rel
+        if not local.is_file() or _inside_venv(local, repo_root):
+            continue
+        parent = posixpath.dirname(rel)
+        chosen = [rel]
+        if parent and parent != root and len(parent) > len(root):
+            folder = repo_root / parent
+            siblings = [f for f in folder.rglob("*") if f.is_file()]
+            size = sum(f.stat().st_size for f in siblings)
+            if len(siblings) <= _SYNC_DIR_MAX_FILES and size <= _SYNC_DIR_MAX_BYTES:
+                chosen = [f.relative_to(repo_root).as_posix() for f in siblings]
+        for item in chosen:
+            if item not in files:
+                files.append(item)
+    return files
+
+
+def sync_inputs(
+    node: NodeConfig, repo_root: Path, argv: list[str], passthrough: list[str]
+) -> dict[str, Any]:
+    """Send the passthrough files a command names to the node's copy of the repo.
+
+    One archive and one extraction, because the link is 6 MB/s at ~540 ms a
+    connection. This machine is authoritative for these inputs, so the node's
+    copies are overwritten. Raises `StagingError` when the inputs are too large
+    to send, so placement fails and the job stays here rather than running
+    against stale or missing data there.
+    """
+    import zipfile
+
+    files = passthrough_inputs(argv, repo_root, passthrough)
+    result: dict[str, Any] = {"files": 0, "bytes": 0}
+    if not files:
+        return result
+    total = sum((repo_root / f).stat().st_size for f in files)
+    if total > _SYNC_MAX_BYTES:
+        raise StagingError(
+            f"the command names {len(files)} passthrough file(s) totalling "
+            f"{total / 1024 / 1024:.0f} MiB; too large to send to {node.name} per job"
+        )
+
+    live = remote_repo_path(node, repo_root)
+    stage_dir = expand_remote(node, REMOTE_STAGE_DIR)
+    name = f"inputs-{abs(hash((str(repo_root), tuple(files)))) % 10**10}.zip"
+    remote_zip = f"{stage_dir}\{name}"
+    with tempfile.TemporaryDirectory(prefix="workerq-inputs-") as tmp:
+        archive = Path(tmp) / name
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+            for rel in files:
+                zf.write(repo_root / rel, rel)
+        nodes.run_remote(node, f"mkdir {_q(stage_dir)} 2>nul & exit /b 0")
+        sent = nodes.copy_to_node(node, archive, remote_zip)
+        if not sent.ok:
+            raise StagingError(f"could not send inputs to {node.name}: {sent.error}")
+    run = nodes.run_remote(
+        node,
+        "powershell -NoProfile -Command \"Expand-Archive -LiteralPath "
+        f"'{remote_zip}' -DestinationPath '{live}' -Force; "
+        f"Remove-Item -LiteralPath '{remote_zip}' -Force\"",
+        timeout=max(node.timeout_seconds, 300.0),
+    )
+    if not run.ok:
+        raise StagingError(f"could not unpack inputs on {node.name}: {run.error}")
+    result["files"] = len(files)
+    result["bytes"] = total
     return result

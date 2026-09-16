@@ -252,6 +252,39 @@ def assess(
     return TravelVerdict(True, [], repo_paths, adopt)
 
 
+def shadowed_passthrough(
+    requested: list[str],
+    linked: list[str],
+    repo_root: Path | None,
+    snapshot_path: Path | None,
+) -> list[str]:
+    """Passthrough entries the snapshot already had, so nothing was linked.
+
+    A passthrough directory is how a project says "writes here belong in the
+    real repository". It is silently skipped when the snapshot already has that
+    path, which happens as soon as one file under it is committed - and then a
+    job's writes land in the snapshot instead. kaggriculture declares `runs` for
+    exactly this reason, and `runs/` gained tracked files on 2026-09-11.
+
+    Here that costs a trip into the snapshot directory. On another machine the
+    worktree is deleted when the job ends, so the results are simply gone - job
+    1460 ran to success on the 3080 Ti and its `runs/...jsonl` was never seen
+    again. Declaring these as outputs brings them home instead.
+    """
+    if repo_root is None or snapshot_path is None:
+        return []
+    shadowed: list[str] = []
+    for raw in requested:
+        entry = str(raw).strip().replace(chr(92), "/").strip("/")
+        if not entry or entry in linked or Path(entry).is_absolute() or ":" in entry:
+            continue
+        if ".." in Path(entry).parts:
+            continue
+        if (repo_root / entry).exists() and (snapshot_path / entry).exists():
+            shadowed.append(entry)
+    return shadowed
+
+
 def describe_outputs(outputs: list[str] | None) -> str | None:
     """A one-line note for `show`, or None when a job declares no outputs."""
     if not outputs:
