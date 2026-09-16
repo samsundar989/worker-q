@@ -85,6 +85,17 @@ declaration in place, which keeps its snapshot and queue position:
 
     workerq requests <job_id> --ram 16
 
+**worker-q may reserve less than you declare.** Once a command has five
+successful measured runs, a `--ram` it habitually over-declares is trimmed to
+the largest fraction of its declaration it has actually used, plus 50%, and the
+submit output says so. Scale is kept: declare more for a bigger run and more is
+reserved. Pass `--exact-resources` when this run is genuinely different.
+
+**A job that cannot start is refused at submit.** A missing script or program,
+or a syntax error in the script or the local modules it imports, fails
+`workerq submit` immediately instead of after a long wait. Fix it and resubmit;
+`--no-preflight` overrides it if the check is wrong.
+
 If a job needs a GPU but not the whole card, `--share-gpu` lets it run beside
 another job that also opted in. It requires `--vram`, because packing is judged
 on the declaration alone:
@@ -223,31 +234,26 @@ machine, not to be safe.
 A pin that cannot be honoured fails **at submit time** with the reason, rather
 than waiting in the queue.
 
-### Two things that stop a job travelling
+### What a travelling job needs
 
-Both are about the job, not the machine, and both are worth fixing rather than
-working around.
-
-**Writing to an absolute path inside the repository.** Repos live at the same
-path on both machines, so `--out C:/Users/samsu/Documents/<project>/artifacts/x`
-resolves on either - and the job would succeed while leaving its results on a
-machine nobody is looking at. worker-q refuses this rather than let it happen.
-The fix is a path *relative* to the repository, declared in `.gpuq.toml`:
-
-    [snapshot]
-    outputs = ["artifacts", "runs/records"]
-
-Declared outputs are copied home when the job finishes. Reading an absolute
-path is fine and is not affected - only writing.
-
-**Data that is not on the other machine.** A job may only be placed where every
-`--passthrough` path it declares exists. Check with:
+**Its data on the other machine.** A job may only be placed where every
+`--passthrough` path it declares exists. Small missing entries (up to 50 MiB,
+never a virtualenv) are sent there automatically, as are files your command
+names under a passthrough path - a script you just wrote into `.cache/` travels
+with its folder. Anything larger has to be staged; check with:
 
     workerq node stage 3080ti --repo <path>
 
-which lists exactly what is missing. Declare passthrough in `.gpuq.toml` rather
-than repeating flags, since that file travels with the snapshot and both
-machines then agree without anyone remembering.
+Declare passthrough in `.gpuq.toml` rather than repeating flags, since that file
+travels with the snapshot and both machines then agree without anyone
+remembering.
+
+**Its results come home.** An absolute output path inside the repository is the
+right pattern where a project asks for one: it is collected from the other
+machine when the job ends. Committed paths a job writes can also be declared:
+
+    [snapshot]
+    outputs = ["artifacts", "runs/records"]
 
 Notes for this machine:
 - A queued job runs the source exactly as it was at submission time, so you may

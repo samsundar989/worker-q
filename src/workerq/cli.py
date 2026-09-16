@@ -244,6 +244,18 @@ def submit(
         "--passthrough",
         help="Ignored path (dataset/checkpoints) to link into the snapshot. Repeatable.",
     ),
+    preflight: bool = typer.Option(
+        True,
+        "--preflight/--no-preflight",
+        help="Refuse at submit a command that cannot start: a missing program or "
+        "script, or a syntax error in the script or its local imports.",
+    ),
+    exact_resources: bool = typer.Option(
+        False,
+        "--exact-resources",
+        help="Reserve exactly the declared --ram, even when this command's history "
+        "shows it uses far less.",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Submit a job to the shared GPU queue and return immediately."""
@@ -297,6 +309,8 @@ def submit(
         describe=describe,
         blocks=blocks,
         eta_seconds=eta_seconds,
+        preflight=preflight,
+        right_size=not exact_resources,
     )
 
     try:
@@ -2984,6 +2998,10 @@ def internal_submit_spec(
                 describe=spec.describe,
                 blocks=spec.blocks,
                 eta_seconds=spec.eta_seconds,
+                # Both already ran on the machine that queued it, against its
+                # own history; the declaration arriving here is the decision.
+                preflight=False,
+                right_size=False,
             )
         )
     except Exception as exc:

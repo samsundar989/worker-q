@@ -72,6 +72,9 @@ class CoreConfig:
     #: own because `to_toml` regenerates this file on every `config set`, and
     #: one more key is a far smaller change than one more section.
     web_port: int = 7676
+    #: Refuse at submit a command that definitely cannot start (a missing
+    #: program or script, a syntax error). `--no-preflight` skips it per job.
+    preflight: bool = True
 
 
 @dataclass
@@ -154,6 +157,13 @@ class ResourcesConfig:
 
     #: How long a job may sit blocked before gpuq says so loudly.
     blocked_warning_seconds: int = 900
+
+    #: Reserve less than a job declares when its command's own history proves
+    #: the declaration is habitually far above use. See
+    #: `GPUQService._right_size`; `--exact-resources` opts one job out.
+    auto_right_size: bool = True
+    #: Successful, well-sampled runs needed before a declaration is trimmed.
+    right_size_min_runs: int = 5
 
 
 @dataclass

@@ -7,9 +7,11 @@ scheduling, snapshotting or state handling (spec sections 3 and 20).
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +58,7 @@ from workerq.util import (
     hostname,
     parse_env_assignment,
     resolve_path,
+    utcnow,
     utcnow_iso,
 )
 
@@ -117,6 +120,10 @@ class SubmitRequest:
     eta_seconds: float | None = None
     #: Pin to one machine. None means worker-q chooses; "local" means here.
     node: str | None = None
+    #: Refuse a command that definitely cannot start. See `preflight`.
+    preflight: bool = True
+    #: Allow the RAM reservation to be trimmed from this command's history.
+    right_size: bool = True
 
 
 @dataclass
@@ -350,6 +357,32 @@ class GPUQService:
             execution_cwd = self._resolve_execution_cwd(
                 snapshot, repo_root, submitted_cwd
             )
+
+            # Judged against the snapshot, because that is what the job will
+            # see: a script that exists in the live tree but is gitignored is
+            # exactly the failure this catches.
+            if request.preflight and self.config.core.preflight:
+                from workerq import preflight
+
+                checked = preflight.check(command, Path(execution_cwd), shell_mode=shell_mode)
+                if not checked.ok:
+                    shown = "\n  ".join(checked.errors[:5])
+                    more = len(checked.errors) - 5
+                    raise GPUQError(
+                        "preflight: this command cannot start.\n  " + shown
+                        + (f"\n  ...and {more} more" if more > 0 else "")
+                        + "\nFix it and resubmit, or pass --no-preflight if this is wrong."
+                    )
+
+            if request.right_size:
+                declared = ram_mib
+                trimmed, note = self._right_size(project, command, shell_mode, ram_mib)
+                if trimmed is not None:
+                    ram_mib = trimmed
+                    advisories.append(note)
+                    self.db.update_job(
+                        job_id, requested_ram_mib=ram_mib, declared_ram_mib=declared
+                    )
 
             self.db.update_job(
                 job_id,
@@ -777,6 +810,81 @@ class GPUQService:
                 f"{capacity.usable_vram_mib / 1024:.1f} GiB is usable. "
                 "This job would never start."
             )
+
+    def _right_size(
+        self,
+        project: str,
+        command: list[str],
+        shell_mode: bool,
+        ram_mib: float | None,
+    ) -> tuple[float | None, str]:
+        """A smaller RAM reservation, when history proves the declaration is inflated.
+
+        The measured cost of not doing this: the median job uses half of what
+        it declares, 405 GiB-hours of reservation went untouched in a week, and
+        the most common reason a job waited was other jobs' *reservations*, not
+        a shortage of memory.
+
+        The obvious rule - reserve the worst peak this command has shown - is
+        unsafe, because a command signature ignores numbers: `--workers 2` and
+        `--workers 8` are the same command to it, and the small runs' peak would
+        starve the big one. So the history is used as a **fraction of what each
+        run declared**, and applied to what this run declares. An agent that
+        declares 16 GiB for eight workers keeps eight workers' worth; what is
+        removed is the habitual padding, not the agent's own sense of scale.
+
+        Conservative in every direction it can be:
+
+        * only successful runs with a directly measured, well-sampled peak;
+        * the *worst* fraction, plus the usual 50% headroom;
+        * against declared RAM alone - a GPU job's commit includes its VRAM
+          under WDDM, which overstates the fraction and so trims less;
+        * never below 2 GiB, and only when the saving is at least 20%.
+        """
+        from workerq.eta import (
+            LEARNED_WINDOW_DAYS,
+            MIN_SUGGESTION_GB,
+            PEAK_HEADROOM,
+            command_signature,
+        )
+        from workerq.usage import MIN_CONFIDENT_SAMPLES
+
+        cfg = self.config.resources
+        if not cfg.auto_right_size or not ram_mib:
+            return None, ""
+        signature = command_signature(command, shell_mode)
+        if not signature:
+            return None, ""
+        cutoff = (utcnow() - timedelta(days=LEARNED_WINDOW_DAYS)).isoformat(
+            timespec="microseconds"
+        )
+        try:
+            rows = self.db.conn.execute(
+                "SELECT peak_ram_mib AS peak, "
+                "COALESCE(declared_ram_mib, requested_ram_mib) AS declared FROM jobs "
+                "WHERE project = ? AND command_signature = ? AND state = ? "
+                "AND finished_at >= ? AND peak_source = 'measured' "
+                "AND usage_samples >= ? AND peak_ram_mib IS NOT NULL "
+                "AND COALESCE(declared_ram_mib, requested_ram_mib) > 0 "
+                "ORDER BY id DESC LIMIT 30",
+                (project, signature, JobState.SUCCEEDED.value, cutoff, MIN_CONFIDENT_SAMPLES),
+            ).fetchall()
+        except Exception:
+            return None, ""
+        if len(rows) < max(1, cfg.right_size_min_runs):
+            return None, ""
+        fraction = max(float(r["peak"]) / float(r["declared"]) for r in rows)
+        target = max(MIN_SUGGESTION_GB * 1024.0, ram_mib * fraction * PEAK_HEADROOM)
+        # Round up to half a GiB, so the number reads as a declaration.
+        target = math.ceil(target / 512.0) * 512.0
+        if target > ram_mib * 0.8:
+            return None, ""
+        return target, (
+            f"reserving {target / 1024:.1f} GiB of the {ram_mib / 1024:.1f} GiB declared: "
+            f"across {len(rows)} successful run(s) this command used at most "
+            f"{fraction:.0%} of its declaration (plus {PEAK_HEADROOM - 1:.0%} headroom). "
+            "Pass --exact-resources to reserve the full amount."
+        )
 
     def _suggestion_ceiling(self) -> tuple[float | None, float | None]:
         """Usable RAM and VRAM in GiB, as a cap on what we advise declaring.
@@ -1314,6 +1422,8 @@ class GPUQService:
         updates: dict[str, Any] = {}
         if ram_mib is not None:
             updates["requested_ram_mib"] = ram_mib
+            # An explicit correction is a new declaration, not a trim.
+            updates["declared_ram_mib"] = None
         if vram_mib is not None:
             updates["requested_vram_mib"] = vram_mib
         if cpus is not None:

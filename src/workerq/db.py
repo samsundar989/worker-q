@@ -22,7 +22,7 @@ from workerq.models import (
 )
 from workerq.util import ensure_dir, restrict_permissions, utcnow_iso
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 _MIGRATIONS: list[tuple[int, str]] = [
     (
@@ -175,6 +175,16 @@ _MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE jobs ADD COLUMN vram_source TEXT;
         """,
     ),
+    (
+        9,
+        """
+        -- What the submitter declared, kept only when worker-q reserved less
+        -- (resources.auto_right_size). History must be measured against the
+        -- declaration, not the trimmed reservation, or every trimmed run would
+        -- look fully used and undo the trimming on the next submission.
+        ALTER TABLE jobs ADD COLUMN declared_ram_mib REAL;
+        """,
+    ),
 ]
 
 _JOB_COLUMNS = (
@@ -187,7 +197,7 @@ _JOB_COLUMNS = (
     "preempted_at, preempted_by, preempted_reason, description, blocks, "
     "eta_seconds, command_signature, progress_fraction, progress_note, "
     "progress_updated_at, peak_ram_mib, peak_vram_mib, usage_samples, peak_source, "
-    "vram_source, node"
+    "vram_source, node, declared_ram_mib"
 )
 
 #: Columns callers are allowed to update through `update_job`.
@@ -231,6 +241,7 @@ _UPDATABLE = frozenset(
         "usage_samples",
         "peak_source",
         "node",
+        "declared_ram_mib",
     }
 )
 

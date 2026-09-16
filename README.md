@@ -280,6 +280,33 @@ declaration has rarely been satisfiable here.
 Over-declaring is safe but packs badly and keeps your own work waiting;
 under-declaring is what takes the machine down.
 
+### Reserving what a command actually uses
+
+Declarations drift high: across 144 measured jobs the median used half of what
+it declared, and the commonest reason work waited was other jobs'
+*reservations*, not a shortage of memory. So once a command has
+`resources.right_size_min_runs` (default 5) successful, directly measured runs,
+worker-q reserves less than a habitually padded `--ram`:
+
+    reserved = declared x (worst fraction of its declaration any run used) x 1.5
+
+It is applied to *this* declaration rather than to past peaks, because a
+command's signature ignores numbers - `--workers 2` and `--workers 8` look alike
+- and a bigger run declared bigger must keep its scale. It never goes below
+2 GiB, is skipped unless it saves at least 20%, and the submit output says what
+it did. `--exact-resources` opts one job out; `resources.auto_right_size = false`
+turns it off.
+
+### Refusing what cannot start
+
+`workerq submit` checks the frozen snapshot before queueing: a path-shaped
+program or a Python script that is not there, or a syntax error in the script or
+any local module it imports, is refused on the spot with the file and line.
+Replayed over 351 real jobs it refused 6, every one of which had failed with
+that exact error after waiting in the queue. Shell strings and anything it
+cannot decide pass. `--no-preflight` skips it for one job; `core.preflight =
+false` turns it off.
+
 ---
 
 
@@ -541,19 +568,21 @@ rather than waiting silently in the queue.
 ### What has to be true for a job to travel
 
 **Its data must be there.** A job is only placed where every `--passthrough`
-path it declares exists. Environments are built on each machine, never copied;
-regenerable caches are left to regenerate; only real inputs are staged.
+path it declares exists. Environments are built on each machine, never copied.
+Small missing entries (up to 50 MiB, never a virtualenv) are sent automatically,
+and so are files a command names under a passthrough path, with their folder
+when it is small - a harness written into `.cache/` minutes before submitting
+arrives with it. Larger data is staged by hand:
 
 ```bash
-workerq node stage 3080ti --repo C:\path\to\project   # lists what is missing
+workerq node stage 3080ti --repo C:\path	o\project   # lists what is missing
 workerq node stage 3080ti --repo ... --clone            # clone it there first
 ```
 
-**It must not write to an absolute path inside the repository.** Repos sit at
-the same path on both machines, so `--out C:/Users/you/Documents/proj/out.csv`
-resolves on either — and the job would succeed while leaving its results on a
-machine nobody is looking at. worker-q refuses that rather than let it happen.
-Use a path relative to the repo and declare it:
+**Its results come home.** An absolute output path inside the repository is
+adopted as an output and collected when the job ends, and so is a passthrough
+directory that the snapshot already contains (it cannot be linked once it holds
+a committed file). Committed paths a job writes can be declared too:
 
 ```toml
 # .gpuq.toml
@@ -562,7 +591,6 @@ passthrough = [".venv", "data/train"]    # read: must exist on the node
 outputs     = ["artifacts", "runs"]      # written: copied home when the job ends
 ```
 
-Reading an absolute path is fine and unaffected. Only writing is refused.
 
 ### Taking a machine out of service
 

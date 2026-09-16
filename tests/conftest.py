@@ -56,6 +56,9 @@ def isolated_config(tmp_path: Path) -> Config:
             state_dir=str(state_dir),
             max_concurrent_jobs=1,
             cancel_grace_seconds=2,
+            # Queue tests submit placeholder commands; the preflight itself is
+            # exercised in tests/unit/test_preflight.py.
+            preflight=False,
         ),
         gpu=GpuConfig(
             default_gpu_count=0,  # tests must not depend on GPU availability

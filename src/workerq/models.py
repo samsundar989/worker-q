@@ -182,6 +182,9 @@ class Job:
     vram_source: str | None = None
     #: Machine this job ran on. None means the one that queued it.
     node: str | None = None
+    #: The submitter's RAM declaration, set only when auto right-sizing
+    #: reserved less (then `requested_ram_mib` is the reservation).
+    declared_ram_mib: float | None = None
     peak_vram_mib: float | None = None
     usage_samples: int = 0
     #: 'measured' (this job's own processes) or 'estimated' (machine telemetry).
@@ -276,6 +279,7 @@ class Job:
             "peak_ram_mib": self.peak_ram_mib,
             "vram_source": self.vram_source,
             "node": self.node,
+            "declared_ram_mib": self.declared_ram_mib,
             "peak_vram_mib": self.peak_vram_mib,
             "usage_samples": self.usage_samples,
             "peak_source": self.peak_source,
