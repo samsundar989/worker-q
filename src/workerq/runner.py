@@ -29,7 +29,13 @@ from workerq.config import Config, load_config
 from workerq.db import Database
 from workerq.gpu import query_gpus
 from workerq.models import Job, JobState
-from workerq.util import atomic_write_text, ensure_dir, hostname, utcnow_iso
+from workerq.util import (
+    atomic_write_text,
+    ensure_dir,
+    hostname,
+    scrub_inherited_env,
+    utcnow_iso,
+)
 from workerq.winproc import ProcessGroup, child_creationflags, posix_child_kwargs
 
 _CANCEL_POLL_SECONDS = 0.5
@@ -203,7 +209,10 @@ def run_job(
     )
 
     # ---- 5/6/7. chdir, apply env, execute ------------------------------
-    child_env = dict(os.environ)
+    # Scrubbed here as well as at daemon start, because a daemon started by an
+    # older build may still carry the variable. A job that sets it explicitly
+    # through --env keeps it: that is applied below.
+    child_env = scrub_inherited_env(dict(os.environ))
     for key, value in job.env.items():
         child_env[key] = value
     progress_path = job_dir / "progress"

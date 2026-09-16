@@ -276,3 +276,21 @@ def hostname() -> str:
 
 def python_executable() -> str:
     return sys.executable or "python"
+
+
+#: Variables a *caller's* shell sets that must not reach the dispatcher or a job.
+#:
+#: `NoDefaultCurrentDirectoryInExePath` is set by agent shells (Claude Code) as
+#: a hardening measure. Inherited by a job, it makes `CreateProcess` refuse a
+#: bare relative program such as `.venv/Scripts/python.exe`: on 2026-09-16 a
+#: dispatcher restarted from an agent shell failed job 1461 that way, with an
+#: error blaming the snapshot. The queue must behave the same whoever started it.
+_SHELL_ONLY_VARIABLES = frozenset({"nodefaultcurrentdirectoryinexepath"})
+
+
+def scrub_inherited_env(env: dict[str, str]) -> dict[str, str]:
+    """Drop shell-hardening variables that change how a job's program is found."""
+    for key in [k for k in env if k.lower() in _SHELL_ONLY_VARIABLES]:
+        env.pop(key, None)
+    return env
+

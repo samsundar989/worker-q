@@ -127,6 +127,11 @@ class LocalDispatcherBackend:
         import os
 
         env.update(os.environ)
+        # Whoever starts the daemon, it and every job it launches must see the
+        # same environment - see util.scrub_inherited_env.
+        from workerq.util import scrub_inherited_env
+
+        scrub_inherited_env(env)
         env["GPUQ_STATE_DIR"] = str(self.config.state_dir)
         if self.config.profile:
             env["GPUQ_PROFILE"] = self.config.profile
