@@ -86,15 +86,18 @@ declaration in place, which keeps its snapshot and queue position:
     workerq requests <job_id> --ram 16
 
 **worker-q may reserve less than you declare.** Once a command has five
-successful measured runs, a `--ram` it habitually over-declares is trimmed to
-the largest fraction of its declaration it has actually used, plus 50%, and the
-submit output says so. Scale is kept: declare more for a bigger run and more is
-reserved. Pass `--exact-resources` when this run is genuinely different.
+successful measured runs, a `--ram` it habitually over-declares is reserved as
+the largest fraction of its declaration any run actually used, plus 50% (never
+below 2 GiB), and `submit` prints what it did. Your sense of scale is kept:
+declare more for a bigger run and more is reserved. So keep declaring honestly -
+do not shave numbers yourself to get started sooner. Pass `--exact-resources`
+when this particular run is genuinely heavier than its history.
 
-**A job that cannot start is refused at submit.** A missing script or program,
-or a syntax error in the script or the local modules it imports, fails
-`workerq submit` immediately instead of after a long wait. Fix it and resubmit;
-`--no-preflight` overrides it if the check is wrong.
+**A job that cannot start is refused at submit.** A missing program or script,
+or a syntax error in the script or any local module it imports, fails
+`workerq submit` immediately with the file and line, instead of after a long
+wait in the queue. Fix it and resubmit. `--no-preflight` overrides the check if
+it is wrong - that should be rare, so say why if you use it.
 
 If a job needs a GPU but not the whole card, `--share-gpu` lets it run beside
 another job that also opted in. It requires `--vram`, because packing is judged
@@ -200,9 +203,9 @@ entirely.
 The two machines are not equals:
 
     SAM_MEGA_PC     RTX 5090 32 GiB    64 GiB RAM   (this one)
-    3080ti          RTX 3080 Ti 12 GiB 16 GiB RAM   about 11 GiB VRAM usable
+    3080ti          RTX 3080 Ti 12 GiB 16 GiB RAM   ~11 GiB VRAM, ~9 GiB RAM for jobs
 
-So a job wanting more than ~11 GiB of VRAM or ~13 GiB of RAM can only ever run
+So a job wanting more than ~11 GiB of VRAM or ~9 GiB of RAM can only ever run
 here. That is not a failure, and `status` says so rather than leaving it
 mysterious.
 
@@ -217,9 +220,10 @@ machine is faster, and moving it would buy nothing.
     workerq node list              both machines, their memory and health
     workerq logs <id> --follow     works the same wherever the job runs
 
-Logs and any declared output paths are brought back automatically when a remote
-job ends, so `workerq logs <id>` is always the right command and you never need
-to go looking on the other machine.
+Logs and outputs are brought back automatically when a remote job ends, so
+`workerq logs <id>` is always the right command and you never need to go looking
+on the other machine. `workerq cancel <id>` reaches a job on the other machine
+too, so cancel before resubmitting rather than leaving two copies running.
 
 ### Pinning, when you really mean it
 
@@ -236,24 +240,33 @@ than waiting in the queue.
 
 ### What a travelling job needs
 
-**Its data on the other machine.** A job may only be placed where every
-`--passthrough` path it declares exists. Small missing entries (up to 50 MiB,
-never a virtualenv) are sent there automatically, as are files your command
-names under a passthrough path - a script you just wrote into `.cache/` travels
-with its folder. Anything larger has to be staged; check with:
-
-    workerq node stage 3080ti --repo <path>
-
-Declare passthrough in `.gpuq.toml` rather than repeating flags, since that file
-travels with the snapshot and both machines then agree without anyone
-remembering.
-
-**Its results come home.** An absolute output path inside the repository is the
-right pattern where a project asks for one: it is collected from the other
-machine when the job ends. Committed paths a job writes can also be declared:
+**Results: write where your project says to.** If a project's instructions or
+`.gpuq.toml` say to use an absolute output path inside the repository, keep
+doing that - it is collected from the other machine when the job ends. Do not
+switch such a project to relative outputs: a relative write lands in the
+disposable snapshot and is deleted. Committed directories a job writes can also
+be declared, and are copied home:
 
     [snapshot]
     outputs = ["artifacts", "runs/records"]
+
+**Data: declare it as passthrough.** A job may only be placed where every
+`--passthrough` path it declares exists. Small missing entries (up to 50 MiB,
+never a virtualenv) are sent to the other machine automatically, and so are
+files your command names under a passthrough path - a script you just wrote
+into `.cache/` travels with its folder. Larger data has to be staged; check with:
+
+    workerq node stage 3080ti --repo <path>
+
+which lists exactly what is missing. Declare passthrough in `.gpuq.toml` rather
+than repeating flags, since that file travels with the snapshot and both
+machines then agree without anyone remembering.
+
+**A passthrough directory stops working once it holds a committed file** - the
+snapshot then has its own copy and nothing is linked, so writes land in the
+snapshot. worker-q collects them from the other machine, but locally they stay in
+`~/.local/state/gpuq/snapshots/<id>/`. If results you expected in the live repo
+are missing, look there, and prefer an absolute output path.
 
 Notes for this machine:
 - A queued job runs the source exactly as it was at submission time, so you may
@@ -263,7 +276,10 @@ Notes for this machine:
 - `workerq status --json`, `workerq show <id> --json` and `gpuq list --json` are the
   machine-readable forms to parse.
 - The command is `workerq`. `gpuq` is a working alias, so older project
-  instructions that say `gpuq ...` are still correct."""
+  instructions that say `gpuq ...` are still correct.
+- Do not restart or stop the dispatcher (`workerq restart`, killing `pythonw`).
+  If the queue looks dead, say so; the owner restarts it from its scheduled task,
+  which is the only way it starts in the right session and environment."""
 
 
 def policy_block() -> str:

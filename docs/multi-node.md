@@ -437,7 +437,9 @@ For each queued job, in the existing `(priority_rank, position, id)` order,
 compute the set of eligible nodes:
 
 1. **Pinned.** `--node <name>` restricts to one node. `--node local` is an
-   explicit way to keep a job home.
+   explicit way to keep a job home. *(Until 2026-09-16 it was silently ignored
+   and such jobs could travel - #545 did. It now withholds the job's remote
+   spec, so the dispatcher can only run it here.)*
 2. **Reachable.** The node's last report is fresh and its dispatcher is
    healthy. A stale node is not eligible for *new* work (see
    [§7](#7-failure-semantics) for what happens to work already on it).
@@ -1129,6 +1131,12 @@ an absolute path *outside* the repo is left alone, because a missing dataset
 fails loudly and that is the safe direction — it is only the paths that
 *resolve* on both machines that diverge silently.
 
+> **Superseded 2026-09-10.** Refusing proved the wrong remedy: an absolute path
+> is the *documented* pattern for arc-whest and biohub, because a relative
+> artifact is deleted with the snapshot, and refusing locked both out entirely.
+> The write target is now adopted as a declared output and collected. Do not
+> advise relative outputs for those projects.
+
 **What the job writes comes home.** `[snapshot] outputs` in `.gpuq.toml` is
 read alongside `passthrough`, travels in the job spec, and is collected when
 the job ends — before it is recorded as finished, because a job marked
@@ -1331,3 +1339,30 @@ not exist until Phases 4–6 have been running for a while.
 5. **Whether `max_concurrent_jobs = 3` on the worker is optimistic.** With
    13 GiB of usable RAM and the default 3 GiB charge for undeclared work,
    three concurrent jobs is close to the ceiling. It may want to be 2.
+
+---
+
+## Addendum, 2026-09-16: the three days nothing travelled
+
+No job was placed on the worker from 2026-09-13 05:43 until 2026-09-16. Every
+cause was silent, and each is worth keeping in mind when changing this code:
+
+- **A failure cached as an answer.** `staging.expand_remote` fell back to the
+  literal `%USERPROFILE%` when the node could not be asked, and cached it. A
+  dispatcher started while the node was off then sent that literal as every
+  job's working directory, and the node's Python refused each one. Failures
+  now raise and are never cached; neither is a failed repo scan.
+- **A retry that could never succeed.** A placement failing after the worktree
+  existed left it behind, and `git worktree add` failed every retry - 187 times
+  for one job, ~15s each on the dispatch loop. Worktrees at the right commit
+  are reused, and failed placements back off per job and node.
+- **Local rules ending a remote scan.** The queue hold and the backfill skip
+  limit returned from the scan, so later jobs were never offered elsewhere.
+- **Passthrough is not a snapshot.** Inputs under `.cache/` written minutes
+  before submission did not exist on the node; files a command names there are
+  now sent with it. A passthrough directory holding a committed file is not
+  linked at all, so its writes are now collected as outputs. Small missing
+  entries are pushed rather than refusing the project.
+- **Lifecycle across machines.** A restart marked remote jobs FAILED (no local
+  pid) and cancels never left the primary. Both are fixed, and a placed job is
+  charged against the cached node report so one tick cannot over-fill the node.

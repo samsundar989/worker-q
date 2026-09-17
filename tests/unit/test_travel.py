@@ -206,3 +206,27 @@ def test_a_passthrough_shadowed_by_tracked_files_is_brought_home(tmp_path):
 
 def test_no_snapshot_means_nothing_is_shadowed(tmp_path):
     assert travel.shadowed_passthrough(["runs"], [], tmp_path, None) == []
+
+
+# --------------------------------------------------------------------------
+# --node local
+# --------------------------------------------------------------------------
+
+
+def _spec_for(service, git_repo, **kw):
+    from workerq.core import SubmitRequest
+
+    job = service.submit(SubmitRequest(
+        command=["python", "-c", "pass"], project="pin", gpus=0, cwd=str(git_repo), **kw
+    )).job
+    row = service.backend.store.get(int(job.backend_job_id))
+    return row.get("remote_spec_json")
+
+
+def test_node_local_keeps_a_job_here(service, git_repo):
+    """It was silently a no-op: job #545 asked for local and ran on the 3080 Ti."""
+    assert _spec_for(service, git_repo, node="local") is None
+
+
+def test_no_pin_can_still_travel(service, git_repo):
+    assert _spec_for(service, git_repo) is not None

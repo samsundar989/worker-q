@@ -109,6 +109,27 @@ workerq init
 
 ---
 
+## `workerq submit` refused my job: "preflight: this command cannot start"
+
+The submit-time check found something that would have failed in the first
+second - after the job had waited its turn. It reports the file and line:
+
+```
+job not submitted: preflight: this command cannot start.
+  C:\...\snapshots\1417\job-1417\tools\production_diagnose.py:518: SyntaxError: unterminated string literal
+```
+
+It judges the **snapshot**, so "script not found" for a file you can see means
+the file is gitignored (see below). It parses the script and every local module
+it imports, for `python script.py`, `python -m pkg.mod` and `uv run` forms;
+shell strings and installed packages are not judged. Replayed over 351 real
+jobs it refused 6, each of which had failed with exactly that error.
+
+If it is genuinely wrong, `--no-preflight` skips it for one job and
+`core.preflight = false` turns it off.
+
+---
+
 ## A job failed immediately
 
 ```bash
@@ -139,6 +160,19 @@ Check what a job actually saw:
 
 ```bash
 workerq show <id>          # Execution cwd, Snapshot commit, Passthrough
+```
+
+### `[WinError 2]` for `.venv/Scripts/python.exe`, and the file is there
+
+The runner blames the snapshot, but check whether the dispatcher was started
+from an agent's shell. Claude Code sets `NoDefaultCurrentDirectoryInExePath=1`,
+which makes Windows refuse a bare relative program like
+`.venv/Scripts/python.exe` (while `./.venv/...` or backslashes still work).
+worker-q strips the variable from the daemon and from every job since 7688001;
+on an older build, restart the dispatcher from its scheduled task:
+
+```powershell
+Start-ScheduledTask -TaskName 'worker-q dispatcher'
 ```
 
 ### The wrong version of my code ran
@@ -250,6 +284,21 @@ workerq submit --project biohub --ram 24 --cpus 4 -- python -m celltrack train
 ```
 
 `workerq show <id>` prints what a job actually requested.
+
+---
+
+## `show` reports less RAM than I declared
+
+That is right-sizing. Once a command has five successful, directly measured
+runs, a `--ram` it habitually over-declares is reserved as
+
+    declared x (largest fraction of its declaration any run used) x 1.5
+
+never below 2 GiB, and only when that saves at least 20%. `submit` prints the
+decision, and the original is kept as `declared_ram_mib`. It scales with what
+you declare, so a bigger run declared bigger keeps its size. If this run really
+is heavier than its history, submit with `--exact-resources`; to turn it off,
+set `resources.auto_right_size = false`.
 
 ---
 
@@ -403,6 +452,34 @@ workerq init && workerq reconcile && workerq status
 
 There is no automatic restart-on-login service in V1. Add one yourself if you
 want it (a user systemd unit, or a Task Scheduler entry running `workerq init`).
+
+---
+
+## Nothing runs on the 3080 Ti
+
+Work only moves when that lets a *different* job start sooner, so an idle worker
+with a short queue is normal. When the queue is backed up and the NODE column
+never says `3080ti`, read the wait reason (`workerq show <id>`); the part after
+`|` is the other machine's verdict.
+
+- **"3080ti is missing <path>"** - passthrough data that is not there. Entries
+  up to 50 MiB are sent automatically; anything larger (or a venv) must be
+  copied by hand. `workerq node stage 3080ti --repo <path>` lists them.
+- **"on 3080ti: needs N GiB RAM but only M GiB is free"** - it does not fit
+  there. The worker has ~9 GiB for jobs once its desktop is running.
+- **"placement on 3080ti failed; retrying in Ns"** - the last attempt errored;
+  `dispatcher.log` has the reason. Failed placements back off (60s doubling to
+  15m) so they cannot stall the dispatch loop.
+- **"3080ti already has N job(s) waiting"** - the node has not started what it
+  was sent yet; more follows once it does.
+- **Nothing after `|` at all** - the job has no remote spec: it was submitted
+  `--node local`, `--no-snapshot` or `--live-worktree`.
+
+Placement was dead from 2026-09-13 to 09-16 for a reason none of these showed:
+a dispatcher started while the node was off cached a failed `%USERPROFILE%`
+lookup, and the node refused every submission. That is fixed (8256a10); if a
+placement error ever shows a path containing `%`, restart the dispatcher from
+its scheduled task.
 
 ---
 

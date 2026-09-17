@@ -563,7 +563,8 @@ workerq submit --node 3080ti ...   # insist on the worker
 
 Prefer not to. A pin overrides a decision made with more information than you
 have. A pin that cannot be honoured fails at **submit** time with the reason,
-rather than waiting silently in the queue.
+rather than waiting silently in the queue. `--node local` gives the job no
+remote spec at all, so it can only ever run on the machine that queued it.
 
 ### What has to be true for a job to travel
 

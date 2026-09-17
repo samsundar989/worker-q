@@ -291,7 +291,13 @@ class GPUQService:
                     f"unknown node {pinned_node!r} (registered: {known}). "
                     "Add it with `workerq node add`."
                 )
-        if pinned_node == LOCAL_NODE:
+        # `--node local` keeps the job here. It used to be normalised to "no
+        # pin", which is what `None` means in the queue, so worker-q was free to
+        # send it away - job #545 asked for local and ran on the 3080 Ti. The
+        # queue row still carries no pin; the job simply gets no remote spec,
+        # which the dispatcher already reads as "can only run here".
+        keep_local = pinned_node == LOCAL_NODE
+        if keep_local:
             pinned_node = None
 
         passthrough = list(request.passthrough or [])
@@ -443,7 +449,7 @@ class GPUQService:
             ]
 
             remote_spec: dict[str, Any] | None = None
-            if snapshot.commit and repo_root is not None and verdict.ok:
+            if snapshot.commit and repo_root is not None and verdict.ok and not keep_local:
                 remote_spec = {
                     "project": project,
                     "argv": list(request.command),
