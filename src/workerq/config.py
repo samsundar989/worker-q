@@ -65,8 +65,15 @@ class CoreConfig:
     max_concurrent_jobs: int = 4
     default_priority: str = "normal"
     snapshot_mode: str = "git"
-    cleanup_successful_snapshots_after_days: int = 7
-    cleanup_failed_snapshots_after_days: int = 14
+    cleanup_successful_snapshots_after_days: int = 1
+    cleanup_failed_snapshots_after_days: int = 3
+    #: Finished snapshots kept regardless of age; older ones beyond this go
+    #: an hour after their job ends. This, not the day limits, is what bounds
+    #: disk on a busy queue.
+    keep_recent_snapshots: int = 20
+    #: The dispatcher applies retention itself, every few minutes. Off means
+    #: snapshots accumulate until someone runs `workerq cleanup`.
+    auto_cleanup: bool = True
     cancel_grace_seconds: int = 15
     #: Port for `workerq web`. Lives in [core] rather than a section of its
     #: own because `to_toml` regenerates this file on every `config set`, and
@@ -400,6 +407,7 @@ class Config:
         for name in (
             "cleanup_successful_snapshots_after_days",
             "cleanup_failed_snapshots_after_days",
+            "keep_recent_snapshots",
         ):
             if getattr(c, name) < 0:
                 raise ConfigError(f"core.{name} must be >= 0")

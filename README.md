@@ -808,8 +808,10 @@ state_dir = "~/.local/state/gpuq"
 max_concurrent_jobs = 4
 default_priority = "normal"
 snapshot_mode = "git"
-cleanup_successful_snapshots_after_days = 7
-cleanup_failed_snapshots_after_days = 14
+cleanup_successful_snapshots_after_days = 1
+cleanup_failed_snapshots_after_days = 3
+keep_recent_snapshots = 20
+auto_cleanup = true
 cancel_grace_seconds = 15
 
 [gpu]
@@ -837,13 +839,20 @@ directory — that is how the test suite avoids touching your real queue.
 ```bash
 workerq reconcile              # repair metadata after a crash or reboot
 workerq cleanup --dry-run      # see what retention would remove
-workerq cleanup                # remove expired snapshots and orphan temp files
+workerq cleanup                # remove expired snapshots and orphan temp files now
+workerq cleanup --keep 5       # keep only the 5 newest finished snapshots
 workerq uninstall --dry-run    # see exactly what removal would touch
 ```
 
 Cleanup never deletes an active job's snapshot or logs, never touches anything
 outside the worker-q state directory, and keeps failed-job evidence for its own
 longer retention window.
+
+You rarely need to run it: the dispatcher applies retention itself every ten
+minutes. A finished job's snapshot goes when it is older than its age limit
+(1 day for success, 3 for failure), or as soon as it is an hour old and no
+longer among the `keep_recent_snapshots` newest. The count cap is what keeps
+disk bounded on a busy queue. Set `auto_cleanup = false` to turn it off.
 
 After a reboot:
 

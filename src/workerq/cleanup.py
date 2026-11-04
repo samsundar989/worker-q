@@ -3,6 +3,13 @@
 Deletion is deliberately conservative. Nothing outside the worker-q state directory
 is ever touched, active jobs are never disturbed, and failed-job evidence
 survives its own longer retention window.
+
+Two limits apply, and a snapshot goes as soon as either says so: an age limit
+per outcome, and a cap on how many finished snapshots are kept at all. The cap
+is what bounds disk on a busy box - a sweep of a few hundred jobs at half a
+gigabyte each fills a drive long before any of them is a week old. The
+dispatcher applies both on its own (`auto_cleanup`); nobody has to remember to
+run `workerq cleanup`, which is how 600 snapshots once piled up.
 """
 
 from __future__ import annotations
@@ -47,6 +54,13 @@ class CleanupPlan:
         return len(self.snapshots) + len(self.temp_files) + len(self.orphan_dirs)
 
 
+#: A finished snapshot is never removed by the count cap sooner than this.
+#: Outputs a job wrote relative to its snapshot live only there, and a remote
+#: job's are copied back into it when it ends, so give whoever submitted it a
+#: chance to look before the cap reclaims it.
+COUNT_CAP_GRACE_SECONDS = 3600.0
+
+
 def _retention(service: GPUQService, state: JobState) -> timedelta:
     core = service.config.core
     days = (
@@ -58,27 +72,65 @@ def _retention(service: GPUQService, state: JobState) -> timedelta:
 
 
 def _dir_size(path: Path) -> int:
+    """Bytes under `path`, never descending a symlink or junction.
+
+    A passthrough junction leads to a live dataset that removal detaches rather
+    than deletes, so counting through it would both overstate what cleanup
+    reclaims and walk tens of gigabytes for nothing.
+    """
+    import os
+
     total = 0
-    try:
-        for entry in path.rglob("*"):
+    stack = [path]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            continue
+        for entry in entries:
             try:
-                if entry.is_file() and not entry.is_symlink():
-                    total += entry.stat().st_size
+                if is_reparse_point(Path(entry.path)):
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(Path(entry.path))
+                elif entry.is_file(follow_symlinks=False):
+                    total += entry.stat(follow_symlinks=False).st_size
             except OSError:
                 continue
-    except OSError:
-        pass
     return total
 
 
-def build_plan(service: GPUQService, *, older_than: str | None = None) -> CleanupPlan:
+def build_plan(
+    service: GPUQService,
+    *,
+    older_than: str | None = None,
+    keep_recent: int | None = None,
+) -> CleanupPlan:
     """Decide what may be removed. Pure inspection - no deletion here."""
     plan = CleanupPlan()
     service.ensure_ready()
     state_dir = service.config.state_dir
     override = parse_duration(older_than) if older_than else None
+    if keep_recent is None:
+        keep_recent = service.config.core.keep_recent_snapshots
 
     known_snapshot_dirs: set[str] = set()
+    # Finished snapshots the age limit would keep, as (age, job, path).
+    retained: list[tuple[float, Any, Path]] = []
+
+    def propose(job: Any, snapshot_path: Path, age: float) -> None:
+        plan.snapshots.append(
+            {
+                "job_id": job.id,
+                "state": job.state,
+                "path": str(snapshot_path),
+                "repo_root": job.repo_root,
+                "ref": f"refs/gpuq/snapshots/{job.id}",
+                "size_bytes": _dir_size(snapshot_path),
+                "age_days": round(age / 86400, 2),
+            }
+        )
 
     for job in service.db.list_jobs():
         if not job.snapshot_path:
@@ -96,22 +148,27 @@ def build_plan(service: GPUQService, *, older_than: str | None = None) -> Cleanu
         retention = override if override is not None else _retention(service, job.state_enum)
         age = age_seconds(job.finished_at or job.updated_at) or 0.0
         if age < retention.total_seconds():
-            remaining = retention.total_seconds() - age
-            plan.skipped.append(
-                f"job #{job.id}: within retention ({remaining / 86400:.1f}d left)"
-            )
+            retained.append((age, job, snapshot_path))
             continue
 
-        plan.snapshots.append(
-            {
-                "job_id": job.id,
-                "state": job.state,
-                "path": str(snapshot_path),
-                "repo_root": job.repo_root,
-                "ref": f"refs/gpuq/snapshots/{job.id}",
-                "size_bytes": _dir_size(snapshot_path),
-                "age_days": round(age / 86400, 2),
-            }
+        propose(job, snapshot_path, age)
+
+    # The count cap: beyond the newest `keep_recent`, a finished snapshot goes
+    # once it is past the grace period, however young its age limit says it is.
+    retained.sort(key=lambda item: item[0])
+    for index, (age, job, snapshot_path) in enumerate(retained):
+        if index >= keep_recent and age >= COUNT_CAP_GRACE_SECONDS:
+            propose(job, snapshot_path, age)
+            continue
+        retention = override if override is not None else _retention(service, job.state_enum)
+        remaining = retention.total_seconds() - age
+        reason = (
+            f"one of the newest {keep_recent}"
+            if index < keep_recent
+            else "finished under an hour ago"
+        )
+        plan.skipped.append(
+            f"job #{job.id}: within retention ({remaining / 86400:.1f}d left, {reason})"
         )
 
     # Snapshot directories with no DB row at all (crashed submissions).
@@ -209,9 +266,13 @@ def execute_plan(service: GPUQService, plan: CleanupPlan) -> CleanupPlan:
 
 
 def run_cleanup(
-    service: GPUQService, *, dry_run: bool = False, older_than: str | None = None
+    service: GPUQService,
+    *,
+    dry_run: bool = False,
+    older_than: str | None = None,
+    keep_recent: int | None = None,
 ) -> CleanupPlan:
-    plan = build_plan(service, older_than=older_than)
+    plan = build_plan(service, older_than=older_than, keep_recent=keep_recent)
     if dry_run:
         return plan
     return execute_plan(service, plan)

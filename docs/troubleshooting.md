@@ -514,11 +514,15 @@ Keeping them separate is what makes the execution backend swappable.
 workerq cleanup --dry-run
 workerq cleanup
 workerq cleanup --older-than 3d
+workerq cleanup --keep 5
 ```
 
-Snapshots are Git worktrees and cost roughly one working tree each. Retention
-defaults to 7 days for successful jobs and 14 for failed ones, so failure
-evidence outlives success.
+Snapshots are Git worktrees and cost roughly one working tree each. The
+dispatcher removes them on its own every ten minutes: after 1 day for
+successful jobs and 3 for failed ones, so failure evidence outlives success,
+and beyond the newest `keep_recent_snapshots` (20) once a job has been
+finished for an hour. If they are piling up anyway, check `auto_cleanup` is
+not off and look for `cleanup error` in the dispatcher log.
 
 Cleanup never touches an active job's snapshot, anything outside the worker-q
 state directory, or the live data behind a passthrough link.

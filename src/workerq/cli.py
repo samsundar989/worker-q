@@ -891,14 +891,25 @@ def cleanup(
     older_than: Optional[str] = typer.Option(
         None, "--older-than", help="Override retention, e.g. 7d, 12h."
     ),
+    keep: Optional[int] = typer.Option(
+        None,
+        "--keep",
+        min=0,
+        help="Keep only this many newest finished snapshots "
+        "(default: core.keep_recent_snapshots).",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
-    """Remove expired snapshots and orphan temp files. Never touches active jobs."""
+    """Remove expired snapshots and orphan temp files. Never touches active jobs.
+
+    The dispatcher already does this every few minutes; run it by hand to see
+    what is kept and why, or to reclaim space sooner.
+    """
     from workerq.cleanup import run_cleanup
 
     service = get_service()
     try:
-        plan = run_cleanup(service, dry_run=dry_run, older_than=older_than)
+        plan = run_cleanup(service, dry_run=dry_run, older_than=older_than, keep_recent=keep)
     except ValueError as exc:
         service.close()
         fail(str(exc))

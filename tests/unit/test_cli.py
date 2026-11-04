@@ -491,6 +491,72 @@ def test_cleanup_keeps_active_job_snapshots(runner: CliRunner, cli_env: Config, 
     assert any("still active" in s for s in payload["skipped"])
 
 
+def _finish(config: Config, job_id: int, *, hours_ago: float, state: str = "SUCCEEDED") -> None:
+    """Mark a submitted job finished `hours_ago`, bypassing the state machine."""
+    from datetime import datetime, timedelta, timezone
+
+    when = (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat()
+    service = GPUQService(config)
+    with service.db.transaction() as conn:
+        conn.execute(
+            "UPDATE jobs SET state = ?, finished_at = ?, updated_at = ? WHERE id = ?",
+            (state, when, when, job_id),
+        )
+    service.close()
+
+
+def _submit(runner: CliRunner, repo: Path) -> tuple[int, Path]:
+    job_id = json.loads(
+        invoke(runner, "submit", "--cwd", str(repo), "--json", "--", "python").stdout
+    )["job_id"]
+    snapshot = Path(
+        json.loads(invoke(runner, "show", str(job_id), "--json").stdout)["snapshot_path"]
+    )
+    return job_id, snapshot
+
+
+def test_cleanup_keeps_only_the_newest_finished_snapshots(
+    runner: CliRunner, cli_env: Config, git_repo: Path
+):
+    """Young snapshots beyond the cap go; that is what bounds disk on a busy box."""
+    jobs = [_submit(runner, git_repo) for _ in range(4)]
+    for hours, (job_id, _) in zip((2, 3, 4, 5), jobs):
+        _finish(cli_env, job_id, hours_ago=hours)
+
+    payload = json.loads(invoke(runner, "cleanup", "--keep", "2", "--json").stdout)
+
+    removed = sorted(entry["job_id"] for entry in payload["snapshots"])
+    assert removed == [jobs[2][0], jobs[3][0]]  # the two oldest
+    assert jobs[0][1].exists() and jobs[1][1].exists()
+    assert not jobs[2][1].exists() and not jobs[3][1].exists()
+
+
+def test_cleanup_cap_spares_a_snapshot_that_just_finished(
+    runner: CliRunner, cli_env: Config, git_repo: Path
+):
+    """Its relative outputs live only in the snapshot, so give them an hour."""
+    job_id, snapshot = _submit(runner, git_repo)
+    _finish(cli_env, job_id, hours_ago=0.1)
+
+    payload = json.loads(invoke(runner, "cleanup", "--keep", "0", "--json").stdout)
+
+    assert payload["snapshots"] == []
+    assert snapshot.exists()
+    assert any("under an hour ago" in s for s in payload["skipped"])
+
+
+def test_cleanup_age_limit_still_applies_within_the_cap(
+    runner: CliRunner, cli_env: Config, git_repo: Path
+):
+    job_id, snapshot = _submit(runner, git_repo)
+    _finish(cli_env, job_id, hours_ago=24 * 30)
+
+    payload = json.loads(invoke(runner, "cleanup", "--keep", "50", "--json").stdout)
+
+    assert [entry["job_id"] for entry in payload["snapshots"]] == [job_id]
+    assert not snapshot.exists()
+
+
 def test_cleanup_rejects_a_bad_duration(runner: CliRunner, cli_env: Config):
     result = invoke(runner, "cleanup", "--older-than", "banana")
     assert result.exit_code != 0

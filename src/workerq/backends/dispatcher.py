@@ -133,6 +133,12 @@ _BLOCKED_REPEAT_SECONDS = 300.0
 #: concludes it is wedged and ends the process. Generous next to the 0.25s tick
 #: and the 15s nvidia-smi timeout, so only a real hang trips it.
 _WATCHDOG_GRACE_SECONDS = 180.0
+
+#: How often the dispatcher applies snapshot retention, and how long after
+#: starting it first does. The first pass is delayed so a restart is not also
+#: a burst of deletion while running jobs are being adopted.
+_CLEANUP_INTERVAL_SECONDS = 600.0
+_CLEANUP_FIRST_DELAY_SECONDS = 60.0
 #: Bytes written before the log size is re-checked, so rotation costs one stat
 #: per megabyte rather than one per line.
 _LOG_CHECK_BYTES = 1024 * 1024
@@ -1937,6 +1943,7 @@ class Dispatcher:
         trim_counter = 0
         self._start_watchdog()
         self._start_node_poller()
+        self._start_snapshot_cleaner()
         try:
             while not self._stop:
                 try:
@@ -2044,6 +2051,53 @@ class Dispatcher:
                     waited += step
 
         threading.Thread(target=poll, name="workerq-node-poll", daemon=True).start()
+
+    def _start_snapshot_cleaner(self) -> None:
+        """Apply snapshot retention without anyone having to ask.
+
+        Retention used to run only from `workerq cleanup`, which no agent ever
+        typed, so every job's worktree stayed on disk for good - 600 of them,
+        several gigabytes apiece, before anyone noticed the drive filling.
+
+        On a thread because removing a large worktree takes seconds to minutes,
+        and the tick must keep reaping and cancelling meanwhile. It opens its
+        own service, since the jobs database connection belongs to whichever
+        thread made it. A failed pass is logged and retried next interval:
+        cleanup costs disk when it fails, never a job.
+        """
+        if not self.config.core.auto_cleanup:
+            return
+        import threading
+
+        def clean() -> None:
+            from workerq.cleanup import run_cleanup
+            from workerq.core import GPUQService
+
+            delay = _CLEANUP_FIRST_DELAY_SECONDS
+            while not self._stop:
+                waited = 0.0
+                while waited < delay and not self._stop:
+                    time.sleep(1.0)
+                    waited += 1.0
+                if self._stop:
+                    break
+                delay = _CLEANUP_INTERVAL_SECONDS
+                try:
+                    with GPUQService(self.config) as service:
+                        plan = run_cleanup(service)
+                    if plan.total or plan.errors:
+                        self.log(
+                            f"cleanup: removed {len(plan.snapshots)} snapshot(s), "
+                            f"{len(plan.orphan_dirs)} orphan(s), "
+                            f"{len(plan.temp_files)} temp file(s), "
+                            f"{plan.removed_bytes / 2**30:.1f} GiB"
+                            + (f"; {len(plan.errors)} error(s): {plan.errors[:3]}"
+                               if plan.errors else "")
+                        )
+                except Exception:
+                    self.log("cleanup error:\n" + traceback.format_exc())
+
+        threading.Thread(target=clean, name="workerq-cleanup", daemon=True).start()
 
     def _start_watchdog(self) -> None:
         """End the process if the main loop stops making progress.
