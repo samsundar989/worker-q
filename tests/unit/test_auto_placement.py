@@ -448,3 +448,84 @@ def test_large_missing_passthrough_still_refuses(dispatcher, monkeypatch, tmp_pa
         NodeConfig(name="w", address="h"), tmp_path, {}, ["weights"]
     )
     assert not ok and "missing weights" in why
+
+
+# --------------------------------------------------------------------------
+# An unreachable node must cost one timeout, not one per waiting job
+# --------------------------------------------------------------------------
+
+
+def _travelling_row(backend_id: int, repo: str) -> dict:
+    import json
+
+    r = row(backend_id, cpus=8)
+    r["remote_spec_json"] = json.dumps({"repo_root": repo})
+    return r
+
+
+def test_an_unreachable_node_is_tried_once_not_once_per_job(dispatcher, monkeypatch):
+    """2026-11-04: a sleeping second machine cost every waiting job its own 8 s
+    SSH timeout, because each autoflow worktree is a different repo root. One
+    tick took minutes, the heartbeat went stale, agents restarted the queue,
+    and the watchdog fired. Now the first timeout marks the node down for all."""
+    from workerq.config import NodeConfig
+
+    dispatcher.config.nodes = [NodeConfig(name="3080ti", address="h")]
+    calls: list[str] = []
+
+    def slow_repo_check(node, spec):
+        calls.append(spec["repo_root"])
+        return False, "could not check 3080ti: could not resolve %USERPROFILE%\\Documents on 3080ti: timed out after 8s"
+
+    monkeypatch.setattr(dispatcher, "_repo_ready", slow_repo_check)
+    monkeypatch.setattr(dispatcher, "_would_block_the_queue", lambda *a: True)
+    rows = [_travelling_row(i, f"C:/repo/.autoflow/worktrees/t{i}") for i in range(1, 21)]
+    for i, r in enumerate(rows):
+        chosen, why = dispatcher._choose_node(r, rows, i, False)
+        assert chosen is None
+    assert len(calls) == 1, "one SSH timeout for the node, not one per job"
+    assert "unreachable" in why
+
+
+def test_the_node_pollers_offline_report_is_honoured_without_blocking(dispatcher, monkeypatch):
+    import time
+
+    from workerq import nodes as nodemod
+    from workerq.config import NodeConfig
+
+    node = NodeConfig(name="w", address="h")
+    dispatcher.config.nodes = [node]
+    dispatcher._reports = nodemod.ReportCache()
+    dispatcher._reports._reports["w"] = (time.monotonic(), nodemod.NodeReport(name="w", error="connection timed out"))
+    monkeypatch.setattr(dispatcher, "_repo_ready", lambda *a: (_ for _ in ()).throw(AssertionError("no SSH for an offline node")))
+    monkeypatch.setattr(dispatcher, "_would_block_the_queue", lambda *a: True)
+    r = _travelling_row(1, "C:/repo")
+    chosen, why = dispatcher._choose_node(r, [r], 0, False)
+    assert chosen is None and "unreachable" in why
+
+
+def test_remote_checks_are_bounded_per_tick_and_keep_the_heartbeat_fresh(dispatcher, monkeypatch):
+    from workerq import backends
+    from workerq.backends import dispatcher as dmod
+    from workerq.config import NodeConfig
+
+    dispatcher.config.nodes = [NodeConfig(name="w", address="h")]
+    clock = [1000.0]
+    monkeypatch.setattr(dmod.time, "monotonic", lambda: clock[0])
+    beats: list[float] = []
+    monkeypatch.setattr(dispatcher, "_heartbeat", lambda: beats.append(clock[0]))
+
+    def slow_but_reachable(node, spec):
+        clock[0] += 6.0                       # a slow node that does answer
+        return False, "w has no clone of project (workerq node stage w --clone)"
+
+    monkeypatch.setattr(dispatcher, "_repo_ready", slow_but_reachable)
+    monkeypatch.setattr(dispatcher, "_would_block_the_queue", lambda *a: True)
+    dispatcher._tick_remote_seconds = 0.0
+    rows = [_travelling_row(i, f"C:/repo/t{i}") for i in range(1, 11)]
+    for i, r in enumerate(rows):
+        dispatcher._choose_node(r, rows, i, False)
+    assert dispatcher._tick_remote_seconds < dmod._PLACEMENT_TICK_BUDGET_SECONDS + 6.0
+    assert len(beats) == 3, "a heartbeat after each remote check"
+    _, why = dispatcher._choose_node(rows[-1], rows, 9, False)
+    assert "later tick" in why

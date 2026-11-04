@@ -208,6 +208,30 @@ _NODE_PUBLISH_SECONDS = 2.0
 #: loop that ticks four times a second, to answer a question whose answer
 #: changes only when a human runs `workerq node stage`.
 _REPO_READY_SECONDS = 60.0
+#: A node that times out, cannot be resolved or refuses the connection is
+#: skipped by every job for a while, instead of being tried by each one. Before
+#: this, a second machine that was asleep cost every waiting job its own 8 s SSH
+#: timeout on the dispatch loop: with ~20 jobs queued, one tick took minutes,
+#: the heartbeat went stale (so `status` and `doctor` called the daemon dead and
+#: agents kept running `workerq restart`), and past 180 s the watchdog killed it.
+_NODE_DOWN_FIRST_SECONDS = 60.0
+_NODE_DOWN_MAX_SECONDS = 600.0
+#: Remote placement checks (repo readiness, cold node reports) may block the
+#: dispatch loop this long per tick, all jobs together. The rest are looked at
+#: on a later tick. Bounds a tick even when a reachable node is slow.
+_PLACEMENT_TICK_BUDGET_SECONDS = 15.0
+#: Error text that means "that machine cannot be reached", not "that machine
+#: said no".
+_UNREACHABLE_MARKERS = (
+    "timed out", "could not resolve", "name or service not known", "connection refused",
+    "no route to host", "network is unreachable", "host is down", "connection reset",
+    "could not connect", "unreachable",
+)
+
+
+def _looks_unreachable(text: str | None) -> bool:
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in _UNREACHABLE_MARKERS)
 #: First and longest delay before a failed placement is offered to that node
 #: again. Each attempt blocks the dispatch loop for several SSH round trips.
 _PLACEMENT_RETRY_SECONDS = 60.0
@@ -273,6 +297,10 @@ class Dispatcher:
         self._placement_logged: dict[int, str] = {}
         #: (job, node) -> (retry_at, delay) for placements that failed.
         self._placement_failures: dict[tuple[int, str], tuple[float, float]] = {}
+        #: node -> (retry_at, delay, why) for nodes that could not be reached.
+        self._node_down: dict[str, tuple[float, float, str]] = {}
+        #: Seconds this tick has spent blocked on remote placement checks.
+        self._tick_remote_seconds = 0.0
         #: backend_id -> when a remote cancel may next be sent (inf once sent).
         self._remote_cancel_at: dict[int, float] = {}
 
@@ -1264,16 +1292,35 @@ class Dispatcher:
 
         reasons: list[str] = []
         for node in candidates:
+            down = self._node_down_reason(node)
+            if down is not None:
+                reasons.append(down)
+                continue
             backoff = self._placement_backoff_reason(backend_id, node)
             if backoff is not None:
                 reasons.append(backoff)
                 continue
-            ready, why = self._repo_ready(node, spec)
+            if self._tick_remote_seconds >= _PLACEMENT_TICK_BUDGET_SECONDS:
+                reasons.append(f"{node.name}: checked on a later tick (this tick's remote budget is spent)")
+                continue
+            started = time.monotonic()
+            try:
+                ready, why = self._repo_ready(node, spec)
+                if ready:
+                    admits, why = self._remote_admits(node, row)
+            finally:
+                self._tick_remote_seconds += time.monotonic() - started
+                # A slow remote check is still progress. Keep the heartbeat fresh
+                # so `status` and `doctor` don't report a working daemon as dead.
+                self._heartbeat()
             if not ready:
+                if _looks_unreachable(why):
+                    self._note_node_down(node, why or "unreachable")
                 reasons.append(why or f"{node.name} is not ready")
                 continue
-            admits, why = self._remote_admits(node, row)
             if not admits:
+                if _looks_unreachable(why):
+                    self._note_node_down(node, why or "unreachable")
                 reasons.append(why or f"{node.name} is busy")
                 continue
             return node, None
@@ -1301,6 +1348,34 @@ class Dispatcher:
             return
         local = str(row.get("wait_reason") or "waiting for this machine").split(" | ")[0]
         self._record_wait(backend_id, f"{local} | {why}" if why else local)
+
+    def _node_down_reason(self, node: Any) -> str | None:
+        """Why no job should try `node` right now, if it cannot be reached.
+
+        Per node, not per job: an unreachable machine is unreachable for every
+        job, and each try costs a full SSH timeout on the dispatch loop. Two
+        sources: our own recent failure (backed off, doubling), and the node
+        poller's latest report, which is read without blocking.
+        """
+        now = time.monotonic()
+        entry = self._node_down.get(node.name)
+        if entry is not None and now < entry[0]:
+            return f"{node.name} is unreachable ({entry[2]})"
+        if self._reports is not None:
+            seen = self._reports.peek(node.name)
+            if seen is not None:
+                taken, report = seen
+                fresh = now - taken < max(60.0, 4 * float(getattr(node, "poll_interval_seconds", 15) or 15))
+                if fresh and not report.online:
+                    return f"{node.name} is unreachable ({report.error})"
+        return None
+
+    def _note_node_down(self, node: Any, why: str) -> None:
+        previous = self._node_down.get(node.name)
+        delay = min(_NODE_DOWN_MAX_SECONDS, previous[1] * 2) if previous else _NODE_DOWN_FIRST_SECONDS
+        self._node_down[node.name] = (time.monotonic() + delay, delay, why)
+        if previous is None or previous[2] != why:
+            self.log(f"node {node.name} unreachable ({why}); no job will try it for {delay:.0f}s")
 
     def _placement_backoff_reason(self, backend_id: int, node: Any) -> str | None:
         """Why this job may not be offered to `node` yet, if it may not.
@@ -1948,6 +2023,7 @@ class Dispatcher:
             while not self._stop:
                 try:
                     self._last_tick = time.monotonic()
+                    self._tick_remote_seconds = 0.0
                     self._heartbeat()
                     self._sample_resources()
                     self._refresh_nodes()
