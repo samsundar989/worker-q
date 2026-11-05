@@ -187,7 +187,10 @@ class SchedulingConfig:
     #: strict head-of-line order.
     backfill: bool = True
     #: How far past a blocked job to look in one tick. Bounds the work done per
-    #: tick and keeps the queue roughly in priority order.
+    #: tick and keeps the queue roughly in priority order. Only *distinct*
+    #: refusals count: a job asking for at least as much as one already refused
+    #: this tick cannot start either, so a run of identical large jobs does not
+    #: hide the small job behind them.
     backfill_max_skip: int = 8
     #: Once the blocked job at the head has waited this long, backfill stops and
     #: the queue drains until it can run. This is the starvation guard: it caps
@@ -198,11 +201,16 @@ class SchedulingConfig:
     #: which is the escape hatch if placement ever misbehaves.
     auto_placement: bool = True
 
-    #: How long the queue may stay held for one job before backfilling resumes.
-    #: Draining the machine only helps when queue pressure is what keeps the head
-    #: out. When it is instead waiting on a job with hours left to run, an
-    #: unbounded hold idles the whole machine and buys the head nothing, so the
-    #: guard gives up after this long and lets work that fits through again.
+    #: How long, in total, the queue may stay held for one job before
+    #: backfilling resumes. A hold reserves the head's request and keeps back
+    #: only jobs that would take part of it; jobs that leave it what it needs
+    #: still start. Draining only helps when queue pressure is what keeps the
+    #: head out. When it is instead waiting on a job with hours left to run, an
+    #: unbounded hold starves everything that competes with it and buys the
+    #: head nothing, so the guard gives up after this long. The budget covers
+    #: the job's whole stay in the queue; it is not renewed by an idle spell.
+    #: A hold is skipped outright when even a fully drained queue could not
+    #: admit the head (its RAM is held by work outside the queue).
     backfill_max_hold_seconds: int = 1800
 
     #: Run job processes below normal priority so the desktop stays responsive

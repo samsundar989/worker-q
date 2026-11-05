@@ -155,6 +155,43 @@ def _reason_key(reason: str) -> str:
     return "".join("#" if c.isdigit() else c for c in reason)
 
 
+def _demand(request: res.ResourceRequest) -> dict[str, float]:
+    """What a job takes from this machine, per dimension a hold can protect.
+
+    Every job takes one slot. Commit is RAM plus VRAM, the same sum
+    `resources.admit` charges against the commit ceiling.
+    """
+    return {
+        "slot": 1.0,
+        "RAM": request.ram_mib,
+        "CPU": float(request.cpus),
+        "GPU": float(request.gpu_count),
+        "VRAM": request.vram_mib,
+        "commit": request.ram_mib + request.vram_mib,
+    }
+
+
+def _asks_at_least(
+    later: res.ResourceRequest, later_mode: str, earlier: res.ResourceRequest, earlier_mode: str
+) -> bool:
+    """Does `later` ask for everything `earlier` does, and no more leniently?
+
+    Admission and device allocation only get harder as a request grows, and a
+    tick only ever takes capacity away. So once `earlier` was refused this tick,
+    `later` will be too: passing it over tells the scan nothing new. GPU mode
+    matters only when both want a device - sharing can fit where exclusive
+    cannot, so an exclusive refusal says nothing about a later shared job.
+    """
+    if (
+        later.ram_mib < earlier.ram_mib
+        or later.vram_mib < earlier.vram_mib
+        or later.cpus < earlier.cpus
+        or later.gpu_count < earlier.gpu_count
+    ):
+        return False
+    return not (earlier.gpu_count > 0 and later_mode != earlier_mode and later_mode == "shared")
+
+
 #: How core marks a queue row as belonging to one of its jobs. Parsed rather
 #: than imported, because the dispatcher deliberately never reads the core
 #: database and importing core here would be the first step towards it.
@@ -276,6 +313,11 @@ class Dispatcher:
         #: unstartable job stalling everything behind it indefinitely.
         self._hold_since: dict[int, float] = {}
         self._hold_logged_at: dict[int, float] = {}
+        #: head backend_id -> hold seconds already used in earlier stretches.
+        #: The hold bound is a budget for the job's whole stay in the queue:
+        #: before this, every idle spell reset it and one 24 GiB job was given
+        #: a fresh 30 minute hold four times in a day.
+        self._hold_spent: dict[int, float] = {}
         #: When the main loop last completed a tick, for the watchdog.
         self._last_tick = time.monotonic()
         self._log_path = config.state_dir / "run" / "dispatcher.log"
@@ -945,6 +987,163 @@ class Dispatcher:
         )
         return True
 
+    # -- holding the queue for its head -------------------------------------
+    def _local_spare(self, in_flight: int, slots: int) -> dict[str, float]:
+        """What this machine has left this instant, on every axis a hold guards.
+
+        The same two limits `resources.admit` applies: measured RAM above the
+        host floor, and the ledger of what running jobs declared. A dimension
+        that cannot be measured here (no GPU stack, no commit reading) is left
+        out, and a hold then does not guard it.
+        """
+        mem = host.memory()
+        gpu = self._gpu_info()
+        cap = res.capacity(self.config, gpu, mem, self._reserve())
+        reserved = res.sum_reservations(self._running_requests())
+        r = self.config.resources
+        floor = cap.total_ram_mib * (r.min_host_free_percent / 100.0)
+        spare = {
+            "slot": float(slots - in_flight),
+            "RAM": min((mem.available_mib or 0.0) - floor, cap.usable_ram_mib - reserved.ram_mib),
+            "CPU": float(cap.usable_cpus - reserved.cpus),
+        }
+        if gpu is not None and gpu.available:
+            spare["GPU"] = float(len(gpu.devices) - len(self._devices_in_use()))
+            spare["VRAM"] = cap.usable_vram_mib - reserved.vram_mib
+        ceiling = host.commit_ceiling_mib(mem)
+        if ceiling is not None and mem.commit_used_mib is not None:
+            margin = cap.total_ram_mib * (r.commit_headroom_percent / 100.0)
+            spare["commit"] = ceiling - mem.commit_used_mib - margin
+        return spare
+
+    def _hold_conflict(
+        self, row: dict[str, Any], held: dict[str, Any], in_flight: int, slots: int
+    ) -> str | None:
+        """Why `row` may not start while the queue is held for `held`, or None.
+
+        A hold reserves the head's whole request out of what is free now, and
+        a job behind it may start only if it fits in what is left after that
+        reservation. Per axis:
+
+        * the job does not use it, or the head does not need it - no conflict;
+        * otherwise the job must leave at least the head's full need behind.
+
+        So a job never takes anything the head is short of (there is not even
+        enough of that for the head, so any use of it delays the head), and
+        never creates a new shortage on an axis where the head already fits.
+        Everything else - a CPU-only job behind a head waiting for a GPU, a
+        small job beside a head whose RAM is already free - keeps flowing.
+        Slots are an axis like any other: a hold keeps one slot for the head.
+        """
+        spare = self._local_spare(in_flight, slots)
+        mine = _demand(self._request_for(row))
+        needs = _demand(self._request_for(held))
+        for dim, need in needs.items():
+            take = mine[dim]
+            if need <= 0 or take <= 0 or dim not in spare:
+                continue
+            left = spare[dim] - take
+            if left < need:
+                def fmt(v: float, dim: str = dim) -> str:
+                    if dim in ("RAM", "VRAM", "commit"):
+                        return f"{max(0.0, v) / 1024.0:.1f} GiB {dim}"
+                    return f"{max(0.0, v):.0f} {dim}(s)"
+                return (
+                    f"queue held for job {int(held['id'])}, which needs {fmt(need)}; "
+                    f"starting this would leave {fmt(left)}"
+                )
+        return None
+
+    def _hold_futility(self, head: dict[str, Any], in_flight: int) -> str | None:
+        """Why holding for `head` cannot get it started, or None if it can.
+
+        Holding is a bet that the machine frees up if we stop adding to it.
+        The bet is judged at its best case - every running worker-q job ends
+        and hands back everything it declared - and refused when even that
+        would not admit the head. What is still in use then belongs to work
+        the queue cannot stop (the desktop, an editor, another tool), so the
+        hold would idle the machine and buy the head nothing.
+
+        Declarations are the only per-job figure we have. A job using more
+        than it declared frees more than we credit, so this can give up on a
+        hold that might have paid; it then falls back to plain backfill, which
+        is what the bounded hold would have done anyway once it expired.
+        """
+        if in_flight == 0:
+            return "nothing is running here, so there is nothing to drain"
+        req = self._request_for(head)
+        mem = host.memory()
+        gpu = self._gpu_info()
+        cap = res.capacity(self.config, gpu, mem, self._reserve())
+        if req.cpus > cap.usable_cpus:
+            return f"it needs {req.cpus} CPU(s) and only {cap.usable_cpus} are usable here"
+        if req.ram_mib > cap.usable_ram_mib:
+            return (
+                f"it needs {req.ram_mib / 1024.0:.1f} GiB RAM and only "
+                f"{cap.usable_ram_mib / 1024.0:.1f} GiB is usable here"
+            )
+        if gpu is not None and gpu.available and req.gpu_count > len(gpu.devices):
+            return f"it needs {req.gpu_count} GPU(s) and this machine has {len(gpu.devices)}"
+        reserved = res.sum_reservations(self._running_requests())
+        floor = cap.total_ram_mib * (self.config.resources.min_host_free_percent / 100.0)
+        drained = (mem.available_mib or 0.0) - floor + reserved.ram_mib
+        if req.ram_mib > drained:
+            return (
+                f"it needs {req.ram_mib / 1024.0:.1f} GiB RAM and even with every "
+                f"running job finished only about {max(0.0, drained) / 1024.0:.1f} GiB "
+                "would be free; the rest is in use outside the queue"
+            )
+        return None
+
+    def _pause_hold(self, head_id: int, now: float) -> None:
+        """Stop the hold clock, banking what this stretch of holding used."""
+        since = self._hold_since.pop(head_id, None)
+        if since is not None:
+            self._hold_spent[head_id] = self._hold_spent.get(head_id, 0.0) + (now - since)
+
+    def _should_hold(self, head: dict[str, Any], in_flight: int, now: float) -> bool:
+        """Should the queue be held for `head`, the first job that cannot start?
+
+        Three bounds, so a hold helps the head without parking the queue:
+
+        * `backfill_head_wait_seconds` - backfill runs freely until the head
+          has been kept waiting this long; this is the starvation guard.
+        * `_hold_futility` - no hold when draining cannot admit the head. The
+          clock does not run then: not holding must not spend the hold.
+        * `backfill_max_hold_seconds` - a budget for the job's whole stay, not
+          per stretch. It used to restart after every idle spell.
+        """
+        sched = self.config.scheduling
+        head_id = int(head["id"])
+        waited = self._blocked_wait_seconds(head_id)
+        if waited < sched.backfill_head_wait_seconds:
+            self._pause_hold(head_id, now)
+            return False
+        may_log = now >= self._hold_logged_at.get(head_id, 0.0)
+        if may_log:
+            self._hold_logged_at[head_id] = now + _BLOCKED_REPEAT_SECONDS
+        futile = self._hold_futility(head, in_flight)
+        if futile is not None:
+            self._pause_hold(head_id, now)
+            if may_log and in_flight > 0:
+                self.log(f"job {head_id}: not holding the queue for it - {futile}")
+            return False
+        started = self._hold_since.setdefault(head_id, now)
+        used = self._hold_spent.get(head_id, 0.0) + (now - started)
+        if used < sched.backfill_max_hold_seconds:
+            if may_log:
+                self.log(
+                    f"job {head_id}: waited {waited:.0f}s; holding the queue for it - "
+                    "only jobs that leave it what it needs may start"
+                )
+            return True
+        if may_log:
+            self.log(
+                f"job {head_id}: held the queue for {used / 60:.0f}m in all without "
+                "starting; its hold budget is spent, so backfilling resumes"
+            )
+        return False
+
     def _blocked_wait_seconds(self, backend_id: int) -> float:
         """How long this job has been continuously unable to start."""
         entry = self._blocked.get(backend_id)
@@ -972,8 +1171,9 @@ class Dispatcher:
         now = time.monotonic()
         # A job that is no longer queued cannot be holding the queue.
         live = {int(row["id"]) for row in queued}
-        for stale in [k for k in self._hold_since if k not in live]:
+        for stale in [k for k in {*self._hold_since, *self._hold_spent} if k not in live]:
             self._hold_since.pop(stale, None)
+            self._hold_spent.pop(stale, None)
             self._hold_logged_at.pop(stale, None)
         for key in [k for k in self._placement_failures if k[0] not in live]:
             self._placement_failures.pop(key, None)
@@ -981,13 +1181,21 @@ class Dispatcher:
         #: Set once a job has been passed over, so the job that caused it can be
         #: told apart from the ones merely behind it.
         head_blocked: dict[str, Any] | None = None
+        #: The head job the queue is held for this tick, if any. Holding no
+        #: longer stops the machine: it reserves what the head needs, and only
+        #: jobs that would take some of that are kept back (`_hold_conflict`).
+        held_for: dict[str, Any] | None = None
         skipped = 0
-        #: Set once this machine may take nothing more this tick: the queue is
-        #: held for the head job, or backfill has looked as far as it may. Both
-        #: rules protect *local* headroom, so they must not end the scan - they
-        #: used to `return`, which left every job behind them unoffered to the
-        #: other machine while it sat idle. A job placed there takes nothing the
-        #: held job is waiting for.
+        #: Requests already refused here this tick. A later job asking for at
+        #: least as much on every axis is refused too, so it does not use up the
+        #: look-ahead: otherwise nine queued 8-24 GiB jobs exhausted
+        #: `backfill_max_skip` and a 1 GiB job behind them was never examined,
+        #: for hours, on a machine with room for it.
+        refused: list[tuple[res.ResourceRequest, str]] = []
+        #: Set once this machine may take nothing more this tick: backfill has
+        #: looked as far as it may. That rule protects *local* headroom, so it
+        #: must not end the scan - it used to `return`, which left every job
+        #: behind it unoffered to the other machine while it sat idle.
         local_closed = False
 
         for position, row in enumerate(queued):
@@ -1052,6 +1260,10 @@ class Dispatcher:
                     )
                     if devices is not None:
                         blocked_reason = None
+                if blocked_reason is None and held_for is not None:
+                    # The queue is held for the head: this job fits, but may
+                    # only start if it leaves the head everything it needs.
+                    blocked_reason = self._hold_conflict(row, held_for, in_flight, slots)
 
             # Placement. Asked whether or not this machine could take the job,
             # because "it fits here" is not the same as "here is the right
@@ -1077,7 +1289,8 @@ class Dispatcher:
                 if remote_why:
                     blocked_reason = f"{blocked_reason} | {remote_why}"
                 self._record_wait(backend_id, blocked_reason)
-                if head_blocked is None:
+                first_blocked = head_blocked is None
+                if first_blocked:
                     head_blocked = row
                     self._consider_preemption(row, blocked_reason)
 
@@ -1088,46 +1301,14 @@ class Dispatcher:
                 if not sched.backfill:
                     local_closed = True
                     continue
-                head_id = int(head_blocked["id"])
-                waited = self._blocked_wait_seconds(head_id)
-                # Holding is a bet that the machine will free up if we stop
-                # adding to it. With nothing running there is nothing to drain,
-                # so the bet cannot pay: the head is held out by the desktop,
-                # the editors, or its own size, none of which the queue can
-                # evict. Holding then buys the head nothing and costs every job
-                # behind it - an idle machine with a 1 GiB job waiting on a
-                # 32 GiB one that will not fit either way.
-                if waited >= sched.backfill_head_wait_seconds and in_flight > 0:
-                    # Holding drains the machine so the head job gets a clear
-                    # run at it. That only works if queue pressure is what is
-                    # keeping it out. When the blocker is a long-running job
-                    # instead, holding forever stalls the whole queue and the
-                    # head gains nothing: it cannot start until that job ends
-                    # either way. So the hold is bounded, and once it expires
-                    # work that fits is allowed through again.
-                    started = self._hold_since.setdefault(head_id, now)
-                    if now - started < sched.backfill_max_hold_seconds:
-                        if now >= self._hold_logged_at.get(head_id, 0.0):
-                            self.log(
-                                f"job {head_id}: waited {waited:.0f}s; "
-                                "holding the queue for it instead of backfilling"
-                            )
-                            self._hold_logged_at[head_id] = now + _BLOCKED_REPEAT_SECONDS
-                        local_closed = True
-                        continue
-                    if now >= self._hold_logged_at.get(head_id, 0.0):
-                        self.log(
-                            f"job {head_id}: held the queue for "
-                            f"{(now - started) / 60:.0f}m without starting; its "
-                            "blocker is not queue pressure, so backfilling resumes"
-                        )
-                        self._hold_logged_at[head_id] = now + _BLOCKED_REPEAT_SECONDS
-                elif in_flight == 0:
-                    # Not holding, so the hold clock must not run. Otherwise an
-                    # idle spell silently spends the head's one bounded hold and
-                    # it never gets the drained machine the hold promises it.
-                    self._hold_since.pop(head_id, None)
-                skipped += 1
+                if first_blocked and self._should_hold(row, in_flight, now):
+                    held_for = row
+
+                request = self._request_for(row)
+                mode = str(row.get("gpu_mode") or "exclusive")
+                if not any(_asks_at_least(request, mode, r, m) for r, m in refused):
+                    skipped += 1
+                refused.append((request, mode))
                 if skipped > sched.backfill_max_skip:
                     local_closed = True
                 continue
